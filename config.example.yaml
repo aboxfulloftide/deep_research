@@ -1,0 +1,21 @@
+llm:
+  base_url: "http://localhost:11434/v1"  # Ollama default; for llama.cpp use http://host:8080/v1
+  model: "llama3"
+  api_key: "ollama"  # Ollama ignores this but the API requires it
+
+searxng:
+  url: "http://localhost:8888"
+
+scraping:
+  timeout: 15
+  max_content_length: 8000
+
+agent:
+  max_steps: 20
+
+db:
+  path: "~/.local/share/deep_research/research.db"
+
+web:
+  host: "0.0.0.0"
+  port: 8000
