@@ -78,8 +78,11 @@ def load_config(config_path: str | None = None) -> Config:
     search_paths = []
     if config_path:
         search_paths.append(Path(config_path))
+    # Check CWD, project root (relative to this file), and user config dir
+    project_root = Path(__file__).parent.parent
     search_paths.extend([
         Path("config.yaml"),
+        project_root / "config.yaml",
         Path.home() / ".config" / "deep_research" / "config.yaml",
     ])
 

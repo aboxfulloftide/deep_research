@@ -8,3 +8,5 @@ build/
 *.db
 .venv/
 config.yaml
+node_modules/
+frontend/dist/
