@@ -4,64 +4,18 @@ Hardware guidance for the knowledge-base system described in
 [PLAN_KB_ARCHITECTURE.md](PLAN_KB_ARCHITECTURE.md). Split out of the main plan
 because it rots at a different rate than the data model and pipeline design.
 
-## Resource Planning
+## Current Tool Baseline
 
-### Current tool
+For the tool as it exists today, `16 GB` VRAM is enough. The app truncates and
+compacts inputs, so larger context alone is not a big win. Everything below is sized
+for the planned KB system, not the current app.
 
-For the tool as it exists today:
+## Hardware Recommendation
 
-- 16 GB VRAM is generally enough
-- larger context alone is not a huge win because the app truncates and compacts inputs
+### Why the planned system needs more
 
-### Planned system
-
-For the planned knowledge-base version:
-
-- 32 GB VRAM becomes much easier to justify
-- not because the app needs giant raw context
-- because the system will benefit from stronger local models and more concurrent extraction/verification work
-
-### Minimum workable local box
-
-- `32 GB` system RAM
-- `16 GB` VRAM
-- `1-2 TB` NVMe storage
-
-### Better target
-
-- `64 GB` system RAM
-- `32 GB` VRAM
-- `2 TB+` NVMe storage
-
-### Why
-
-- PostgreSQL + parsers + chunking + workers need RAM
-- local extraction and verification benefit from larger models
-- transcripts/documents create a lot of intermediate text and indexes
-- SSD speed matters for snapshots, chunks, caches, and retrieval
-
-### Current machine guidance
-
-If budget is limited, current priority order recommendation:
-
-1. `64 GB` system RAM
-2. fast `2 TB+` NVMe
-3. `32 GB` total VRAM
-4. more CPU cores after that
-
-Interpretation:
-
-- if the goal stays close to the current app, 16 GB VRAM is fine
-- if the goal becomes a real local KB with ingestion, verification, and reporting, 32 GB VRAM is a reasonable target
-
-## Revised Hardware Recommendation
-
-This section revisits hardware after the schema and workflow definition became more concrete.
-
-### What changed versus the earlier recommendation
-
-The earlier recommendation was based on the current lightweight scraper/summarizer app.
-The newer recommendation reflects the intended system:
+The current app only needs the lightweight baseline above. The planned system is
+different:
 
 - PostgreSQL-backed knowledge base
 - raw source snapshots on disk
@@ -178,7 +132,9 @@ As of `July 5, 2026`, current official spec pages show:
 - NVIDIA `RTX 5090`: `32 GB` GDDR7
 - NVIDIA `RTX PRO 6000 Blackwell`: `96 GB` GDDR7 ECC
 - AMD Radeon PRO `W7900`: `48 GB` GDDR6
-- Intel Arc Pro `B70`: `32 GB`
+- Intel Arc Pro `B70`: `32 GB` GDDR6
+- Intel Arc Pro `B60`: `24 GB` (dual-GPU board variants reach `48 GB`)
+- used/prev-gen NVIDIA `RTX 3090` / `RTX 4090`: `24 GB`
 
 Interpretation:
 
@@ -186,6 +142,23 @@ Interpretation:
 - `RTX 5090` class is the first straightforward single-card 32 GB option in the consumer NVIDIA stack
 - workstation cards like `W7900` and `RTX PRO 6000` are capacity-first options, but usually for a very different budget
 - Intel `B70` is interesting as a 32 GB workstation card, but I would not make it the default recommendation for this project unless budget pressure is dominant and you are willing to accept a less proven local AI software path
+
+#### The 24 GB middle tier
+
+The machine tiers in this doc jump from `16 GB` to `32 GB` VRAM, but there is a
+deliberate middle option worth naming:
+
+- a used `RTX 3090` or `RTX 4090` (`24 GB`) runs 30B-class models at Q4 with
+  KV-cache headroom, at a fraction of `RTX 5090` cost
+- two used `RTX 3090`s give `48 GB` total for less than one `RTX 5090`, with the
+  multi-GPU caveats below
+- Intel's Arc Pro `B60` (`24 GB`) is the budget new-card option in this tier, with
+  the same ecosystem caveat as the `B70`
+
+Trade-offs: used-market risk, no warranty, and worse power draw per GB (especially
+the `3090`). If used hardware is acceptable, this tier is the best price/performance
+entry point for the planned system. If it is not, skip straight to the `32 GB` tier —
+which is why the machine tiers above do not include a 24 GB build.
 
 ### Single 32 GB card vs two 16 GB cards
 
@@ -273,6 +246,13 @@ If you are deciding whether the next dollar should go to GPU, RAM, or storage:
 1. Get to `64 GB` RAM if you are below that now
 2. Ensure at least `2 TB` of fast SSD storage
 3. Then move from `16 GB` VRAM to `32 GB` VRAM if the project is staying on the current roadmap
+
+Timing note: tie the GPU purchase to the plan's step-0 extraction spike (see
+"Extraction + Resolution Spike" in [PLAN_KB_ARCHITECTURE.md](PLAN_KB_ARCHITECTURE.md)).
+The spike runs fine on the existing `16 GB` card and answers exactly the question
+that justifies the spend — whether a ~14B model is good enough for first-pass
+extraction or a heavier model is needed from the start. RAM and storage are safe to
+buy anytime; defer the GPU until the spike result is in.
 
 ### Bottom-line recommendation
 

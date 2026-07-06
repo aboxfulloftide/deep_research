@@ -31,7 +31,11 @@ Important current limitation:
 - the app mostly works as "fetch data, put it in prompt, summarize"
 - this means large context windows are not the main value driver right now
 
-## User Requirements Captured So Far
+## Decision Register
+
+Single source of truth for decisions made during planning. Spec sections cite these
+by number; when a decision changes, update it here first so the rest of the document
+has one place to disagree with.
 
 From the planning discussion:
 
@@ -114,6 +118,59 @@ From the planning discussion:
 - those sources can be re-used later if a relevant topic is created
 - the system should support broad domain extraction such as "historical and economic related data"
 - part of the goal is to build a general-purpose local knowledge database, not only topic-bound research projects
+
+20. v1 product scope (from Batch 1):
+- the personal local knowledge base and the deep-research agent are equal priorities
+- v1 workflow set:
+  - ingest a YouTube video, playlist, or list of documents and extract general data by
+    broad categories such as history/economic unless a specific topic is given
+  - start from a topic plus starting sources (YouTube, websites, PDFs), then continue
+    researching with additional web search
+  - KB querying and timeline/report outputs are extensions of those two workflows,
+    not separate workflow categories
+- out of scope for v1: multi-user support
+- monitoring: manual refresh by default; monitoring only when explicitly enabled for
+  selected topics
+- some review interface is required in v1
+- OCR may later be reused from an existing separate OCR project; not required for v1
+
+21. Source and trust policy (from Batch 2):
+- sources have trust tiers
+- source types are not hard-deprioritized by default; ranking is driven by
+  trust/ranking logic instead
+- conflicting claims are shown side by side, indicating which source is currently
+  preferred based on trust/ranking
+
+22. Extraction policy (from Batch 3):
+- default always-extract set: source metadata, broad topic tags, entities,
+  dates/times, claims, key metrics/numbers when present
+- the default set stays configurable so the baseline can be edited later
+- explicit-only extraction (examples): exhaustive relationship mapping, detailed
+  sentiment/opinion analysis, fine-grained economic breakdowns, full legal/regulatory
+  extraction, product-spec normalization across every attribute, quote-level
+  extraction everywhere
+- extraction modes exist from the start: general, historical, economic, legal,
+  product/spec
+
+23. Retrieval and freshness (from Batch 4):
+- hybrid retrieval: prefer stored knowledge first unless stale or incomplete
+- reanalyze a stored source when the question/focus changes; re-fetch only if stale,
+  missing, or explicitly refreshed
+- after model/schema/prompt improvements, mark affected sources outdated; re-extract
+  on demand or via optional batch re-extraction for selected topics/sources
+
+24. Operations and review workflow (from Batch 5):
+- jobs are hybrid: manual by default, background allowed for explicit monitoring or
+  larger queued work
+- optional manual review exists for important claims before they are treated as
+  trusted
+- on partial failure: keep partial results, mark the run incomplete, allow retry later
+
+25. Interfaces and outputs (from Batch 6):
+- web UI is the primary interface first
+- v1 exports for other local tools: JSON, SQL views, local API (CSV not required)
+- v1 review UI: source list/detail, topic timelines, claim list with
+  status/confidence, contradiction/conflict view, job/run status view
 
 ## Recommended Direction
 
@@ -276,19 +333,25 @@ This is the current recommended table set for v1.
 - `topic_source_links`
 - `sources`
 - `source_versions`
+- `source_fetch_attempts`
 - `artifacts`
 - `artifact_chunks`
 - `analysis_focuses`
+- `extraction_runs`
+- `extracted_observations`
 - `entities`
 - `entity_mentions`
 - `events`
 - `event_mentions`
 - `claims`
+- `claim_topics`
 - `claim_evidence`
 - `claim_links`
+- `resolution_candidates`
 - `metrics`
 - `reports`
 - `jobs`
+- `job_dependencies`
 - `sessions`
 - `messages`
 
@@ -310,6 +373,10 @@ This is the current recommended table set for v1.
 `source_versions`
 - snapshots of a source over time, especially for changing web pages
 
+`source_fetch_attempts`
+- history of fetch/parse attempts, redirects, failures, blocked pages, and transcript or
+  parser errors
+
 `artifacts`
 - normalized extracted assets such as cleaned text, transcript text, parsed PDF text
 
@@ -324,6 +391,15 @@ This table should support both:
 
 - topic-bound analysis
 - source-only analysis without a topic
+
+`extraction_runs`
+- provenance for a specific extraction pass, including model, prompt version, extraction
+  modes, parameters, scope, status, and output summary
+
+`extracted_observations`
+- raw model outputs from a source chunk before they are resolved into canonical claims,
+  entities, events, or metrics
+- protects the curated knowledge base from first-pass extraction noise
 
 `entities`
 - people, organizations, products, places, documents, etc.
@@ -340,11 +416,19 @@ This table should support both:
 `claims`
 - atomic statements such as "X happened on date Y" or "product Z has 32 GB RAM"
 
+`claim_topics`
+- optional many-to-many link between claims and topics, mirroring `topic_source_links`
+- claims can exist with no topic and be attached to several topics later (decision 19)
+
 `claim_evidence`
 - links from claims to supporting, contradicting, or contextual evidence in source chunks
 
 `claim_links`
 - relationships between claims such as duplicate, derived-from, contradicts, supersedes
+
+`resolution_candidates`
+- possible entity/event/claim duplicates, contradictions, or merges awaiting automatic or
+  manual resolution
 
 `metrics`
 - structured numeric/time/currency/spec values for comparison queries
@@ -354,6 +438,9 @@ This table should support both:
 
 `jobs`
 - background ingestion, extraction, verification, refresh, and retry state
+
+`job_dependencies`
+- dependency edges between jobs so multi-step workflows can retry or resume safely
 
 `sessions` / `messages`
 - keep chat history separate from the knowledge store
@@ -376,6 +463,13 @@ Each claim should also carry:
 - prompt/version metadata
 - timestamps
 
+Important distinction:
+
+- raw extracted model output should be stored separately from canonical claims
+- canonical `claims` are the resolved KB view
+- `extracted_observations` are the audit trail of what a model said before resolution,
+  review, deduplication, or promotion
+
 ## Evidence Model
 
 Each claim should be traceable to one or more evidence records including:
@@ -385,10 +479,45 @@ Each claim should be traceable to one or more evidence records including:
 - artifact ID
 - chunk ID
 - evidence type: support / contradict / mention / derived
-- excerpt or offsets
+- excerpt text
+- exact character offsets where available
+- quote hash or normalized excerpt hash where useful
+- transcript time offsets where available
 - extraction timestamp
 
 This is necessary for trust, comparison, and debugging.
+
+## Verification Policy and Budget
+
+Verification is the one workflow whose cost can explode: every claim can fan out into
+searches, scrapes, and extra extraction passes. Build order step 6 gates it with an
+explicit per-claim budget so cost stays bounded.
+
+Triggers:
+
+- manual request (verify a claim, a topic, or the claims behind a report)
+- claims whose `importance_score` exceeds a configurable threshold after extraction
+- report generation may queue verification for high-importance unverified claims it
+  wants to cite, rather than blocking on them
+
+Per-claim budget (defaults, configurable):
+
+- at most 2 web searches
+- at most 3 additional sources examined
+- one extraction/comparison pass per examined source
+
+Stop conditions:
+
+- budget exhausted, or
+- 2 independent supporting sources found, or
+- a contradiction found — at which point the goal switches to recording the conflict
+  (`claim_links`, `resolution_candidates`), not resolving it inside the budget
+
+On budget exhaustion the claim stays `unverified`, with
+`claims.verification_attempted_at` set so reports can distinguish "never checked"
+from "checked, inconclusive". Verification work runs through `jobs`, so topic-wide
+verification is many small budgeted jobs — resumable, retryable, and individually
+cheap.
 
 ## Ingestion Pipeline Plan
 
@@ -475,12 +604,18 @@ claim/evidence schema has stabilized.
    - how bad is the duplication problem, and what resolution strategy is required?
 
    Prototype this on **SQLite** — do not gate it on a database migration. Throw the code
-   away; keep the learnings and a schema shaped by real output.
+   away; keep the learnings and a schema shaped by real output. During the spike, model
+   outputs should be treated as raw `extracted_observations`, not as final canonical
+   `claims`.
 
 1. Lock the **entity/claim/event resolution strategy** explicitly (even if v1's answer is
    "lexical + trigram match plus a review queue for merges"). Resolution is not a
    second-wave nicety — it is what makes the KB queryable instead of a pile of
-   disconnected extractions. Decide it now; do not let it be emergent.
+   disconnected extractions. Decide it now; do not let it be emergent. Include a simple
+   merge/review queue concept so uncertain duplicates can be preserved instead of
+   guessed away. In v1, resolution reads mention locations from
+   `extracted_observations` (chunk IDs + offsets) — `entity_mentions` and
+   `event_mentions` are second-wave tables, not resolution prerequisites.
 
 2. Add the **source registry plus versioned ingestion** for web, files, and YouTube
    transcripts, still on SQLite. Wire in the retention invariant (see retention section:
@@ -497,7 +632,8 @@ claim/evidence schema has stabilized.
    This is also where jsonb ergonomics, real FTS, and concurrent workers start to pay off.
 
 6. Add the **verification workflow**, gated by a per-claim verification budget tied to
-   `importance_score` (see verification section) so search cost cannot explode.
+   `importance_score` (see "Verification Policy and Budget") so search cost cannot
+   explode.
 
 7. Add **topic reports and event comparison** (timeline first).
 
@@ -561,17 +697,29 @@ biggest v1 scope decisions: what resolution strategy is actually required
 
 ### Concrete shape
 
-A small standalone script. No database migration, no web UI, no new schema:
+A small standalone script. No production database migration, no web UI, no final schema:
 
-- load 1 real article + 1 real YouTube transcript (reuse the existing scraper)
+- load 1 real article + 1 real YouTube transcript covering the same story or topic —
+  required, since the resolution question cannot be tested unless the sources overlap
+  (reuse the existing scraper)
 - chunk them (naive fixed-size chunking is fine for the spike)
 - for each chunk, call the local model with a claim-extraction prompt returning JSON such
   as `[{claim_text, entities[], event?, confidence, source_chunk_id}]`
-- write everything to a JSONL file
+- write everything to a JSONL file or throwaway SQLite tables
 - print summary counts (claims per source, roughly-unique entities, obvious duplicate
   clusters)
 
-Then read the JSONL by hand. That reading is the actual deliverable.
+Then read the JSONL or SQLite output by hand. That reading is the actual deliverable.
+
+For SQLite-backed spike tables, keep the shape intentionally small:
+
+- `spike_chunks`
+- `spike_extraction_runs`
+- `spike_extracted_observations`
+- `spike_resolution_candidates`
+
+Do not treat those names or columns as final. Their job is to expose what the model
+actually returns and what the later PostgreSQL schema must support.
 
 ### Why no database for the spike
 
@@ -585,6 +733,9 @@ rows have a known, validated shape.
 
 - a `claims` / `entities` / `claim_evidence` schema reverse-engineered from real output
   instead of guessed
+- an `extracted_observations` shape that separates raw model output from canonical KB
+  records
+- a first pass at `resolution_candidates` for duplicate entities, events, and claims
 - a read on whether the intended fast model (for example `Qwen3-14B`) is good enough for
   first-pass extraction, or whether the heavy model is needed from the start
 - an honest sizing of the resolution problem, feeding the step-1 resolution decision
@@ -598,12 +749,27 @@ rows have a known, validated shape.
   questions above have concrete answers
 - output feeds directly into the schema draft and the step-1 resolution strategy decision
 
+Minimum quality gates before moving past the spike:
+
+- most extracted claims must be atomic enough to dedupe and verify
+- evidence links must point to the correct chunk or transcript range often enough to be
+  trusted as provenance
+- hallucinated specifics must be rare enough that review and verification can contain the
+  risk
+- duplicate entity/event/claim clusters must be measurable, with a proposed v1 resolution
+  strategy
+- self-reported confidence and importance scores must be judged useful or explicitly
+  treated as weak metadata
+
+If these gates fail, do not proceed directly to schema implementation. Adjust prompt
+shape, model choice, chunking, or extraction mode design first.
+
 ## Hardware & Resource Planning
 
 Hardware sizing, GPU/RAM/storage tiers, and purchase logic have moved to a
 dedicated doc so they can evolve independently of the data model and pipeline:
 
-- [HARDWARE.md](HARDWARE.md) — resource planning + revised hardware recommendation
+- [HARDWARE.md](HARDWARE.md) — hardware recommendation, machine tiers, and purchase logic
 
 ## Initial Feature Boundaries
 
@@ -626,12 +792,6 @@ Note:
 
 - OCR may later be integrated from an existing separate OCR project, but it is not required for this project's v1 scope
 
-## Open Questions Still Needing Answers
-
-These questions still need user decisions.
-
-There are no currently unresolved planning questions captured from the discussion so far.
-
 ## Decision Backlog For Project Definition
 
 To avoid a large unfocused design pass, the remaining decisions should be handled in small batches.
@@ -650,21 +810,7 @@ Answer these first:
 
 Current answer status:
 
-- v1 should treat the personal local knowledge base and the deep-research agent as equal priorities
-- current workflow candidates for v1:
-- v1 workflow set:
-  - ingest a YouTube video, playlist, or list of documents and extract general data by broad categories such as history/economic unless a specific topic is given
-  - start from a topic plus starting sources such as YouTube, websites, and PDFs, then continue researching with additional web search
-  - knowledge-base querying and timeline/report style outputs are considered extensions of the first two workflows rather than separate standalone workflow categories
-- currently out of scope for v1:
-  - no multi-user support in v1
-- v1 monitoring scope:
-  - manual refresh by default
-  - monitoring only when explicitly enabled for selected topics
-- v1 review requirement:
-  - some review interface is required in v1
-- future OCR note:
-  - there is already a separate working OCR project that may be reused later instead of building OCR here from scratch
+- resolved — recorded as decision 20 in the Decision Register
 
 Why this batch matters:
 
@@ -690,10 +836,7 @@ Why this batch matters:
 
 Current answer status:
 
-- sources should have trust tiers
-- source types should not be hard-deprioritized by default
-- ranking should be driven by trust/ranking logic instead
-- when claims conflict, show the conflicting claims side by side and indicate which source is currently preferred based on trust/ranking
+- resolved — recorded as decision 21 in the Decision Register
 
 ### Batch 3: extraction policy
 
@@ -715,28 +858,7 @@ Why this batch matters:
 
 Current answer status:
 
-- default always-extract set is acceptable as:
-  - source metadata
-  - broad topic tags
-  - entities
-  - dates/times
-  - claims
-  - key metrics/numbers when present
-- default extraction behavior should remain configurable so the baseline set can be edited later
-- explicit-only extraction examples accepted for now:
-  - exhaustive relationship mapping
-  - detailed sentiment/opinion analysis
-  - fine-grained economic breakdowns
-  - full legal/regulatory extraction
-  - product-spec normalization across every attribute
-  - quote-level extraction everywhere
-- extraction modes should exist from the start
-- initial mode candidates:
-  - general
-  - historical
-  - economic
-  - legal
-  - product/spec
+- resolved — recorded as decision 22 in the Decision Register
 
 ### Batch 4: retrieval and freshness behavior
 
@@ -759,11 +881,7 @@ Why this batch matters:
 
 Current answer status:
 
-- retrieval should be hybrid: prefer stored knowledge first unless it is stale or incomplete
-- reanalyze a source if it is already stored locally and the question/focus changed
-- re-fetch only if the source is stale, missing, or explicitly refreshed
-- after model/schema/prompt improvements, affected sources should be marked outdated
-- re-extraction should happen on demand or through optional batch re-extraction for selected topics/sources
+- resolved — recorded as decision 23 in the Decision Register
 
 ### Batch 5: operations and review workflow
 
@@ -783,10 +901,7 @@ Why this batch matters:
 
 Current answer status:
 
-- long ingestion/extraction jobs should use a hybrid model
-- manual by default, but background jobs allowed for explicit monitoring or larger queued work
-- optional manual review should exist for important claims before they are treated as trusted
-- on partial failure, keep partial results, mark the run incomplete, and allow retry later
+- resolved — recorded as decision 24 in the Decision Register
 
 ### Batch 6: interfaces and outputs
 
@@ -814,18 +929,7 @@ Why this batch matters:
 
 Current answer status:
 
-- the web UI should be the primary interface first
-- v1 should support export/output for other local tools via:
-  - JSON
-  - SQL views
-  - local API
-- CSV is not required for v1
-- v1 review UI should include:
-  - source list and source detail
-  - topic timelines
-  - claim list with status/confidence
-  - contradiction/conflict view
-  - job/run status view
+- resolved — recorded as decision 25 in the Decision Register
 
 ## Summary of Current Recommendation
 
@@ -858,6 +962,18 @@ It is not final SQL, but it should be close enough to drive migrations, service 
 - use `jsonb` only where flexibility is useful; do not replace core normalized tables with blobs
 - store raw files and snapshots on disk; store paths, hashes, and metadata in PostgreSQL
 - use enums or constrained text values for status/type fields depending on migration preference
+
+### Source identity and lifecycle rules
+
+- define canonicalization rules before bulk ingestion, including URL normalization,
+  YouTube video/playlist identity, file hash behavior, and redirect handling
+- store fetch failures and parse failures; they are useful for retry logic and freshness
+  decisions
+- support source deletion as an explicit lifecycle operation, not an ad hoc row delete
+- when deleting a source, decide whether to keep reports, remove generated facts, or
+  tombstone affected claims
+- never delete evidence-referenced source versions unless the dependent evidence and
+  derived records are intentionally removed as part of a controlled cleanup
 
 ### Suggested extensions
 
@@ -1019,6 +1135,9 @@ Suggested fields:
 
 Notes:
 - retention policy should preserve first version plus newest two versions
+- `is_first_version` and `is_latest` are denormalized flags owned by the ingest and
+  prune jobs; update them in the same transaction that inserts or removes versions,
+  or they will drift
 - `retention_locked` allows manual exceptions later if policy ever changes
 - **evidence integrity overrides the prune rule.** See "Retention vs. Evidence
   Integrity" below — a version that has `claim_evidence` referencing it must never be
@@ -1031,7 +1150,7 @@ Indexes:
 
 ##### Retention vs. Evidence Integrity
 
-The universal "first version + newest two versions" rule (see requirements 13 and 16)
+The universal "first version + newest two versions" rule (see decisions 13 and 16)
 directly conflicts with `claim_evidence.source_version_id`. If a claim's evidence points
 at version 4, and version 4 is a "middle" version, the naive prune rule would delete the
 exact snapshot the provenance depends on — orphaning the evidence and destroying the one
@@ -1051,6 +1170,51 @@ This is a latent data-corruption bug, so the invariant must be explicit:
 - Net effect: the retained set for a source is "first + newest two + every version any
   claim cites." This can exceed three versions for heavily-cited sources — that is
   correct and intended.
+
+The same invariant applies one level down. Evidence actually anchors to
+`artifact_chunks`, not just versions, and chunks have a second death path that the
+prune rule alone does not cover: **re-chunking**. Re-running chunking with different
+parameters (new chunk size, changed text normalization, prompt/model upgrades per
+Batch 4) would orphan every `claim_evidence.artifact_chunk_id` pointing at the
+replaced rows — the same corruption, with no pruning involved. So:
+
+- **chunks are immutable once any `claim_evidence` row references them** — re-chunking
+  creates a new chunk set (a new `artifacts` row or a new chunk generation), never an
+  in-place update or delete of referenced chunk rows
+- enforce with `claim_evidence.artifact_chunk_id -> artifact_chunks.id`
+  `ON DELETE RESTRICT`, exactly like the version FK
+- `excerpt_hash` is the detection net for normalization drift, not a license to
+  rewrite referenced chunks
+
+#### `source_fetch_attempts`
+
+Purpose:
+- operational history for attempts to fetch, parse, or refresh a source
+
+Suggested fields:
+- `id uuid primary key`
+- `source_id uuid null`
+- `source_version_id uuid null`
+- `attempt_type text` such as `fetch`, `parse`, `transcript_fetch`, `metadata_fetch`
+- `status text` such as `succeeded`, `partial`, `failed`, `blocked`, `not_found`
+- `requested_uri text null`
+- `final_uri text null`
+- `http_status integer null`
+- `error_code text null`
+- `error_message text null`
+- `started_at timestamptz`
+- `completed_at timestamptz null`
+- `metadata jsonb`
+- `created_at timestamptz`
+
+Notes:
+- failed fetches are useful data, especially for web pages, transcripts, redirects,
+  paywalls, unsupported MIME types, and parser failures
+- this table should not replace `jobs`; it records source-specific access outcomes
+
+Indexes:
+- index on `(source_id, created_at desc)`
+- index on `status`
 
 #### `artifacts`
 
@@ -1094,6 +1258,10 @@ Suggested fields:
 - `metadata jsonb`
 - `created_at timestamptz`
 
+Notes:
+- chunks referenced by `claim_evidence` are immutable; re-chunking produces a new
+  chunk set instead of replacing rows (see "Retention vs. Evidence Integrity")
+
 Indexes:
 - unique index on `(artifact_id, chunk_index)`
 - full-text index on `chunk_text`
@@ -1126,6 +1294,45 @@ Indexes:
 - index on `topic_run_id`
 - index on `source_id`
 
+#### `extraction_runs`
+
+Purpose:
+- provenance for a specific extraction pass over one or more chunks, artifacts, sources,
+  or topic runs
+
+Suggested fields:
+- `id uuid primary key`
+- `topic_run_id uuid null`
+- `analysis_focus_id uuid null`
+- `source_id uuid null`
+- `source_version_id uuid null`
+- `artifact_id uuid null`
+- `run_scope text` such as `chunk`, `artifact`, `source_version`, `source`, `topic_run`
+- `extraction_modes jsonb`
+- `model_id text not null`
+- `runtime text null`
+- `prompt_name text null`
+- `prompt_version text null`
+- `extraction_schema_version text null`
+- `parameters jsonb`
+- `status text` such as `queued`, `running`, `completed`, `partial`, `failed`, `stale`
+- `output_hash text null`
+- `result_summary jsonb`
+- `started_at timestamptz null`
+- `completed_at timestamptz null`
+- `created_at timestamptz`
+- `updated_at timestamptz`
+
+Notes:
+- every extracted observation should point back to an `extraction_run`
+- model, prompt, and schema versions are required so old outputs can be marked stale
+  after prompt/model/schema improvements
+
+Indexes:
+- index on `(source_id, created_at desc)`
+- index on `(artifact_id, created_at desc)`
+- index on `status`
+
 #### `jobs`
 
 Purpose:
@@ -1152,7 +1359,65 @@ Indexes:
 - index on `(status, priority, scheduled_at)`
 - index on `topic_run_id`
 
+#### `job_dependencies`
+
+Purpose:
+- dependency edges between jobs in multi-step workflows
+
+Suggested fields:
+- `id uuid primary key`
+- `job_id uuid not null`
+- `depends_on_job_id uuid not null`
+- `dependency_type text` such as `blocks_until_success`, `blocks_until_finished`
+- `created_at timestamptz`
+
+Notes:
+- ingestion pipelines are naturally ordered: fetch, parse, chunk, extract, verify, report
+- dependency edges make partial retry and resume behavior explicit
+
+Indexes:
+- unique index on `(job_id, depends_on_job_id)`
+- index on `depends_on_job_id`
+
 ### Knowledge tables
+
+#### `extracted_observations`
+
+Purpose:
+- raw model outputs before resolution into canonical entities, events, claims, or metrics
+
+Suggested fields:
+- `id uuid primary key`
+- `extraction_run_id uuid not null`
+- `artifact_chunk_id uuid not null`
+- `observation_type text` such as `claim`, `entity`, `event`, `metric`, `relationship`
+- `raw_text text not null`
+- `normalized_text text null`
+- `raw_payload jsonb`
+- `candidate_claim_id uuid null`
+- `candidate_entity_id uuid null`
+- `candidate_event_id uuid null`
+- `candidate_metric_id uuid null`
+- `confidence numeric(5,2) null`
+- `importance_score numeric(5,2) null`
+- `char_start integer null`
+- `char_end integer null`
+- `time_start_seconds numeric(12,3) null`
+- `time_end_seconds numeric(12,3) null`
+- `status text` such as `new`, `promoted`, `rejected`, `duplicate`, `needs_review`, `stale`
+- `created_at timestamptz`
+- `updated_at timestamptz`
+
+Notes:
+- this is the buffer between noisy model output and the curated knowledge base
+- canonical tables should be populated by promotion/resolution logic, not by blindly
+  trusting first-pass extraction
+
+Indexes:
+- index on `extraction_run_id`
+- index on `artifact_chunk_id`
+- index on `(observation_type, status)`
+- full-text or trigram index on `normalized_text`
 
 #### `entities`
 
@@ -1256,24 +1521,43 @@ Suggested fields:
 - `subject_entity_id uuid null`
 - `object_entity_id uuid null`
 - `event_id uuid null`
-- `topic_id uuid null`
 - `canonical_text text not null`
 - `normalized_text text not null`
 - `status text` such as `unverified`, `supported`, `contradicted`, `mixed`, `deprecated`
 - `preferred_source_id uuid null`
 - `confidence numeric(5,2) null`
 - `importance_score numeric(5,2) null`
+- `verification_attempted_at timestamptz null`
 - `is_user_reviewed boolean default false`
 - `reviewed_at timestamptz null`
 - `reviewed_by text null`
 - `created_at timestamptz`
 - `updated_at timestamptz`
 
+Notes:
+- topic linkage lives in `claim_topics`, not on the claim row — a claim can belong to
+  zero topics at ingest time and several topics later (decision 19)
+
 Indexes:
-- index on `topic_id`
 - index on `event_id`
 - index on `status`
 - full-text or trigram index on `normalized_text`
+
+#### `claim_topics`
+
+Purpose:
+- optional many-to-many link between claims and topics, mirroring `topic_source_links`
+
+Suggested fields:
+- `id uuid primary key`
+- `claim_id uuid not null`
+- `topic_id uuid not null`
+- `link_reason text` such as `extracted_in_run`, `manual_attach`, `derived`
+- `created_at timestamptz`
+
+Indexes:
+- unique index on `(claim_id, topic_id)`
+- index on `topic_id`
 
 #### `claim_evidence`
 
@@ -1283,13 +1567,25 @@ Purpose:
 Suggested fields:
 - `id uuid primary key`
 - `claim_id uuid not null`
+- `extraction_run_id uuid null`
+- `extracted_observation_id uuid null`
 - `artifact_chunk_id uuid not null`
 - `source_id uuid not null`
 - `source_version_id uuid not null`
 - `evidence_type text` such as `support`, `contradict`, `mention`, `derived`
 - `excerpt_text text null`
+- `excerpt_hash text null`
+- `char_start integer null`
+- `char_end integer null`
+- `time_start_seconds numeric(12,3) null`
+- `time_end_seconds numeric(12,3) null`
 - `confidence numeric(5,2) null`
 - `created_at timestamptz`
+
+Notes:
+- offsets should refer to the normalized artifact/chunk text where possible
+- transcript evidence should preserve timestamps where available
+- `excerpt_hash` helps detect when a chunk was regenerated or text normalization changed
 
 Indexes:
 - index on `claim_id`
@@ -1312,6 +1608,41 @@ Suggested fields:
 Indexes:
 - unique index on `(from_claim_id, to_claim_id, link_type)`
 
+#### `resolution_candidates`
+
+Purpose:
+- possible duplicate, merge, contradiction, or supersession candidates for entities,
+  events, claims, and metrics
+
+Suggested fields:
+- `id uuid primary key`
+- `candidate_type text` such as `entity_duplicate`, `event_duplicate`, `claim_duplicate`, `claim_contradiction`, `claim_supersession`
+- `left_entity_id uuid null`
+- `right_entity_id uuid null`
+- `left_event_id uuid null`
+- `right_event_id uuid null`
+- `left_claim_id uuid null`
+- `right_claim_id uuid null`
+- `left_observation_id uuid null`
+- `right_observation_id uuid null`
+- `score numeric(5,2) null`
+- `reason text null`
+- `method text` such as `normalized_text`, `trigram`, `embedding`, `model`, `manual`
+- `status text` such as `open`, `accepted`, `rejected`, `deferred`, `auto_applied`
+- `reviewed_by text null`
+- `reviewed_at timestamptz null`
+- `created_at timestamptz`
+- `updated_at timestamptz`
+
+Notes:
+- this table is the v1 merge/review queue
+- uncertain matches should become candidates instead of being silently merged
+
+Indexes:
+- index on `(candidate_type, status)`
+- index on `left_claim_id`
+- index on `right_claim_id`
+
 #### `metrics`
 
 Purpose:
@@ -1320,7 +1651,6 @@ Purpose:
 Suggested fields:
 - `id uuid primary key`
 - `claim_id uuid null`
-- `topic_id uuid null`
 - `event_id uuid null`
 - `entity_id uuid null`
 - `metric_name text not null`
@@ -1333,10 +1663,12 @@ Suggested fields:
 - `metadata jsonb`
 - `created_at timestamptz`
 
+Notes:
+- topic scoping is derived through `claim_id -> claim_topics` when needed
+
 Indexes:
 - index on `(metric_name, effective_at)`
 - index on `entity_id`
-- index on `topic_id`
 
 ### Reporting and review tables
 
@@ -1434,10 +1766,25 @@ Important relationships that should exist from the start:
 - `sources.source_type_id -> source_types.id`
 - `sources.trust_tier_id -> trust_tiers.id`
 - `source_versions.source_id -> sources.id`
+- `source_fetch_attempts.source_id -> sources.id`
+- `source_fetch_attempts.source_version_id -> source_versions.id`
 - `artifacts.source_version_id -> source_versions.id`
 - `artifact_chunks.artifact_id -> artifacts.id`
 - `analysis_focuses.topic_run_id -> topic_runs.id`
 - `analysis_focuses.source_id -> sources.id`
+- `extraction_runs.topic_run_id -> topic_runs.id`
+- `extraction_runs.analysis_focus_id -> analysis_focuses.id`
+- `extraction_runs.source_id -> sources.id`
+- `extraction_runs.source_version_id -> source_versions.id`
+- `extraction_runs.artifact_id -> artifacts.id`
+- `job_dependencies.job_id -> jobs.id`
+- `job_dependencies.depends_on_job_id -> jobs.id`
+- `extracted_observations.extraction_run_id -> extraction_runs.id`
+- `extracted_observations.artifact_chunk_id -> artifact_chunks.id`
+- `extracted_observations.candidate_claim_id -> claims.id`
+- `extracted_observations.candidate_entity_id -> entities.id`
+- `extracted_observations.candidate_event_id -> events.id`
+- `extracted_observations.candidate_metric_id -> metrics.id`
 - `entity_aliases.entity_id -> entities.id`
 - `entity_mentions.entity_id -> entities.id`
 - `entity_mentions.artifact_chunk_id -> artifact_chunks.id`
@@ -1446,16 +1793,26 @@ Important relationships that should exist from the start:
 - `claims.subject_entity_id -> entities.id`
 - `claims.object_entity_id -> entities.id`
 - `claims.event_id -> events.id`
-- `claims.topic_id -> topics.id`
 - `claims.preferred_source_id -> sources.id`
+- `claim_topics.claim_id -> claims.id`
+- `claim_topics.topic_id -> topics.id`
 - `claim_evidence.claim_id -> claims.id`
+- `claim_evidence.extraction_run_id -> extraction_runs.id`
+- `claim_evidence.extracted_observation_id -> extracted_observations.id`
 - `claim_evidence.artifact_chunk_id -> artifact_chunks.id`
 - `claim_evidence.source_id -> sources.id`
 - `claim_evidence.source_version_id -> source_versions.id`
 - `claim_links.from_claim_id -> claims.id`
 - `claim_links.to_claim_id -> claims.id`
+- `resolution_candidates.left_entity_id -> entities.id`
+- `resolution_candidates.right_entity_id -> entities.id`
+- `resolution_candidates.left_event_id -> events.id`
+- `resolution_candidates.right_event_id -> events.id`
+- `resolution_candidates.left_claim_id -> claims.id`
+- `resolution_candidates.right_claim_id -> claims.id`
+- `resolution_candidates.left_observation_id -> extracted_observations.id`
+- `resolution_candidates.right_observation_id -> extracted_observations.id`
 - `metrics.claim_id -> claims.id`
-- `metrics.topic_id -> topics.id`
 - `metrics.event_id -> events.id`
 - `metrics.entity_id -> entities.id`
 - `reports.topic_id -> topics.id`
@@ -1470,12 +1827,13 @@ Important relationships that should exist from the start:
 
 - full-text search index on `artifact_chunks.chunk_text`
 - lookup indexes on `sources.canonical_key`, `entities.normalized_name`, `events.start_at`
-- status indexes on `claims.status`, `jobs.status`, `topic_runs.status`
+- status indexes on `claims.status`, `jobs.status`, `topic_runs.status`,
+  `extraction_runs.status`, `extracted_observations.status`
 - recent-first indexes on `source_versions(source_id, captured_at desc)` and `reports(topic_id, created_at desc)`
 
 ### What can be deferred from v1 if needed
 
-- advanced entity resolution tables
+- advanced entity resolution tables beyond the basic `resolution_candidates` queue
 - graph-style relationship expansion
 - vector embeddings tables
 - automated taxonomy-management tables
@@ -1492,16 +1850,22 @@ If the first build needs to stay disciplined, prioritize these tables first:
 - `trust_tiers`
 - `sources`
 - `source_versions`
+- `source_fetch_attempts`
 - `artifacts`
 - `artifact_chunks`
 - `analysis_focuses`
+- `extraction_runs`
+- `extracted_observations`
 - `entities`
 - `events`
 - `claims`
+- `claim_topics`
 - `claim_evidence`
+- `resolution_candidates`
 - `metrics`
 - `reports`
 - `jobs`
+- `job_dependencies`
 - `sessions`
 - `messages`
 
@@ -1514,6 +1878,9 @@ Then add second-wave tables after the pipeline works:
 - `claim_links`
 - `report_sources`
 - `claim_reviews`
+
+Deferring `entity_mentions` / `event_mentions` does not block resolution: v1
+resolution reads mention locations from `extracted_observations`.
 
 ## Local Model & Runtime Plan
 
