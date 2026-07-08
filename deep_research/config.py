@@ -33,6 +33,12 @@ class WebConfig(BaseModel):
     port: int = 8000
 
 
+class KBConfig(BaseModel):
+    """Knowledge base storage — deliberately separate from chat session storage."""
+    db_path: str = "~/.local/share/deep_research/kb.db"
+    snapshot_dir: str = "~/.local/share/deep_research/kb_snapshots"
+
+
 class Config(BaseModel):
     llm: LLMConfig = LLMConfig()
     searxng: SearXNGConfig = SearXNGConfig()
@@ -40,10 +46,19 @@ class Config(BaseModel):
     agent: AgentConfig = AgentConfig()
     db: DBConfig = DBConfig()
     web: WebConfig = WebConfig()
+    kb: KBConfig = KBConfig()
 
     @property
     def db_path(self) -> Path:
         return Path(self.db.path).expanduser()
+
+    @property
+    def kb_db_path(self) -> Path:
+        return Path(self.kb.db_path).expanduser()
+
+    @property
+    def kb_snapshot_dir(self) -> Path:
+        return Path(self.kb.snapshot_dir).expanduser()
 
 
 def _apply_env_overrides(config: Config) -> Config:
@@ -59,6 +74,8 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_DB_PATH": ("db", "path"),
         "DEEP_RESEARCH_WEB_HOST": ("web", "host"),
         "DEEP_RESEARCH_WEB_PORT": ("web", "port"),
+        "DEEP_RESEARCH_KB_DB_PATH": ("kb", "db_path"),
+        "DEEP_RESEARCH_KB_SNAPSHOT_DIR": ("kb", "snapshot_dir"),
     }
     data = config.model_dump()
     for env_var, (section, key) in env_map.items():

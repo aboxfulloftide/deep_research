@@ -166,7 +166,33 @@ From the planning discussion:
   trusted
 - on partial failure: keep partial results, mark the run incomplete, allow retry later
 
-25. Interfaces and outputs (from Batch 6):
+25. Resolution strategy (from build-order step 1, informed by the step-0 spike):
+- entities: auto-merge only on exact normalized-name match (lowercased,
+  punctuation-stripped); any fuzzy/substring match additionally requires a minimum
+  normalized-name length before it is even considered, and always lands in
+  `resolution_candidates` for review — it is never auto-merged. The spike found naive
+  substring matching without a length guard unusably noisy (e.g. "AI" flagged as a
+  duplicate of "Britain" and "Mark Twain" because both strings happen to contain "ai")
+- claims: no auto-merge tier at all in v1. Candidate generation runs on embedding
+  cosine similarity (`nomic-embed-text`, "clustering:" instruction prefix) between
+  claims from different sources/extraction runs; pairs above a similarity threshold
+  are written to `resolution_candidates` as `claim_duplicate` for review. Lexical/
+  trigram similarity is not used for cross-source claim dedup — the spike measured it
+  catching zero real duplicates. Embedding similarity does catch real duplicates the
+  lexical pass misses, but precision degrades fast past the top few pairs per claim
+  (measured: only 50% precision even at a 0.85 cosine cutoff), so this is a candidate
+  filter feeding review, not a merge trigger
+- events: not directly exercised by the spike (chunking didn't surface multiple
+  independent mentions of the same event). Use the same pattern as claims —
+  normalized-title exact match as the only auto-merge tier, everything else queued —
+  until real event volume justifies revisiting
+- consequence for Role C (embeddings) in `MODELS.md`: no longer purely optional or
+  deferrable. An embeddings model needs to be resident starting at the resolution
+  step (build order step 1), not just as a later retrieval improvement
+- see [spike/FINDINGS.md](spike/FINDINGS.md) for the full validation this decision is
+  based on, including the specific true/false-positive examples at each threshold
+
+26. Interfaces and outputs (from Batch 6):
 - web UI is the primary interface first
 - v1 exports for other local tools: JSON, SQL views, local API (CSV not required)
 - v1 review UI: source list/detail, topic timelines, claim list with
@@ -608,18 +634,34 @@ claim/evidence schema has stabilized.
    outputs should be treated as raw `extracted_observations`, not as final canonical
    `claims`.
 
-1. Lock the **entity/claim/event resolution strategy** explicitly (even if v1's answer is
-   "lexical + trigram match plus a review queue for merges"). Resolution is not a
-   second-wave nicety — it is what makes the KB queryable instead of a pile of
-   disconnected extractions. Decide it now; do not let it be emergent. Include a simple
-   merge/review queue concept so uncertain duplicates can be preserved instead of
-   guessed away. In v1, resolution reads mention locations from
-   `extracted_observations` (chunk IDs + offsets) — `entity_mentions` and
+1. **Done.** Lock the **entity/claim/event resolution strategy** explicitly. Resolution
+   is not a second-wave nicety — it is what makes the KB queryable instead of a pile of
+   disconnected extractions. Locked as decision 25 in the Decision Register: exact
+   normalized-name match auto-merges entities, everything else (fuzzy entity matches,
+   all claim matches via embedding similarity, event matches) lands in
+   `resolution_candidates` for review — nothing else auto-merges. This is not the
+   "lexical + trigram" default this section originally floated: the step-0 spike
+   measured lexical/trigram claim matching catching zero real cross-source duplicates,
+   so claim candidate generation runs on embedding similarity instead (see
+   [spike/FINDINGS.md](spike/FINDINGS.md)). In v1, resolution reads mention locations
+   from `extracted_observations` (chunk IDs + offsets) — `entity_mentions` and
    `event_mentions` are second-wave tables, not resolution prerequisites.
 
-2. Add the **source registry plus versioned ingestion** for web, files, and YouTube
-   transcripts, still on SQLite. Wire in the retention invariant (see retention section:
-   never prune a version that has evidence pointing at it).
+2. **Done.** Add the **source registry plus versioned ingestion** for web, files, and
+   YouTube transcripts, still on SQLite. Wire in the retention invariant (see retention
+   section: never prune a version that has evidence pointing at it). Implemented in
+   `deep_research/kb/` (`db.py`, `canonical.py`, `storage.py`, `ingest.py`) with a CLI
+   at `cli/kb.py` (`deep-research-kb ingest-url|ingest-youtube|ingest-file|list-sources|
+   show-source`), using a SQLite db separate from chat sessions (`kb.db` next to
+   `research.db`) plus a `kb_snapshots/` directory of raw files on disk. Verified
+   end-to-end: dedup on unchanged content, new versions on real content changes,
+   first+newest-two pruning with files deleted from disk, the `retention_locked`
+   evidence-integrity carve-out surviving a prune pass, and all three ingestion
+   failure paths (bad URL, missing file, bad YouTube ID) logging to
+   `source_fetch_attempts` instead of crashing. One design correction made during
+   verification: file source identity is the file path, not the content hash — content
+   hash as identity would make every edit a brand-new unrelated source instead of a new
+   version of the same one, which would have defeated file versioning entirely.
 
 3. Add **chunk storage and retrieval** (FTS5 baseline).
 
@@ -651,8 +693,18 @@ Important notes:
 
 ## Extraction + Resolution Spike (Step 0)
 
-Status: planned, not started. Do not build or run this yet. This section captures the
-intent so the spike can be executed cleanly when the project is ready to begin.
+Status: **done**. Harness lives in `spike/` (throwaway, per the plan below); results
+and the answers to both exit questions are in [spike/FINDINGS.md](spike/FINDINGS.md).
+Headline results: 158 claims extracted from one article + one YouTube transcript on
+the same topic using `Qwen3-14B` via local `llama.cpp`; extraction quality cleared all
+minimum quality gates. Key adjustment for step 1: entity resolution should auto-merge
+only on exact normalized-name match (naive substring/fuzzy matching on short names was
+unusably noisy — e.g. "AI" spuriously matched "Britain"), and claim resolution needs an
+embedding-similarity pass since lexical matching found zero cross-source claim
+duplicates even where sources overlapped in substance.
+
+This section below captures the original intent so the spike's design rationale
+stays visible next to the results.
 
 ### Why this comes first
 
@@ -929,7 +981,7 @@ Why this batch matters:
 
 Current answer status:
 
-- resolved — recorded as decision 25 in the Decision Register
+- resolved — recorded as decision 26 in the Decision Register
 
 ## Summary of Current Recommendation
 

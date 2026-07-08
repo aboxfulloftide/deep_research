@@ -245,14 +245,44 @@ If you are deciding whether the next dollar should go to GPU, RAM, or storage:
 
 1. Get to `64 GB` RAM if you are below that now
 2. Ensure at least `2 TB` of fast SSD storage
-3. Then move from `16 GB` VRAM to `32 GB` VRAM if the project is staying on the current roadmap
+3. Then move from `16 GB` VRAM to `32 GB` VRAM once the project actually needs the
+   heavy model tier running alongside the fast one (see spike result below) — not
+   before
 
-Timing note: tie the GPU purchase to the plan's step-0 extraction spike (see
-"Extraction + Resolution Spike" in [PLAN_KB_ARCHITECTURE.md](PLAN_KB_ARCHITECTURE.md)).
-The spike runs fine on the existing `16 GB` card and answers exactly the question
-that justifies the spend — whether a ~14B model is good enough for first-pass
-extraction or a heavier model is needed from the start. RAM and storage are safe to
-buy anytime; defer the GPU until the spike result is in.
+#### Spike result: the 16 GB card already clears the bar this purchase was gated on
+
+The step-0 extraction spike (see [spike/FINDINGS.md](spike/FINDINGS.md)) ran
+`Qwen3-14B-Q4_K_M` via `llama.cpp` on the existing single `16 GB` card (9.6 GB used)
+and cleared every minimum quality gate: atomic claims, 0 hallucinations across 158
+extracted claims, 96% of evidence quotes matched the source text verbatim. This
+directly answers the question the GPU purchase was waiting on — "is a ~14B model
+good enough for first-pass extraction, or is a heavier model needed from the start" —
+and the answer is **the 14B model is good enough**. That result weakens the case for
+an immediate GPU upgrade rather than strengthening it: a single `16 GB` card is
+sufficient for the fast-model extraction tier as designed.
+
+What still justifies `32 GB` VRAM, now more precisely than before the spike:
+
+- **running the heavy model (Role B) resident alongside the fast model**, instead of
+  unloading one to load the other. `Qwen3-30B-A3B` / `Gemma 3 27B` at Q4 runs roughly
+  `18-20 GB` by itself — it doesn't fit next to the 14B model in `16 GB` at all. The
+  spike hit this cost directly: switching the local `llama.cpp` server from
+  `gpt-oss-20b` to `qwen3-14b` mid-spike meant real unload/download/reload downtime.
+- **keeping an embeddings model loaded concurrently for claim resolution.** The spike
+  found that lexical/trigram similarity caught zero cross-source claim duplicates even
+  where sources overlapped in substance — an embedding-similarity pass is now a
+  required part of step 1's resolution strategy, not an optional later upgrade. The
+  embedding model itself is small (`nomic-embed-text` is ~274 MB), but it needs to sit
+  alongside whichever generation model is active without fighting it for the last few
+  GB of a nearly-full `16 GB` card.
+- **headroom for a better quantization** (Q5/Q6/Q8 instead of Q4) on the heavy
+  verification/synthesis tier, once it isn't competing with the fast model for the
+  same `16 GB`.
+
+Net effect: defer the GPU purchase until the pipeline actually needs the fast model,
+heavy model, and embeddings model loaded at the same time (build order steps 1, 4, and
+6 — resolution, extraction pipeline, verification) — not because first-pass extraction
+quality needs it. RAM and storage are safe to buy anytime regardless.
 
 ### Bottom-line recommendation
 

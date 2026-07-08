@@ -18,10 +18,12 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "sse-starlette>=2.0",
+    "youtube-transcript-api>=0.6",
 ]
 
 [project.scripts]
 deep-research = "cli.main:main"
+deep-research-kb = "cli.kb:main"
 
 [tool.setuptools.packages.find]
 include = ["deep_research*", "cli*", "web*"]
