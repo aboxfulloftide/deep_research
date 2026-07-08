@@ -15,9 +15,17 @@ from deep_research.kb.storage import SnapshotStore
 console = Console()
 
 
+def _fmt_ts(value) -> str:
+    """Postgres returns real datetime objects (not the ISO strings SQLite
+    stored), so format explicitly instead of the old string[:19] slicing."""
+    if value is None:
+        return ""
+    return value.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def _kb_setup(args):
     config = load_config(args.config)
-    kb_db = KBDatabase(config.kb_db_path)
+    kb_db = KBDatabase(config.kb.postgres_dsn)
     snapshot_store = SnapshotStore(config.kb_snapshot_dir)
     return config, kb_db, snapshot_store
 
@@ -77,7 +85,7 @@ async def cmd_list_sources(args):
             s["source_type_code"],
             s.get("title") or "(untitled)",
             s.get("trust_tier_code") or "-",
-            s["updated_at"][:19],
+            _fmt_ts(s["updated_at"]),
         )
     console.print(table)
 
@@ -112,7 +120,7 @@ async def cmd_show_source(args):
     table.add_column("Bytes")
     for v in versions:
         table.add_row(
-            str(v["version_number"]), v["captured_at"][:19],
+            str(v["version_number"]), _fmt_ts(v["captured_at"]),
             "yes" if v["is_first_version"] else "",
             "yes" if v["is_latest"] else "",
             "yes" if v["retention_locked"] else "",
@@ -129,7 +137,7 @@ async def cmd_show_source(args):
         table.add_column("Error")
         for a in attempts[:10]:
             table.add_row(
-                a["created_at"][:19], a["attempt_type"], a["status"],
+                _fmt_ts(a["created_at"]), a["attempt_type"], a["status"],
                 a.get("error_message") or "",
             )
         console.print(table)

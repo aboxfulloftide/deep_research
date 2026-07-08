@@ -710,9 +710,53 @@ claim/evidence schema has stabilized.
    chunk; the model simply phrased/omitted it differently on this pass), not a
    pipeline defect.
 
-5. **Migrate to PostgreSQL** once the claim/evidence schema has stabilized. Migrating
-   once, against a validated schema, is far cheaper than designing Postgres tables twice.
-   This is also where jsonb ergonomics, real FTS, and concurrent workers start to pay off.
+5. **Done.** **Migrate to PostgreSQL** once the claim/evidence schema has stabilized.
+   Migrating once, against a validated schema, is far cheaper than designing Postgres
+   tables twice. This is also where jsonb ergonomics, real FTS, and concurrent workers
+   start to pay off. Postgres runs via `docker-compose.yml` (a new `postgres` service
+   alongside `searxng`), on the same machine as the LLM and snapshot storage — decided
+   explicitly rather than splitting across machines, since decision 9 (raw snapshots on
+   disk, DB stores only paths/hashes) means separating the DB host from the file host
+   would require a shared network filesystem for no real benefit at single-user scale.
+   The frontend is the one piece that *can* run elsewhere, since it already just talks
+   to the backend over HTTP.
+
+   `deep_research/kb/db.py` was rewritten in place (same class, same public method
+   signatures, so `ingest.py`/`artifacts.py`/`extraction.py`/`resolution.py`/`cli/kb.py`
+   needed no changes beyond timestamp/type handling — see below) against `asyncpg`.
+   Upgrades that came free with the migration: `JSONB` instead of `TEXT`+
+   `json.dumps`/`loads` for metadata/payload columns (a registered codec means callers
+   pass/receive Python dicts directly), real `TIMESTAMPTZ` instead of ISO8601 strings,
+   and native full-text search (`tsvector` generated column + GIN index +
+   `websearch_to_tsquery`) replacing the SQLite FTS5 virtual table and its manual sync
+   code — `websearch_to_tsquery` also fixes the punctuation-crash bug from the SQLite
+   version for free, verified directly (`92% GDP growth`, unbalanced quotes, and `&`/`|`
+   all resolve to sane tsqueries with zero errors, unlike FTS5's MATCH operator).
+
+   Clean cutover, not a data migration: existing KB content was verification/spike data
+   only, so the plan was to recreate the schema and re-run the same ingest → chunk →
+   extract → resolve pipeline against Postgres rather than write a SQLite→Postgres
+   migrator for throwaway rows. Two real bugs were found and fixed during that
+   re-verification, both now-obvious in hindsight once real data hit them:
+   - `ingest.py` had its own local `_now()` returning an ISO string (predating the
+     Postgres-wide `datetime` convention in `db.py`) — `TIMESTAMPTZ` columns rejected
+     it; fixed to return a `datetime`.
+   - Postgres `REAL` is 4-byte single precision, unlike SQLite's `REAL` which is always
+     8-byte — this showed up as `confidence: 0.9000000238418579` instead of `0.9`.
+     Fixed by widening every float column (`confidence`, `importance_score`, `score`,
+     `value_numeric`, `rank_weight`, `trust_score`, `time_start_seconds`,
+     `time_end_seconds`) to `DOUBLE PRECISION`.
+
+   Re-verified the full step 2-4 test matrix against Postgres after both fixes: all
+   five source types ingest/chunk/extract identically, dedup and idempotent
+   re-extraction hold, retention pruning and the `retention_locked` evidence-integrity
+   lock both still fire correctly, and FTS search (including the previously-crashing
+   punctuation query) returns correct, better-stemmed results.
+
+   Known minor gap, not fixed: CLI commands never explicitly close the `asyncpg`
+   pool they open (no observed warnings in practice since each CLI invocation is a
+   short-lived process that exits immediately after, but worth cleaning up if this
+   code is ever driven from a long-running process instead of one-shot CLI calls).
 
 6. Add the **verification workflow**, gated by a per-claim verification budget tied to
    `importance_score` (see "Verification Policy and Budget") so search cost cannot

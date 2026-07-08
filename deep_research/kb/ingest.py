@@ -47,8 +47,8 @@ _FILE_MIME_TYPES = {
 }
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass

@@ -21,7 +21,10 @@ web:
   port: 8000
 
 kb:
-  db_path: "~/.local/share/deep_research/kb.db"
+  # PostgreSQL (build order step 5) — see docker-compose.yml for the local
+  # postgres service this default DSN matches. Chat sessions stay on SQLite
+  # (see `db` above); this is deliberately separate.
+  postgres_dsn: "postgresql://deep_research:deep_research@localhost:5432/deep_research_kb"
   snapshot_dir: "~/.local/share/deep_research/kb_snapshots"
   # Extraction/embeddings use their own models, independent of the `llm` section above.
   extraction_llm_base_url: "http://localhost:8080/v1"  # llama.cpp llama-server

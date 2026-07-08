@@ -1,35 +1,42 @@
-"""Source registry, versioned ingestion, and chunk storage/retrieval
-(PLAN_KB_ARCHITECTURE.md, build order steps 2-3).
+"""Source registry, versioned ingestion, chunk storage/retrieval, and
+extraction/resolution storage (PLAN_KB_ARCHITECTURE.md, build order steps 2-5).
 
-Deliberately a separate SQLite database from chat sessions/messages (deep_research/db.py)
-per the plan's design goal of keeping chat history and knowledge-base data apart.
-Schema is the SQLite-first subset of the PostgreSQL draft in the plan: source_types,
-trust_tiers, sources, source_versions, source_fetch_attempts, artifacts,
-artifact_chunks (+ an FTS5 index over chunk text). Extraction (build order step 4)
-and everything past it are not part of this module yet.
+Deliberately a separate PostgreSQL database from chat sessions/messages
+(deep_research/db.py, still SQLite) per the plan's design goal of keeping chat
+history and knowledge-base data apart.
+
+Migrated from SQLite to PostgreSQL per build order step 5, once the schema had
+been exercised end-to-end (steps 2-4) against real ingested/chunked/extracted
+data. Notable upgrades that came for free with the migration:
+- JSONB instead of TEXT+json.dumps/loads for metadata/payload columns
+- real TIMESTAMPTZ instead of ISO8601 strings
+- native full-text search (tsvector + GIN + websearch_to_tsquery) replacing the
+  SQLite FTS5 virtual table — websearch_to_tsquery also fixes the punctuation-
+  crash bug from the SQLite version for free, since it never raises a syntax
+  error on arbitrary user input (unlike FTS5's MATCH operator, which did)
 """
 
 import json
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from typing import Any
 
-import aiosqlite
+import asyncpg
 
 from deep_research.kb.chunking import normalize_name, normalize_ws
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_types (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     code TEXT NOT NULL UNIQUE,
     label TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS trust_tiers (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     code TEXT NOT NULL UNIQUE,
     label TEXT NOT NULL,
-    rank_weight REAL NOT NULL DEFAULT 0,
+    rank_weight DOUBLE PRECISION NOT NULL DEFAULT 0,
     description TEXT
 );
 
@@ -43,11 +50,11 @@ CREATE TABLE IF NOT EXISTS sources (
     publisher TEXT,
     published_at TEXT,
     trust_tier_id INTEGER REFERENCES trust_tiers(id),
-    trust_score REAL,
+    trust_score DOUBLE PRECISION,
     language_code TEXT,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(source_type_id);
@@ -62,12 +69,12 @@ CREATE TABLE IF NOT EXISTS source_versions (
     http_status INTEGER,
     mime_type TEXT,
     byte_size INTEGER,
-    captured_at TEXT NOT NULL,
-    is_first_version INTEGER NOT NULL DEFAULT 0,
-    is_latest INTEGER NOT NULL DEFAULT 0,
-    retention_locked INTEGER NOT NULL DEFAULT 0,
-    metadata TEXT,
-    created_at TEXT NOT NULL,
+    captured_at TIMESTAMPTZ NOT NULL,
+    is_first_version BOOLEAN NOT NULL DEFAULT FALSE,
+    is_latest BOOLEAN NOT NULL DEFAULT FALSE,
+    retention_locked BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL,
     UNIQUE(source_id, version_number)
 );
 
@@ -86,10 +93,10 @@ CREATE TABLE IF NOT EXISTS source_fetch_attempts (
     http_status INTEGER,
     error_code TEXT,
     error_message TEXT,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    metadata TEXT,
-    created_at TEXT NOT NULL
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_fetch_attempts_source
@@ -105,20 +112,22 @@ CREATE TABLE IF NOT EXISTS artifacts (
     title TEXT,
     summary TEXT,
     chunk_params_hash TEXT NOT NULL,
-    is_current INTEGER NOT NULL DEFAULT 1,
-    metadata TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    is_current BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_source_version
     ON artifacts(source_version_id, artifact_type);
 CREATE INDEX IF NOT EXISTS idx_artifacts_current ON artifacts(is_current);
 
--- artifact_chunks referenced by claim_evidence (build order step 4+) must be
--- immutable: re-chunking creates a new artifact generation (is_current flips),
--- old chunk rows are never updated or deleted. See "Retention vs. Evidence
--- Integrity" in PLAN_KB_ARCHITECTURE.md.
+-- artifact_chunks referenced by claim_evidence must be immutable: re-chunking
+-- creates a new artifact generation (is_current flips), old chunk rows are
+-- never updated or deleted. See "Retention vs. Evidence Integrity" in
+-- PLAN_KB_ARCHITECTURE.md. chunk_tsv is a generated column — Postgres keeps it
+-- in sync automatically, no manual FTS-index sync code needed (unlike the
+-- SQLite FTS5 virtual table this replaces).
 CREATE TABLE IF NOT EXISTS artifact_chunks (
     id TEXT PRIMARY KEY,
     artifact_id TEXT NOT NULL REFERENCES artifacts(id),
@@ -130,10 +139,11 @@ CREATE TABLE IF NOT EXISTS artifact_chunks (
     token_estimate INTEGER,
     section_label TEXT,
     page_number INTEGER,
-    time_start_seconds REAL,
-    time_end_seconds REAL,
-    metadata TEXT,
-    created_at TEXT NOT NULL,
+    time_start_seconds DOUBLE PRECISION,
+    time_end_seconds DOUBLE PRECISION,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL,
+    chunk_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', chunk_text)) STORED,
     UNIQUE(artifact_id, chunk_index)
 );
 
@@ -141,31 +151,25 @@ CREATE INDEX IF NOT EXISTS idx_artifact_chunks_artifact
     ON artifact_chunks(artifact_id, page_number);
 CREATE INDEX IF NOT EXISTS idx_artifact_chunks_time
     ON artifact_chunks(artifact_id, time_start_seconds);
-
--- Manually-synced (not external-content) FTS5 index: keeps artifact_chunks on
--- plain TEXT uuid primary keys instead of coupling to SQLite rowids.
-CREATE VIRTUAL TABLE IF NOT EXISTS artifact_chunks_fts USING fts5(
-    chunk_text,
-    chunk_id UNINDEXED,
-    artifact_id UNINDEXED
-);
+CREATE INDEX IF NOT EXISTS idx_artifact_chunks_tsv
+    ON artifact_chunks USING GIN(chunk_tsv);
 
 -- Canonical entities. UNIQUE(entity_type, normalized_name) *is* the exact-match
--- auto-merge tier from decision 25 — a plain INSERT OR IGNORE + re-select handles
--- "same entity, same type, identical normalized name" for free. Anything less
--- than exact (fuzzy/substring) never merges here; it only ever produces a
--- resolution_candidates row for review. entity_mentions (per-chunk mention
--- locations) is a deferred second-wave table — v1 reads mention locations out of
--- extracted_observations.raw_payload instead.
+-- auto-merge tier from decision 25 — INSERT ... ON CONFLICT DO NOTHING + a
+-- re-select handles "same entity, same type, identical normalized name" for
+-- free. Anything less than exact (fuzzy/substring) never merges here; it only
+-- ever produces a resolution_candidates row for review. entity_mentions
+-- (per-chunk mention locations) is a deferred second-wave table — v1 reads
+-- mention locations out of extracted_observations.raw_payload instead.
 CREATE TABLE IF NOT EXISTS entities (
     id TEXT PRIMARY KEY,
     entity_type TEXT NOT NULL,
     name TEXT NOT NULL,
     normalized_name TEXT NOT NULL,
     description TEXT,
-    metadata TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(entity_type, normalized_name)
 );
 
@@ -181,9 +185,9 @@ CREATE TABLE IF NOT EXISTS events (
     start_at TEXT,
     end_at TEXT,
     date_precision TEXT,
-    metadata TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at);
@@ -207,14 +211,14 @@ CREATE TABLE IF NOT EXISTS claims (
     normalized_text TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'unverified',
     preferred_source_id TEXT REFERENCES sources(id),
-    confidence REAL,
-    importance_score REAL,
-    verification_attempted_at TEXT,
-    is_user_reviewed INTEGER NOT NULL DEFAULT 0,
-    reviewed_at TEXT,
+    confidence DOUBLE PRECISION,
+    importance_score DOUBLE PRECISION,
+    verification_attempted_at TIMESTAMPTZ,
+    is_user_reviewed BOOLEAN NOT NULL DEFAULT FALSE,
+    reviewed_at TIMESTAMPTZ,
     reviewed_by TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(claim_type, normalized_text)
 );
 
@@ -233,14 +237,14 @@ CREATE TABLE IF NOT EXISTS extraction_runs (
     prompt_name TEXT NOT NULL,
     prompt_version TEXT NOT NULL,
     extraction_schema_version TEXT NOT NULL,
-    parameters TEXT,
+    parameters JSONB,
     status TEXT NOT NULL DEFAULT 'running',
     chunk_count INTEGER,
     observation_count INTEGER,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_extraction_runs_artifact ON extraction_runs(artifact_id, created_at DESC);
@@ -256,16 +260,16 @@ CREATE TABLE IF NOT EXISTS extracted_observations (
     observation_type TEXT NOT NULL DEFAULT 'claim',
     raw_text TEXT NOT NULL,
     normalized_text TEXT NOT NULL,
-    raw_payload TEXT NOT NULL,
+    raw_payload JSONB NOT NULL,
     candidate_claim_id TEXT REFERENCES claims(id),
-    confidence REAL,
-    importance_score REAL,
+    confidence DOUBLE PRECISION,
+    importance_score DOUBLE PRECISION,
     char_start INTEGER,
     char_end INTEGER,
     quote_match_type TEXT,
     status TEXT NOT NULL DEFAULT 'new',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_observations_run ON extracted_observations(extraction_run_id);
@@ -288,8 +292,8 @@ CREATE TABLE IF NOT EXISTS claim_evidence (
     excerpt_hash TEXT,
     char_start INTEGER,
     char_end INTEGER,
-    confidence REAL,
-    created_at TEXT NOT NULL
+    confidence DOUBLE PRECISION,
+    created_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_claim_evidence_claim ON claim_evidence(claim_id);
@@ -308,14 +312,14 @@ CREATE TABLE IF NOT EXISTS resolution_candidates (
     right_event_id TEXT REFERENCES events(id),
     left_claim_id TEXT REFERENCES claims(id),
     right_claim_id TEXT REFERENCES claims(id),
-    score REAL,
+    score DOUBLE PRECISION,
     reason TEXT,
     method TEXT,
     status TEXT NOT NULL DEFAULT 'open',
     reviewed_by TEXT,
-    reviewed_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_resolution_candidates_type_status
@@ -327,12 +331,12 @@ CREATE TABLE IF NOT EXISTS metrics (
     event_id TEXT REFERENCES events(id),
     entity_id TEXT REFERENCES entities(id),
     metric_name TEXT NOT NULL,
-    value_numeric REAL,
+    value_numeric DOUBLE PRECISION,
     value_text TEXT,
     unit TEXT,
     currency_code TEXT,
-    metadata TEXT,
-    created_at TEXT NOT NULL
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_metrics_claim ON metrics(claim_id);
@@ -357,93 +361,83 @@ TRUST_TIERS = [
 ]
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _new_id() -> str:
     return str(uuid.uuid4())
 
 
-def _sanitize_fts_query(query: str) -> str:
-    """Turn free-text user input into a safe FTS5 query.
-
-    FTS5's query syntax treats punctuation like %, -, (, ), " as operators, so a
-    raw user query (e.g. "92% GDP growth") can be a syntax error. Wrapping each
-    token as a quoted string literal (with embedded quotes doubled, the FTS5
-    escaping rule) makes every token a literal phrase match instead, joined by
-    the implicit AND between terms.
-    """
-    tokens = query.split()
-    quoted = [f'"{tok.replace(chr(34), chr(34) * 2)}"' for tok in tokens if tok]
-    return " ".join(quoted)
+async def _register_jsonb_codec(conn: asyncpg.Connection) -> None:
+    """Lets us pass/receive Python dicts directly for jsonb columns instead of
+    manually json.dumps/loads at every call site."""
+    await conn.set_type_codec(
+        "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog",
+    )
 
 
 class KBDatabase:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self.pool: asyncpg.Pool | None = None
 
     async def init(self):
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.executescript(SCHEMA)
+        self.pool = await asyncpg.create_pool(self.dsn, init=_register_jsonb_codec)
+        async with self.pool.acquire() as conn:
+            await conn.execute(SCHEMA)
             for code, label in SOURCE_TYPES:
-                await db.execute(
-                    "INSERT OR IGNORE INTO source_types (code, label) VALUES (?, ?)",
-                    (code, label),
+                await conn.execute(
+                    "INSERT INTO source_types (code, label) VALUES ($1, $2) "
+                    "ON CONFLICT (code) DO NOTHING",
+                    code, label,
                 )
             for code, label, rank_weight, description in TRUST_TIERS:
-                await db.execute(
-                    "INSERT OR IGNORE INTO trust_tiers (code, label, rank_weight, description) "
-                    "VALUES (?, ?, ?, ?)",
-                    (code, label, rank_weight, description),
+                await conn.execute(
+                    "INSERT INTO trust_tiers (code, label, rank_weight, description) "
+                    "VALUES ($1, $2, $3, $4) ON CONFLICT (code) DO NOTHING",
+                    code, label, rank_weight, description,
                 )
-            await db.commit()
+
+    async def close(self):
+        if self.pool is not None:
+            await self.pool.close()
 
     # -- reference tables ---------------------------------------------------
 
     async def get_source_type_id(self, code: str) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT id FROM source_types WHERE code = ?", (code,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchval("SELECT id FROM source_types WHERE code = $1", code)
         if row is None:
             raise ValueError(f"Unknown source type code: {code!r}")
-        return row[0]
+        return row
 
     async def get_source_type_code(self, source_type_id: int) -> str:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT code FROM source_types WHERE id = ?", (source_type_id,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchval("SELECT code FROM source_types WHERE id = $1", source_type_id)
         if row is None:
             raise ValueError(f"Unknown source type id: {source_type_id!r}")
-        return row[0]
+        return row
 
     async def get_trust_tier_id(self, code: str | None) -> int | None:
         if code is None:
             return None
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("SELECT id FROM trust_tiers WHERE code = ?", (code,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchval("SELECT id FROM trust_tiers WHERE code = $1", code)
         if row is None:
             raise ValueError(f"Unknown trust tier code: {code!r}")
-        return row[0]
+        return row
 
     # -- sources --------------------------------------------------------
 
     async def get_source_by_canonical_key(self, canonical_key: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM sources WHERE canonical_key = ?", (canonical_key,)
-            )
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM sources WHERE canonical_key = $1", canonical_key)
         return dict(row) if row else None
 
     async def get_source(self, source_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM sources WHERE id = ?", (source_id,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM sources WHERE id = $1", source_id)
         return dict(row) if row else None
 
     async def get_or_create_source(
@@ -468,36 +462,29 @@ class KBDatabase:
         source_id = _new_id()
         now = _now()
 
-        async with aiosqlite.connect(self.db_path) as db:
-            try:
-                await db.execute(
-                    "INSERT INTO sources (id, source_type_id, canonical_uri, canonical_key, "
-                    "title, author, publisher, published_at, trust_tier_id, language_code, "
-                    "is_active, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-                    (
-                        source_id, source_type_id, canonical_uri, canonical_key,
-                        title, author, publisher, published_at, trust_tier_id, language_code,
-                        now, now,
-                    ),
-                )
-                await db.commit()
-            except aiosqlite.IntegrityError:
-                # Lost a race against another writer on canonical_key; fall through to re-fetch.
-                pass
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO sources (id, source_type_id, canonical_uri, canonical_key, "
+                "title, author, publisher, published_at, trust_tier_id, language_code, "
+                "is_active, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11, $12) "
+                "ON CONFLICT (canonical_key) DO NOTHING",
+                source_id, source_type_id, canonical_uri, canonical_key,
+                title, author, publisher, published_at, trust_tier_id, language_code,
+                now, now,
+            )
 
         source = await self.get_source_by_canonical_key(canonical_key)
         assert source is not None
         return source, source["id"] == source_id
 
     async def set_source_title_if_missing(self, source_id: str, title: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE sources SET title = ?, updated_at = ? "
-                "WHERE id = ? AND (title IS NULL OR title = '')",
-                (title, _now(), source_id),
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE sources SET title = $1, updated_at = $2 "
+                "WHERE id = $3 AND (title IS NULL OR title = '')",
+                title, _now(), source_id,
             )
-            await db.commit()
 
     # -- fetch attempts -------------------------------------------------
 
@@ -512,62 +499,51 @@ class KBDatabase:
         http_status: int | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
-        started_at: str | None = None,
-        completed_at: str | None = None,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
         metadata: dict | None = None,
     ) -> str:
         attempt_id = _new_id()
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+        async with self.pool.acquire() as conn:
+            await conn.execute(
                 "INSERT INTO source_fetch_attempts "
                 "(id, source_id, source_version_id, attempt_type, status, requested_uri, "
                 "final_uri, http_status, error_code, error_message, started_at, completed_at, "
-                "metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    attempt_id, source_id, source_version_id, attempt_type, status,
-                    requested_uri, final_uri, http_status, error_code, error_message,
-                    started_at or now, completed_at, json.dumps(metadata) if metadata else None, now,
-                ),
+                "metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                attempt_id, source_id, source_version_id, attempt_type, status,
+                requested_uri, final_uri, http_status, error_code, error_message,
+                started_at or now, completed_at, metadata, now,
             )
-            await db.commit()
         return attempt_id
 
     # -- source versions --------------------------------------------------
 
     async def get_latest_version(self, source_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM source_versions WHERE source_id = ? AND is_latest = 1", (source_id,)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM source_versions WHERE source_id = $1 AND is_latest = TRUE", source_id,
             )
-            row = await cursor.fetchone()
         return dict(row) if row else None
 
     async def list_versions(self, source_id: str) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM source_versions WHERE source_id = ? ORDER BY version_number",
-                (source_id,),
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM source_versions WHERE source_id = $1 ORDER BY version_number", source_id,
             )
-            rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     async def get_source_version(self, version_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM source_versions WHERE id = ?", (version_id,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM source_versions WHERE id = $1", version_id)
         return dict(row) if row else None
 
     async def get_next_version_number(self, source_id: str) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT COALESCE(MAX(version_number), 0) FROM source_versions WHERE source_id = ?",
-                (source_id,),
+        async with self.pool.acquire() as conn:
+            max_version = await conn.fetchval(
+                "SELECT COALESCE(MAX(version_number), 0) FROM source_versions WHERE source_id = $1",
+                source_id,
             )
-            (max_version,) = await cursor.fetchone()
         return max_version + 1
 
     async def add_source_version(
@@ -578,7 +554,7 @@ class KBDatabase:
         http_status: int | None = None,
         mime_type: str | None = None,
         byte_size: int | None = None,
-        captured_at: str | None = None,
+        captured_at: datetime | None = None,
         metadata: dict | None = None,
     ) -> tuple[dict, bool]:
         """Returns (version_row, created). If the content hash matches the current
@@ -588,39 +564,32 @@ class KBDatabase:
         if latest is not None and latest["content_hash"] == content_hash:
             return latest, False
 
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT COALESCE(MAX(version_number), 0) FROM source_versions WHERE source_id = ?",
-                (source_id,),
-            )
-            (max_version,) = await cursor.fetchone()
-            version_number = max_version + 1
-            version_id = _new_id()
-            now = _now()
-
-            if latest is not None:
-                await db.execute(
-                    "UPDATE source_versions SET is_latest = 0 WHERE id = ?", (latest["id"],)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                max_version = await conn.fetchval(
+                    "SELECT COALESCE(MAX(version_number), 0) FROM source_versions WHERE source_id = $1",
+                    source_id,
                 )
+                version_number = max_version + 1
+                version_id = _new_id()
+                now = _now()
 
-            await db.execute(
-                "INSERT INTO source_versions "
-                "(id, source_id, version_number, snapshot_path, content_hash, http_status, "
-                "mime_type, byte_size, captured_at, is_first_version, is_latest, "
-                "retention_locked, metadata, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)",
-                (
+                if latest is not None:
+                    await conn.execute(
+                        "UPDATE source_versions SET is_latest = FALSE WHERE id = $1", latest["id"],
+                    )
+
+                row = await conn.fetchrow(
+                    "INSERT INTO source_versions "
+                    "(id, source_id, version_number, snapshot_path, content_hash, http_status, "
+                    "mime_type, byte_size, captured_at, is_first_version, is_latest, "
+                    "retention_locked, metadata, created_at) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, FALSE, $11, $12) "
+                    "RETURNING *",
                     version_id, source_id, version_number, snapshot_path, content_hash,
                     http_status, mime_type, byte_size, captured_at or now,
-                    1 if version_number == 1 else 0,
-                    json.dumps(metadata) if metadata else None, now,
-                ),
-            )
-            await db.commit()
-
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM source_versions WHERE id = ?", (version_id,))
-            row = await cursor.fetchone()
+                    version_number == 1, metadata, now,
+                )
 
         return dict(row), True
 
@@ -650,78 +619,65 @@ class KBDatabase:
         if not to_delete:
             return []
 
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.executemany(
-                "DELETE FROM source_versions WHERE id = ?", [(r["id"],) for r in to_delete]
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM source_versions WHERE id = ANY($1::text[])",
+                [r["id"] for r in to_delete],
             )
-            await db.commit()
 
         return to_delete
 
     async def lock_version_retention(self, version_id: str) -> None:
-        """Mark a version as evidence-referenced so it is never pruned. Not called by
-        anything yet in step 2 — wired here so step 4 (claim_evidence) has nothing
-        left to add to the schema, only a call site."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE source_versions SET retention_locked = 1 WHERE id = ?", (version_id,)
+        """Mark a version as evidence-referenced so it is never pruned."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE source_versions SET retention_locked = TRUE WHERE id = $1", version_id,
             )
-            await db.commit()
 
     # -- listing / display ------------------------------------------------
 
     async def list_sources(self, limit: int = 50) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
                 "SELECT s.*, st.code AS source_type_code, tt.code AS trust_tier_code "
                 "FROM sources s "
                 "JOIN source_types st ON st.id = s.source_type_id "
                 "LEFT JOIN trust_tiers tt ON tt.id = s.trust_tier_id "
-                "ORDER BY s.updated_at DESC LIMIT ?",
-                (limit,),
+                "ORDER BY s.updated_at DESC LIMIT $1",
+                limit,
             )
-            rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     async def list_fetch_attempts(self, source_id: str) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM source_fetch_attempts WHERE source_id = ? ORDER BY created_at DESC",
-                (source_id,),
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM source_fetch_attempts WHERE source_id = $1 ORDER BY created_at DESC",
+                source_id,
             )
-            rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     # -- artifacts & chunks (build order step 3) -------------------------
 
     async def get_current_artifact(self, source_version_id: str, artifact_type: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM artifacts WHERE source_version_id = ? AND artifact_type = ? "
-                "AND is_current = 1",
-                (source_version_id, artifact_type),
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM artifacts WHERE source_version_id = $1 AND artifact_type = $2 "
+                "AND is_current = TRUE",
+                source_version_id, artifact_type,
             )
-            row = await cursor.fetchone()
         return dict(row) if row else None
 
     async def get_current_artifacts_for_version(self, source_version_id: str) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM artifacts WHERE source_version_id = ? AND is_current = 1",
-                (source_version_id,),
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM artifacts WHERE source_version_id = $1 AND is_current = TRUE",
+                source_version_id,
             )
-            rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     async def get_artifact(self, artifact_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM artifacts WHERE id = $1", artifact_id)
         return dict(row) if row else None
 
     async def upsert_artifact(
@@ -750,24 +706,18 @@ class KBDatabase:
             return current, False
 
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            if current is not None:
-                await db.execute("UPDATE artifacts SET is_current = 0 WHERE id = ?", (current["id"],))
-            await db.execute(
-                "INSERT INTO artifacts (id, source_version_id, artifact_type, storage_path, "
-                "content_hash, title, summary, chunk_params_hash, is_current, metadata, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
-                (
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if current is not None:
+                    await conn.execute("UPDATE artifacts SET is_current = FALSE WHERE id = $1", current["id"])
+                row = await conn.fetchrow(
+                    "INSERT INTO artifacts (id, source_version_id, artifact_type, storage_path, "
+                    "content_hash, title, summary, chunk_params_hash, is_current, metadata, "
+                    "created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9, $10, $11) "
+                    "RETURNING *",
                     artifact_id, source_version_id, artifact_type, storage_path, content_hash,
-                    title, summary, chunk_params_hash,
-                    json.dumps(metadata) if metadata else None, now, now,
-                ),
-            )
-            await db.commit()
-
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
-            row = await cursor.fetchone()
+                    title, summary, chunk_params_hash, metadata, now, now,
+                )
 
         return dict(row), True
 
@@ -788,49 +738,33 @@ class KBDatabase:
     ) -> dict:
         chunk_id = _new_id()
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
                 "INSERT INTO artifact_chunks (id, artifact_id, chunk_index, chunk_text, chunk_hash, "
                 "char_start, char_end, token_estimate, section_label, page_number, "
                 "time_start_seconds, time_end_seconds, metadata, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    chunk_id, artifact_id, chunk_index, chunk_text, chunk_hash,
-                    char_start, char_end, token_estimate, section_label, page_number,
-                    time_start_seconds, time_end_seconds,
-                    json.dumps(metadata) if metadata else None, now,
-                ),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) "
+                "RETURNING *",
+                chunk_id, artifact_id, chunk_index, chunk_text, chunk_hash,
+                char_start, char_end, token_estimate, section_label, page_number,
+                time_start_seconds, time_end_seconds, metadata, now,
             )
-            await db.execute(
-                "INSERT INTO artifact_chunks_fts (chunk_text, chunk_id, artifact_id) VALUES (?, ?, ?)",
-                (chunk_text, chunk_id, artifact_id),
-            )
-            await db.commit()
-
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM artifact_chunks WHERE id = ?", (chunk_id,))
-            row = await cursor.fetchone()
         return dict(row)
 
     async def list_chunks(self, artifact_id: str) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM artifact_chunks WHERE artifact_id = ? ORDER BY chunk_index",
-                (artifact_id,),
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM artifact_chunks WHERE artifact_id = $1 ORDER BY chunk_index", artifact_id,
             )
-            rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     async def search_chunks(self, query: str, limit: int = 20) -> list[dict]:
-        """Full-text search over current-generation chunks only (is_current = 1),
-        joined back to source metadata for display."""
-        fts_query = _sanitize_fts_query(query)
-        if not fts_query:
-            return []
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
+        """Full-text search over current-generation chunks only (is_current =
+        TRUE), joined back to source metadata for display. websearch_to_tsquery
+        never raises a syntax error on arbitrary user input (unlike SQLite
+        FTS5's MATCH, which crashed on punctuation like '92% GDP growth')."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
                 """
                 SELECT
                     c.id AS chunk_id, c.chunk_index, c.page_number,
@@ -838,20 +772,21 @@ class KBDatabase:
                     a.id AS artifact_id, a.artifact_type,
                     sv.id AS source_version_id, sv.version_number,
                     s.id AS source_id, s.title AS source_title, s.canonical_uri,
-                    bm25(artifact_chunks_fts) AS score,
-                    snippet(artifact_chunks_fts, 0, '>>>', '<<<', ' ... ', 12) AS snippet
-                FROM artifact_chunks_fts
-                JOIN artifact_chunks c ON c.id = artifact_chunks_fts.chunk_id
-                JOIN artifacts a ON a.id = c.artifact_id AND a.is_current = 1
+                    ts_rank_cd(c.chunk_tsv, websearch_to_tsquery('english', $1)) AS score,
+                    ts_headline(
+                        'english', c.chunk_text, websearch_to_tsquery('english', $1),
+                        'StartSel=>>>,StopSel=<<<,MaxWords=15,MinWords=5,MaxFragments=1'
+                    ) AS snippet
+                FROM artifact_chunks c
+                JOIN artifacts a ON a.id = c.artifact_id AND a.is_current = TRUE
                 JOIN source_versions sv ON sv.id = a.source_version_id
                 JOIN sources s ON s.id = sv.source_id
-                WHERE artifact_chunks_fts MATCH ?
-                ORDER BY score
-                LIMIT ?
+                WHERE c.chunk_tsv @@ websearch_to_tsquery('english', $1)
+                ORDER BY score DESC
+                LIMIT $2
                 """,
-                (fts_query, limit),
+                query, limit,
             )
-            rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     # -- entities/events/claims (build order step 4) ---------------------
@@ -865,44 +800,35 @@ class KBDatabase:
         normalized = normalize_name(name)
         entity_id = _new_id()
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO entities "
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO entities "
                 "(id, entity_type, name, normalized_name, description, metadata, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (entity_id, entity_type, name, normalized, description,
-                 json.dumps(metadata) if metadata else None, now, now),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+                "ON CONFLICT (entity_type, normalized_name) DO NOTHING",
+                entity_id, entity_type, name, normalized, description, metadata, now, now,
             )
-            await db.commit()
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM entities WHERE entity_type = ? AND normalized_name = ?",
-                (entity_type, normalized),
+            row = await conn.fetchrow(
+                "SELECT * FROM entities WHERE entity_type = $1 AND normalized_name = $2",
+                entity_type, normalized,
             )
-            row = await cursor.fetchone()
         row = dict(row)
         return row, row["id"] == entity_id
 
     async def get_entity(self, entity_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM entities WHERE id = ?", (entity_id,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM entities WHERE id = $1", entity_id)
         return dict(row) if row else None
 
     async def list_entities(self, entity_type: str | None = None, limit: int = 500) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self.pool.acquire() as conn:
             if entity_type:
-                cursor = await db.execute(
-                    "SELECT * FROM entities WHERE entity_type = ? ORDER BY updated_at DESC LIMIT ?",
-                    (entity_type, limit),
+                rows = await conn.fetch(
+                    "SELECT * FROM entities WHERE entity_type = $1 ORDER BY updated_at DESC LIMIT $2",
+                    entity_type, limit,
                 )
             else:
-                cursor = await db.execute(
-                    "SELECT * FROM entities ORDER BY updated_at DESC LIMIT ?", (limit,)
-                )
-            rows = await cursor.fetchall()
+                rows = await conn.fetch("SELECT * FROM entities ORDER BY updated_at DESC LIMIT $1", limit)
         return [dict(r) for r in rows]
 
     async def get_or_create_event(
@@ -915,27 +841,23 @@ class KBDatabase:
         normalized = normalize_name(title)
         event_id = _new_id()
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO events "
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO events "
                 "(id, title, normalized_title, description, event_type, start_at, end_at, "
                 "date_precision, metadata, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (event_id, title, normalized, description, event_type, start_at, end_at,
-                 date_precision, json.dumps(metadata) if metadata else None, now, now),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) "
+                "ON CONFLICT (normalized_title) DO NOTHING",
+                event_id, title, normalized, description, event_type, start_at, end_at,
+                date_precision, metadata, now, now,
             )
-            await db.commit()
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM events WHERE normalized_title = ?", (normalized,))
-            row = await cursor.fetchone()
+            row = await conn.fetchrow("SELECT * FROM events WHERE normalized_title = $1", normalized)
         row = dict(row)
         return row, row["id"] == event_id
 
     async def list_events(self, limit: int = 500) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM events ORDER BY updated_at DESC LIMIT ?", (limit,))
-            rows = await cursor.fetchall()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM events ORDER BY updated_at DESC LIMIT $1", limit)
         return [dict(r) for r in rows]
 
     async def get_or_create_claim(
@@ -946,43 +868,35 @@ class KBDatabase:
         normalized_text) reuses the existing claim row — this is the same safe
         exact-match case as entities/events, not the fuzzy/lexical similarity
         decision 25 ruled out for claims. Anything less than exact never merges
-        here; see the embedding-based candidate generation in extraction.py."""
+        here; see the embedding-based candidate generation in resolution.py."""
         normalized = normalize_ws(canonical_text).lower()
         claim_id = _new_id()
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO claims "
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO claims "
                 "(id, claim_type, event_id, canonical_text, normalized_text, status, "
                 "confidence, importance_score, is_user_reviewed, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'unverified', ?, ?, 0, ?, ?)",
-                (claim_id, claim_type, event_id, canonical_text, normalized,
-                 confidence, importance_score, now, now),
+                "VALUES ($1, $2, $3, $4, $5, 'unverified', $6, $7, FALSE, $8, $9) "
+                "ON CONFLICT (claim_type, normalized_text) DO NOTHING",
+                claim_id, claim_type, event_id, canonical_text, normalized,
+                confidence, importance_score, now, now,
             )
-            await db.commit()
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM claims WHERE claim_type = ? AND normalized_text = ?",
-                (claim_type, normalized),
+            row = await conn.fetchrow(
+                "SELECT * FROM claims WHERE claim_type = $1 AND normalized_text = $2",
+                claim_type, normalized,
             )
-            row = await cursor.fetchone()
         row = dict(row)
         return row, row["id"] == claim_id
 
     async def get_claim(self, claim_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM claims WHERE id = ?", (claim_id,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM claims WHERE id = $1", claim_id)
         return dict(row) if row else None
 
     async def list_claims(self, limit: int = 100) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM claims ORDER BY updated_at DESC LIMIT ?", (limit,)
-            )
-            rows = await cursor.fetchall()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM claims ORDER BY updated_at DESC LIMIT $1", limit)
         return [dict(r) for r in rows]
 
     async def add_claim_evidence(
@@ -993,39 +907,33 @@ class KBDatabase:
         char_end: int | None = None, confidence: float | None = None,
     ) -> dict:
         """Creates the evidence link AND locks the referenced source_version's
-        retention — this is the first real caller of lock_version_retention
-        (stubbed in build order step 2 for exactly this moment)."""
+        retention (see lock_version_retention / "Retention vs. Evidence Integrity")."""
         evidence_id = _new_id()
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
                 "INSERT INTO claim_evidence "
                 "(id, claim_id, extraction_run_id, extracted_observation_id, artifact_chunk_id, "
                 "source_id, source_version_id, evidence_type, excerpt_text, excerpt_hash, "
                 "char_start, char_end, confidence, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (evidence_id, claim_id, extraction_run_id, extracted_observation_id, artifact_chunk_id,
-                 source_id, source_version_id, evidence_type, excerpt_text, excerpt_hash,
-                 char_start, char_end, confidence, now),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) "
+                "RETURNING *",
+                evidence_id, claim_id, extraction_run_id, extracted_observation_id, artifact_chunk_id,
+                source_id, source_version_id, evidence_type, excerpt_text, excerpt_hash,
+                char_start, char_end, confidence, now,
             )
-            await db.commit()
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM claim_evidence WHERE id = ?", (evidence_id,))
-            row = await cursor.fetchone()
         await self.lock_version_retention(source_version_id)
         return dict(row)
 
     async def list_claim_evidence(self, claim_id: str) -> list[dict]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
                 "SELECT ce.*, s.title AS source_title, s.canonical_uri "
                 "FROM claim_evidence ce "
                 "JOIN sources s ON s.id = ce.source_id "
-                "WHERE ce.claim_id = ? ORDER BY ce.created_at",
-                (claim_id,),
+                "WHERE ce.claim_id = $1 ORDER BY ce.created_at",
+                claim_id,
             )
-            rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     async def add_metric(
@@ -1036,18 +944,14 @@ class KBDatabase:
     ) -> dict:
         metric_id = _new_id()
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
                 "INSERT INTO metrics (id, claim_id, event_id, entity_id, metric_name, "
                 "value_numeric, value_text, unit, currency_code, metadata, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (metric_id, claim_id, event_id, entity_id, metric_name, value_numeric,
-                 value_text, unit, currency_code, json.dumps(metadata) if metadata else None, now),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
+                metric_id, claim_id, event_id, entity_id, metric_name, value_numeric,
+                value_text, unit, currency_code, metadata, now,
             )
-            await db.commit()
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM metrics WHERE id = ?", (metric_id,))
-            row = await cursor.fetchone()
         return dict(row)
 
     # -- resolution candidates (v1 merge/review queue) --------------------
@@ -1077,64 +981,61 @@ class KBDatabase:
         left_claim_id: str | None = None, right_claim_id: str | None = None,
     ) -> tuple[dict, bool]:
         """De-duplicates on (candidate_type, left/right id pair) in application
-        code — a DB UNIQUE constraint can't do this here because SQLite (like
+        code — a DB UNIQUE constraint can't do this here because Postgres (like
         standard SQL) never treats NULL as equal to NULL, and every row has at
         least one NULL id-pair (only one of entity/event/claim applies per
-        candidate_type)."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM resolution_candidates WHERE candidate_type = ? "
-                "AND left_entity_id IS ? AND right_entity_id IS ? "
-                "AND left_event_id IS ? AND right_event_id IS ? "
-                "AND left_claim_id IS ? AND right_claim_id IS ?",
-                (candidate_type, left_entity_id, right_entity_id,
-                 left_event_id, right_event_id, left_claim_id, right_claim_id),
-            )
-            existing = await cursor.fetchone()
-            if existing:
-                return dict(existing), False
+        candidate_type). IS NOT DISTINCT FROM is Postgres's NULL-safe equality
+        operator, needed since some of these columns are NULL for any given row."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                existing = await conn.fetchrow(
+                    "SELECT * FROM resolution_candidates WHERE candidate_type = $1 "
+                    "AND left_entity_id IS NOT DISTINCT FROM $2 "
+                    "AND right_entity_id IS NOT DISTINCT FROM $3 "
+                    "AND left_event_id IS NOT DISTINCT FROM $4 "
+                    "AND right_event_id IS NOT DISTINCT FROM $5 "
+                    "AND left_claim_id IS NOT DISTINCT FROM $6 "
+                    "AND right_claim_id IS NOT DISTINCT FROM $7",
+                    candidate_type, left_entity_id, right_entity_id,
+                    left_event_id, right_event_id, left_claim_id, right_claim_id,
+                )
+                if existing:
+                    return dict(existing), False
 
-            candidate_id = _new_id()
-            now = _now()
-            await db.execute(
-                "INSERT INTO resolution_candidates "
-                "(id, candidate_type, left_entity_id, right_entity_id, left_event_id, right_event_id, "
-                "left_claim_id, right_claim_id, score, reason, method, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
-                (candidate_id, candidate_type, left_entity_id, right_entity_id,
-                 left_event_id, right_event_id, left_claim_id, right_claim_id,
-                 score, reason, method, now, now),
-            )
-            await db.commit()
-            cursor = await db.execute("SELECT * FROM resolution_candidates WHERE id = ?", (candidate_id,))
-            row = await cursor.fetchone()
+                candidate_id = _new_id()
+                now = _now()
+                row = await conn.fetchrow(
+                    "INSERT INTO resolution_candidates "
+                    "(id, candidate_type, left_entity_id, right_entity_id, left_event_id, right_event_id, "
+                    "left_claim_id, right_claim_id, score, reason, method, status, created_at, updated_at) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'open', $12, $13) "
+                    "RETURNING *",
+                    candidate_id, candidate_type, left_entity_id, right_entity_id,
+                    left_event_id, right_event_id, left_claim_id, right_claim_id,
+                    score, reason, method, now, now,
+                )
         return dict(row), True
 
     async def list_resolution_candidates(
         self, candidate_type: str | None = None, status: str | None = "open", limit: int = 100,
     ) -> list[dict]:
-        query = "SELECT * FROM resolution_candidates WHERE 1=1"
-        params: list = []
+        query = "SELECT * FROM resolution_candidates WHERE TRUE"
+        params: list[Any] = []
         if candidate_type:
-            query += " AND candidate_type = ?"
             params.append(candidate_type)
+            query += f" AND candidate_type = ${len(params)}"
         if status:
-            query += " AND status = ?"
             params.append(status)
-        query += " ORDER BY score DESC LIMIT ?"
+            query += f" AND status = ${len(params)}"
         params.append(limit)
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(query, params)
-            rows = await cursor.fetchall()
+        query += f" ORDER BY score DESC LIMIT ${len(params)}"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
         return [dict(r) for r in rows]
 
     async def get_resolution_candidate(self, candidate_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM resolution_candidates WHERE id = ?", (candidate_id,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM resolution_candidates WHERE id = $1", candidate_id)
         return dict(row) if row else None
 
     async def review_resolution_candidate(
@@ -1146,29 +1047,23 @@ class KBDatabase:
         if decision not in ("accepted", "rejected"):
             raise ValueError(f"decision must be 'accepted' or 'rejected', got {decision!r}")
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE resolution_candidates SET status = ?, reviewed_by = ?, reviewed_at = ?, "
-                "updated_at = ? WHERE id = ?",
-                (decision, reviewed_by, now, now, candidate_id),
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE resolution_candidates SET status = $1, reviewed_by = $2, reviewed_at = $3, "
+                "updated_at = $4 WHERE id = $5 RETURNING *",
+                decision, reviewed_by, now, now, candidate_id,
             )
-            await db.commit()
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM resolution_candidates WHERE id = ?", (candidate_id,))
-            row = await cursor.fetchone()
         return dict(row)
 
     # -- extraction runs & observations ------------------------------------
 
     async def find_extraction_run_by_signature(self, artifact_id: str, run_signature: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM extraction_runs WHERE artifact_id = ? AND run_signature = ? "
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM extraction_runs WHERE artifact_id = $1 AND run_signature = $2 "
                 "AND status = 'completed'",
-                (artifact_id, run_signature),
+                artifact_id, run_signature,
             )
-            row = await cursor.fetchone()
         return dict(row) if row else None
 
     async def create_extraction_run(
@@ -1178,31 +1073,26 @@ class KBDatabase:
     ) -> dict:
         run_id = _new_id()
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
                 "INSERT INTO extraction_runs (id, artifact_id, run_signature, model_id, runtime, "
                 "prompt_name, prompt_version, extraction_schema_version, parameters, status, "
                 "chunk_count, observation_count, started_at, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, 0, ?, ?, ?)",
-                (run_id, artifact_id, run_signature, model_id, runtime, prompt_name,
-                 prompt_version, extraction_schema_version,
-                 json.dumps(parameters) if parameters else None, chunk_count, now, now, now),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'running', $10, 0, $11, $12, $13) "
+                "RETURNING *",
+                run_id, artifact_id, run_signature, model_id, runtime, prompt_name,
+                prompt_version, extraction_schema_version, parameters, chunk_count, now, now, now,
             )
-            await db.commit()
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM extraction_runs WHERE id = ?", (run_id,))
-            row = await cursor.fetchone()
         return dict(row)
 
     async def complete_extraction_run(self, run_id: str, observation_count: int, status: str = "completed") -> None:
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE extraction_runs SET status = ?, observation_count = ?, "
-                "completed_at = ?, updated_at = ? WHERE id = ?",
-                (status, observation_count, now, now, run_id),
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE extraction_runs SET status = $1, observation_count = $2, "
+                "completed_at = $3, updated_at = $4 WHERE id = $5",
+                status, observation_count, now, now, run_id,
             )
-            await db.commit()
 
     async def add_observation(
         self, extraction_run_id: str, artifact_chunk_id: str, raw_text: str,
@@ -1213,49 +1103,41 @@ class KBDatabase:
         obs_id = _new_id()
         now = _now()
         normalized = normalize_ws(raw_text).lower()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
                 "INSERT INTO extracted_observations "
                 "(id, extraction_run_id, artifact_chunk_id, observation_type, raw_text, "
                 "normalized_text, raw_payload, confidence, importance_score, char_start, "
                 "char_end, quote_match_type, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)",
-                (obs_id, extraction_run_id, artifact_chunk_id, observation_type, raw_text,
-                 normalized, json.dumps(raw_payload), confidence, importance_score,
-                 char_start, char_end, quote_match_type, now, now),
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'new', $13, $14) "
+                "RETURNING *",
+                obs_id, extraction_run_id, artifact_chunk_id, observation_type, raw_text,
+                normalized, raw_payload, confidence, importance_score,
+                char_start, char_end, quote_match_type, now, now,
             )
-            await db.commit()
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM extracted_observations WHERE id = ?", (obs_id,))
-            row = await cursor.fetchone()
         return dict(row)
 
     async def list_observations(self, extraction_run_id: str, status: str | None = None) -> list[dict]:
-        query = "SELECT * FROM extracted_observations WHERE extraction_run_id = ?"
-        params: list = [extraction_run_id]
+        query = "SELECT * FROM extracted_observations WHERE extraction_run_id = $1"
+        params: list[Any] = [extraction_run_id]
         if status:
-            query += " AND status = ?"
             params.append(status)
+            query += f" AND status = ${len(params)}"
         query += " ORDER BY created_at"
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(query, params)
-            rows = await cursor.fetchall()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
         return [dict(r) for r in rows]
 
     async def mark_observation_promoted(self, observation_id: str, claim_id: str) -> None:
         now = _now()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "UPDATE extracted_observations SET status = 'promoted', candidate_claim_id = ?, "
-                "updated_at = ? WHERE id = ?",
-                (claim_id, now, observation_id),
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE extracted_observations SET status = 'promoted', candidate_claim_id = $1, "
+                "updated_at = $2 WHERE id = $3",
+                claim_id, now, observation_id,
             )
-            await db.commit()
 
     async def get_artifact_chunk(self, chunk_id: str) -> dict | None:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM artifact_chunks WHERE id = ?", (chunk_id,))
-            row = await cursor.fetchone()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM artifact_chunks WHERE id = $1", chunk_id)
         return dict(row) if row else None

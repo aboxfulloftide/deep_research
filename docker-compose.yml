@@ -1,4 +1,22 @@
 services:
+  postgres:
+    image: postgres:16
+    container_name: deep-research-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_USER=deep_research
+      - POSTGRES_PASSWORD=deep_research
+      - POSTGRES_DB=deep_research_kb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deep_research"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   searxng:
     image: searxng/searxng:latest
     container_name: deep-research-searxng
@@ -9,3 +27,6 @@ services:
       - ./searxng:/etc/searxng:rw
     environment:
       - SEARXNG_BASE_URL=http://localhost:8888/
+
+volumes:
+  postgres_data:

@@ -13,7 +13,6 @@ Two separate concerns, deliberately kept apart:
 """
 
 import hashlib
-import json
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -128,7 +127,10 @@ async def resolve_and_promote(
     new_claim_ids: list[str] = []
 
     for obs in observations:
-        payload = json.loads(obs["raw_payload"])
+        # raw_payload is jsonb — asyncpg's registered codec already decodes it
+        # to a dict, no json.loads needed (unlike the SQLite TEXT column this
+        # replaced).
+        payload = obs["raw_payload"]
 
         chunk = await kb_db.get_artifact_chunk(obs["artifact_chunk_id"])
         artifact = await kb_db.get_artifact(chunk["artifact_id"])

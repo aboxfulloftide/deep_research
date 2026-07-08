@@ -21,6 +21,7 @@ dependencies = [
     "youtube-transcript-api>=0.6",
     "pypdf>=5.0",
     "python-docx>=1.0",
+    "asyncpg>=0.30",
 ]
 
 [project.scripts]
