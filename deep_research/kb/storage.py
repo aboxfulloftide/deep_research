@@ -22,6 +22,13 @@ class SnapshotStore:
         path.write_bytes(content)
         return path
 
+    def write_artifact(self, artifact_id: str, content: bytes, ext: str = ".txt") -> Path:
+        ext = ext if ext.startswith(".") else f".{ext}"
+        path = self.root / "artifacts" / f"{artifact_id}{ext}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
     def delete(self, path: Path | str) -> None:
         p = Path(path)
         p.unlink(missing_ok=True)

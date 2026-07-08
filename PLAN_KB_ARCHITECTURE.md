@@ -663,7 +663,23 @@ claim/evidence schema has stabilized.
    hash as identity would make every edit a brand-new unrelated source instead of a new
    version of the same one, which would have defeated file versioning entirely.
 
-3. Add **chunk storage and retrieval** (FTS5 baseline).
+3. **Done.** Add **chunk storage and retrieval** (FTS5 baseline). Implemented as
+   `artifacts` + `artifact_chunks` tables plus a manually-synced FTS5 virtual table
+   in `deep_research/kb/db.py`, with per-source-type text extraction in
+   `deep_research/kb/artifacts.py` (web/html via BeautifulSoup, markdown/text via
+   direct decode, PDF via `pypdf` with per-page chunking and `page_number` metadata,
+   DOCX via `python-docx`, YouTube transcripts via time-based chunking preserving
+   `time_start_seconds`/`time_end_seconds`). Re-chunking with unchanged parameters is
+   a no-op; re-chunking with different parameters creates a new artifact generation
+   and leaves old chunks untouched, satisfying the immutability requirement in
+   "Retention vs. Evidence Integrity" ahead of `claim_evidence` existing. CLI:
+   `deep-research-kb chunk-source <id>` and `search <query>`. Verified against all
+   five ingested source types, plus idempotency, new-generation-on-param-change, and
+   correct FTS results (including the cross-source Furman "92% of GDP growth" claim
+   from the spike surfacing from both the article and transcript). One bug found and
+   fixed during verification: raw user search queries containing punctuation (e.g.
+   `92% GDP growth`) crashed FTS5's query parser — fixed by quoting each token as an
+   FTS5 string literal before matching.
 
 4. Add the **extraction pipeline** for entities, events, claims, and metrics, with an
    **`extraction_runs` provenance record** so re-extraction is idempotent and claims can

@@ -1,11 +1,12 @@
-"""Source registry + versioned ingestion storage (PLAN_KB_ARCHITECTURE.md, build
-order step 2).
+"""Source registry, versioned ingestion, and chunk storage/retrieval
+(PLAN_KB_ARCHITECTURE.md, build order steps 2-3).
 
 Deliberately a separate SQLite database from chat sessions/messages (deep_research/db.py)
 per the plan's design goal of keeping chat history and knowledge-base data apart.
 Schema is the SQLite-first subset of the PostgreSQL draft in the plan: source_types,
-trust_tiers, sources, source_versions, source_fetch_attempts. Chunking/artifacts
-(build order step 3) and everything past it are not part of this module yet.
+trust_tiers, sources, source_versions, source_fetch_attempts, artifacts,
+artifact_chunks (+ an FTS5 index over chunk text). Extraction (build order step 4)
+and everything past it are not part of this module yet.
 """
 
 import json
@@ -92,6 +93,60 @@ CREATE TABLE IF NOT EXISTS source_fetch_attempts (
 CREATE INDEX IF NOT EXISTS idx_fetch_attempts_source
     ON source_fetch_attempts(source_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_fetch_attempts_status ON source_fetch_attempts(status);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    source_version_id TEXT NOT NULL REFERENCES source_versions(id),
+    artifact_type TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    title TEXT,
+    summary TEXT,
+    chunk_params_hash TEXT NOT NULL,
+    is_current INTEGER NOT NULL DEFAULT 1,
+    metadata TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_source_version
+    ON artifacts(source_version_id, artifact_type);
+CREATE INDEX IF NOT EXISTS idx_artifacts_current ON artifacts(is_current);
+
+-- artifact_chunks referenced by claim_evidence (build order step 4+) must be
+-- immutable: re-chunking creates a new artifact generation (is_current flips),
+-- old chunk rows are never updated or deleted. See "Retention vs. Evidence
+-- Integrity" in PLAN_KB_ARCHITECTURE.md.
+CREATE TABLE IF NOT EXISTS artifact_chunks (
+    id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+    chunk_index INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    chunk_hash TEXT NOT NULL,
+    char_start INTEGER,
+    char_end INTEGER,
+    token_estimate INTEGER,
+    section_label TEXT,
+    page_number INTEGER,
+    time_start_seconds REAL,
+    time_end_seconds REAL,
+    metadata TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(artifact_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifact_chunks_artifact
+    ON artifact_chunks(artifact_id, page_number);
+CREATE INDEX IF NOT EXISTS idx_artifact_chunks_time
+    ON artifact_chunks(artifact_id, time_start_seconds);
+
+-- Manually-synced (not external-content) FTS5 index: keeps artifact_chunks on
+-- plain TEXT uuid primary keys instead of coupling to SQLite rowids.
+CREATE VIRTUAL TABLE IF NOT EXISTS artifact_chunks_fts USING fts5(
+    chunk_text,
+    chunk_id UNINDEXED,
+    artifact_id UNINDEXED
+);
 """
 
 SOURCE_TYPES = [
@@ -119,6 +174,20 @@ def _now() -> str:
 
 def _new_id() -> str:
     return str(uuid.uuid4())
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """Turn free-text user input into a safe FTS5 query.
+
+    FTS5's query syntax treats punctuation like %, -, (, ), " as operators, so a
+    raw user query (e.g. "92% GDP growth") can be a syntax error. Wrapping each
+    token as a quoted string literal (with embedded quotes doubled, the FTS5
+    escaping rule) makes every token a literal phrase match instead, joined by
+    the implicit AND between terms.
+    """
+    tokens = query.split()
+    quoted = [f'"{tok.replace(chr(34), chr(34) * 2)}"' for tok in tokens if tok]
+    return " ".join(quoted)
 
 
 class KBDatabase:
@@ -150,6 +219,14 @@ class KBDatabase:
             row = await cursor.fetchone()
         if row is None:
             raise ValueError(f"Unknown source type code: {code!r}")
+        return row[0]
+
+    async def get_source_type_code(self, source_type_id: int) -> str:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT code FROM source_types WHERE id = ?", (source_type_id,))
+            row = await cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Unknown source type id: {source_type_id!r}")
         return row[0]
 
     async def get_trust_tier_id(self, code: str | None) -> int | None:
@@ -417,6 +494,156 @@ class KBDatabase:
             cursor = await db.execute(
                 "SELECT * FROM source_fetch_attempts WHERE source_id = ? ORDER BY created_at DESC",
                 (source_id,),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    # -- artifacts & chunks (build order step 3) -------------------------
+
+    async def get_current_artifact(self, source_version_id: str, artifact_type: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM artifacts WHERE source_version_id = ? AND artifact_type = ? "
+                "AND is_current = 1",
+                (source_version_id, artifact_type),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_artifact(self, artifact_id: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def upsert_artifact(
+        self,
+        artifact_id: str,
+        source_version_id: str,
+        artifact_type: str,
+        storage_path: str,
+        content_hash: str,
+        chunk_params_hash: str,
+        title: str | None = None,
+        summary: str | None = None,
+        metadata: dict | None = None,
+    ) -> tuple[dict, bool]:
+        """Returns (artifact_row, is_new_generation). If the current artifact for this
+        (source_version_id, artifact_type) already used the same chunk_params_hash,
+        this is a no-op — the caller should not re-chunk, and artifact_id is ignored
+        (the existing row is returned). Otherwise the old artifact (if any) is marked
+        non-current — its chunk rows are left untouched, never updated or deleted,
+        since re-chunking must produce a new generation rather than mutate rows
+        `claim_evidence` may later reference. artifact_id is caller-supplied (rather
+        than generated here) so the caller can write the extracted-text file to disk
+        at that id before/while the DB row is inserted."""
+        current = await self.get_current_artifact(source_version_id, artifact_type)
+        if current is not None and current["chunk_params_hash"] == chunk_params_hash:
+            return current, False
+
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            if current is not None:
+                await db.execute("UPDATE artifacts SET is_current = 0 WHERE id = ?", (current["id"],))
+            await db.execute(
+                "INSERT INTO artifacts (id, source_version_id, artifact_type, storage_path, "
+                "content_hash, title, summary, chunk_params_hash, is_current, metadata, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                (
+                    artifact_id, source_version_id, artifact_type, storage_path, content_hash,
+                    title, summary, chunk_params_hash,
+                    json.dumps(metadata) if metadata else None, now, now,
+                ),
+            )
+            await db.commit()
+
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
+            row = await cursor.fetchone()
+
+        return dict(row), True
+
+    async def add_chunk(
+        self,
+        artifact_id: str,
+        chunk_index: int,
+        chunk_text: str,
+        chunk_hash: str,
+        char_start: int | None = None,
+        char_end: int | None = None,
+        token_estimate: int | None = None,
+        section_label: str | None = None,
+        page_number: int | None = None,
+        time_start_seconds: float | None = None,
+        time_end_seconds: float | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        chunk_id = _new_id()
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO artifact_chunks (id, artifact_id, chunk_index, chunk_text, chunk_hash, "
+                "char_start, char_end, token_estimate, section_label, page_number, "
+                "time_start_seconds, time_end_seconds, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    chunk_id, artifact_id, chunk_index, chunk_text, chunk_hash,
+                    char_start, char_end, token_estimate, section_label, page_number,
+                    time_start_seconds, time_end_seconds,
+                    json.dumps(metadata) if metadata else None, now,
+                ),
+            )
+            await db.execute(
+                "INSERT INTO artifact_chunks_fts (chunk_text, chunk_id, artifact_id) VALUES (?, ?, ?)",
+                (chunk_text, chunk_id, artifact_id),
+            )
+            await db.commit()
+
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM artifact_chunks WHERE id = ?", (chunk_id,))
+            row = await cursor.fetchone()
+        return dict(row)
+
+    async def list_chunks(self, artifact_id: str) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM artifact_chunks WHERE artifact_id = ? ORDER BY chunk_index",
+                (artifact_id,),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def search_chunks(self, query: str, limit: int = 20) -> list[dict]:
+        """Full-text search over current-generation chunks only (is_current = 1),
+        joined back to source metadata for display."""
+        fts_query = _sanitize_fts_query(query)
+        if not fts_query:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT
+                    c.id AS chunk_id, c.chunk_index, c.page_number,
+                    c.time_start_seconds, c.time_end_seconds,
+                    a.id AS artifact_id, a.artifact_type,
+                    sv.id AS source_version_id, sv.version_number,
+                    s.id AS source_id, s.title AS source_title, s.canonical_uri,
+                    bm25(artifact_chunks_fts) AS score,
+                    snippet(artifact_chunks_fts, 0, '>>>', '<<<', ' ... ', 12) AS snippet
+                FROM artifact_chunks_fts
+                JOIN artifact_chunks c ON c.id = artifact_chunks_fts.chunk_id
+                JOIN artifacts a ON a.id = c.artifact_id AND a.is_current = 1
+                JOIN source_versions sv ON sv.id = a.source_version_id
+                JOIN sources s ON s.id = sv.source_id
+                WHERE artifact_chunks_fts MATCH ?
+                ORDER BY score
+                LIMIT ?
+                """,
+                (fts_query, limit),
             )
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
