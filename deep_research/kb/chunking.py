@@ -1,10 +1,41 @@
-"""Pure chunking functions — no I/O. Naive fixed-size chunking is intentional
-here: PLAN_KB_ARCHITECTURE.md explicitly defers smarter (semantic/structural)
-chunking, and the step-0 spike validated that extraction quality holds up
-fine on naive chunks.
+"""Pure chunking and text-normalization functions — no I/O. Naive fixed-size
+chunking is intentional here: PLAN_KB_ARCHITECTURE.md explicitly defers smarter
+(semantic/structural) chunking, and the step-0 spike validated that extraction
+quality holds up fine on naive chunks.
 """
 
+import re
+
 DEFAULT_CHUNK_SIZE_CHARS = 1200
+
+
+def normalize_ws(s: str | None) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def normalize_name(s: str | None) -> str:
+    """Exact-match key for entities/events (decision 25): lowercase,
+    punctuation-stripped. This is the *only* auto-merge tier — anything less
+    than an exact match on this key must go through resolution_candidates."""
+    return re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
+
+
+def find_quote(quote: str, chunk_text: str) -> tuple[str, int, int] | None:
+    """Locate a model-reported supporting quote inside the chunk it supposedly
+    came from. Whitespace-normalized exact/case-insensitive substring match —
+    validated in the step-0 spike at 96% match rate, with the misses being
+    genuine excerpts with minor drift, never fabrication."""
+    q = normalize_ws(quote)
+    c = normalize_ws(chunk_text)
+    if not q:
+        return None
+    idx = c.find(q)
+    if idx >= 0:
+        return ("exact", idx, idx + len(q))
+    idx_ci = c.lower().find(q.lower())
+    if idx_ci >= 0:
+        return ("case_insensitive", idx_ci, idx_ci + len(q))
+    return None
 
 
 def chunk_text(text: str, size: int = DEFAULT_CHUNK_SIZE_CHARS) -> list[tuple[str, int, int]]:

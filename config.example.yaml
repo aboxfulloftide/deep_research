@@ -23,3 +23,9 @@ web:
 kb:
   db_path: "~/.local/share/deep_research/kb.db"
   snapshot_dir: "~/.local/share/deep_research/kb_snapshots"
+  # Extraction/embeddings use their own models, independent of the `llm` section above.
+  extraction_llm_base_url: "http://localhost:8080/v1"  # llama.cpp llama-server
+  extraction_llm_model: ""  # empty = auto-detect whichever model llama.cpp has loaded
+  embedding_base_url: "http://localhost:11434"  # Ollama
+  embedding_model: "nomic-embed-text:v1.5"
+  claim_duplicate_threshold: 0.85

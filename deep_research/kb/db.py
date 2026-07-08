@@ -16,6 +16,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from deep_research.kb.chunking import normalize_name, normalize_ws
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_types (
     id INTEGER PRIMARY KEY,
@@ -147,6 +149,193 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifact_chunks_fts USING fts5(
     chunk_id UNINDEXED,
     artifact_id UNINDEXED
 );
+
+-- Canonical entities. UNIQUE(entity_type, normalized_name) *is* the exact-match
+-- auto-merge tier from decision 25 — a plain INSERT OR IGNORE + re-select handles
+-- "same entity, same type, identical normalized name" for free. Anything less
+-- than exact (fuzzy/substring) never merges here; it only ever produces a
+-- resolution_candidates row for review. entity_mentions (per-chunk mention
+-- locations) is a deferred second-wave table — v1 reads mention locations out of
+-- extracted_observations.raw_payload instead.
+CREATE TABLE IF NOT EXISTS entities (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    description TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(entity_type, normalized_name)
+);
+
+-- Canonical events. UNIQUE(normalized_title) is the exact-match auto-merge tier
+-- decision 25 specifies for events (same pattern as entities). Fuzzy event
+-- matching is explicitly deferred until real event volume justifies it.
+CREATE TABLE IF NOT EXISTS events (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    normalized_title TEXT NOT NULL UNIQUE,
+    description TEXT,
+    event_type TEXT,
+    start_at TEXT,
+    end_at TEXT,
+    date_precision TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at);
+
+-- Canonical claims. UNIQUE(claim_type, normalized_text) auto-merges only
+-- byte-identical normalized claims — decision 25 says claims have "no auto-merge
+-- tier" for *fuzzy/lexical* similarity (the spike measured that catching zero
+-- real duplicates), but an exact-text match is the same safe case as entities/
+-- events, so it gets the same treatment. Near-duplicate claims (different
+-- phrasing, same fact) never merge here; they go through embedding-similarity
+-- candidate generation into resolution_candidates instead. No subject/object
+-- entity columns yet — the validated extraction prompt returns a flat entity
+-- list per claim, not subject/object roles, so per-claim entity association
+-- lives in extracted_observations.raw_payload for v1 (entity_mentions is a
+-- deferred second-wave table, same as events).
+CREATE TABLE IF NOT EXISTS claims (
+    id TEXT PRIMARY KEY,
+    claim_type TEXT NOT NULL,
+    event_id TEXT REFERENCES events(id),
+    canonical_text TEXT NOT NULL,
+    normalized_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'unverified',
+    preferred_source_id TEXT REFERENCES sources(id),
+    confidence REAL,
+    importance_score REAL,
+    verification_attempted_at TEXT,
+    is_user_reviewed INTEGER NOT NULL DEFAULT 0,
+    reviewed_at TEXT,
+    reviewed_by TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(claim_type, normalized_text)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
+CREATE INDEX IF NOT EXISTS idx_claims_event ON claims(event_id);
+
+-- Provenance for one extraction pass over one artifact's current chunks.
+-- run_signature (model+prompt+schema hash) makes re-extraction idempotent: the
+-- same signature against the same artifact is a no-op unless forced.
+CREATE TABLE IF NOT EXISTS extraction_runs (
+    id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+    run_signature TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    runtime TEXT,
+    prompt_name TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    extraction_schema_version TEXT NOT NULL,
+    parameters TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    chunk_count INTEGER,
+    observation_count INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_extraction_runs_artifact ON extraction_runs(artifact_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_extraction_runs_signature ON extraction_runs(artifact_id, run_signature);
+CREATE INDEX IF NOT EXISTS idx_extraction_runs_status ON extraction_runs(status);
+
+-- Raw model output before resolution — the audit trail / noise buffer that
+-- protects the curated claims table from first-pass extraction noise.
+CREATE TABLE IF NOT EXISTS extracted_observations (
+    id TEXT PRIMARY KEY,
+    extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(id),
+    artifact_chunk_id TEXT NOT NULL REFERENCES artifact_chunks(id),
+    observation_type TEXT NOT NULL DEFAULT 'claim',
+    raw_text TEXT NOT NULL,
+    normalized_text TEXT NOT NULL,
+    raw_payload TEXT NOT NULL,
+    candidate_claim_id TEXT REFERENCES claims(id),
+    confidence REAL,
+    importance_score REAL,
+    char_start INTEGER,
+    char_end INTEGER,
+    quote_match_type TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_observations_run ON extracted_observations(extraction_run_id);
+CREATE INDEX IF NOT EXISTS idx_observations_chunk ON extracted_observations(artifact_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_observations_status ON extracted_observations(status);
+
+-- Provenance links from claims to the exact chunk they came from. Creating one
+-- of these is what locks the referenced source_version's retention (see
+-- lock_version_retention / "Retention vs. Evidence Integrity").
+CREATE TABLE IF NOT EXISTS claim_evidence (
+    id TEXT PRIMARY KEY,
+    claim_id TEXT NOT NULL REFERENCES claims(id),
+    extraction_run_id TEXT REFERENCES extraction_runs(id),
+    extracted_observation_id TEXT REFERENCES extracted_observations(id),
+    artifact_chunk_id TEXT NOT NULL REFERENCES artifact_chunks(id),
+    source_id TEXT NOT NULL REFERENCES sources(id),
+    source_version_id TEXT NOT NULL REFERENCES source_versions(id),
+    evidence_type TEXT NOT NULL,
+    excerpt_text TEXT,
+    excerpt_hash TEXT,
+    char_start INTEGER,
+    char_end INTEGER,
+    confidence REAL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_evidence_claim ON claim_evidence(claim_id);
+CREATE INDEX IF NOT EXISTS idx_claim_evidence_chunk ON claim_evidence(artifact_chunk_id);
+
+-- The v1 merge/review queue (decision 25). Uncertain matches land here instead
+-- of being silently merged. Accepting/rejecting a candidate only changes its
+-- status in this step — executing an accepted merge (reassigning evidence,
+-- tombstoning the duplicate) is explicitly deferred, not implemented yet.
+CREATE TABLE IF NOT EXISTS resolution_candidates (
+    id TEXT PRIMARY KEY,
+    candidate_type TEXT NOT NULL,
+    left_entity_id TEXT REFERENCES entities(id),
+    right_entity_id TEXT REFERENCES entities(id),
+    left_event_id TEXT REFERENCES events(id),
+    right_event_id TEXT REFERENCES events(id),
+    left_claim_id TEXT REFERENCES claims(id),
+    right_claim_id TEXT REFERENCES claims(id),
+    score REAL,
+    reason TEXT,
+    method TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolution_candidates_type_status
+    ON resolution_candidates(candidate_type, status);
+
+CREATE TABLE IF NOT EXISTS metrics (
+    id TEXT PRIMARY KEY,
+    claim_id TEXT REFERENCES claims(id),
+    event_id TEXT REFERENCES events(id),
+    entity_id TEXT REFERENCES entities(id),
+    metric_name TEXT NOT NULL,
+    value_numeric REAL,
+    value_text TEXT,
+    unit TEXT,
+    currency_code TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_metrics_claim ON metrics(claim_id);
 """
 
 SOURCE_TYPES = [
@@ -365,6 +554,13 @@ class KBDatabase:
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_source_version(self, version_id: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM source_versions WHERE id = ?", (version_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
     async def get_next_version_number(self, source_id: str) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
@@ -511,6 +707,16 @@ class KBDatabase:
             row = await cursor.fetchone()
         return dict(row) if row else None
 
+    async def get_current_artifacts_for_version(self, source_version_id: str) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM artifacts WHERE source_version_id = ? AND is_current = 1",
+                (source_version_id,),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     async def get_artifact(self, artifact_id: str) -> dict | None:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -647,3 +853,409 @@ class KBDatabase:
             )
             rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    # -- entities/events/claims (build order step 4) ---------------------
+
+    async def get_or_create_entity(
+        self, entity_type: str, name: str, description: str | None = None,
+        metadata: dict | None = None,
+    ) -> tuple[dict, bool]:
+        """Exact-match auto-merge tier (decision 25): same entity_type + same
+        normalized_name reuses the existing row via the UNIQUE constraint."""
+        normalized = normalize_name(name)
+        entity_id = _new_id()
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO entities "
+                "(id, entity_type, name, normalized_name, description, metadata, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (entity_id, entity_type, name, normalized, description,
+                 json.dumps(metadata) if metadata else None, now, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM entities WHERE entity_type = ? AND normalized_name = ?",
+                (entity_type, normalized),
+            )
+            row = await cursor.fetchone()
+        row = dict(row)
+        return row, row["id"] == entity_id
+
+    async def get_entity(self, entity_id: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM entities WHERE id = ?", (entity_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_entities(self, entity_type: str | None = None, limit: int = 500) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if entity_type:
+                cursor = await db.execute(
+                    "SELECT * FROM entities WHERE entity_type = ? ORDER BY updated_at DESC LIMIT ?",
+                    (entity_type, limit),
+                )
+            else:
+                cursor = await db.execute(
+                    "SELECT * FROM entities ORDER BY updated_at DESC LIMIT ?", (limit,)
+                )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_or_create_event(
+        self, title: str, description: str | None = None, event_type: str | None = None,
+        start_at: str | None = None, end_at: str | None = None,
+        date_precision: str | None = None, metadata: dict | None = None,
+    ) -> tuple[dict, bool]:
+        """Exact-match auto-merge tier (decision 25): normalized_title match
+        reuses the existing row. Fuzzy event matching is deferred."""
+        normalized = normalize_name(title)
+        event_id = _new_id()
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO events "
+                "(id, title, normalized_title, description, event_type, start_at, end_at, "
+                "date_precision, metadata, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, title, normalized, description, event_type, start_at, end_at,
+                 date_precision, json.dumps(metadata) if metadata else None, now, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM events WHERE normalized_title = ?", (normalized,))
+            row = await cursor.fetchone()
+        row = dict(row)
+        return row, row["id"] == event_id
+
+    async def list_events(self, limit: int = 500) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM events ORDER BY updated_at DESC LIMIT ?", (limit,))
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_or_create_claim(
+        self, claim_type: str, canonical_text: str, event_id: str | None = None,
+        confidence: float | None = None, importance_score: float | None = None,
+    ) -> tuple[dict, bool]:
+        """Exact-match auto-merge tier: byte-identical (claim_type,
+        normalized_text) reuses the existing claim row — this is the same safe
+        exact-match case as entities/events, not the fuzzy/lexical similarity
+        decision 25 ruled out for claims. Anything less than exact never merges
+        here; see the embedding-based candidate generation in extraction.py."""
+        normalized = normalize_ws(canonical_text).lower()
+        claim_id = _new_id()
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO claims "
+                "(id, claim_type, event_id, canonical_text, normalized_text, status, "
+                "confidence, importance_score, is_user_reviewed, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'unverified', ?, ?, 0, ?, ?)",
+                (claim_id, claim_type, event_id, canonical_text, normalized,
+                 confidence, importance_score, now, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM claims WHERE claim_type = ? AND normalized_text = ?",
+                (claim_type, normalized),
+            )
+            row = await cursor.fetchone()
+        row = dict(row)
+        return row, row["id"] == claim_id
+
+    async def get_claim(self, claim_id: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM claims WHERE id = ?", (claim_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def list_claims(self, limit: int = 100) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM claims ORDER BY updated_at DESC LIMIT ?", (limit,)
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def add_claim_evidence(
+        self, claim_id: str, artifact_chunk_id: str, source_id: str, source_version_id: str,
+        evidence_type: str = "support", excerpt_text: str | None = None,
+        excerpt_hash: str | None = None, extraction_run_id: str | None = None,
+        extracted_observation_id: str | None = None, char_start: int | None = None,
+        char_end: int | None = None, confidence: float | None = None,
+    ) -> dict:
+        """Creates the evidence link AND locks the referenced source_version's
+        retention — this is the first real caller of lock_version_retention
+        (stubbed in build order step 2 for exactly this moment)."""
+        evidence_id = _new_id()
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO claim_evidence "
+                "(id, claim_id, extraction_run_id, extracted_observation_id, artifact_chunk_id, "
+                "source_id, source_version_id, evidence_type, excerpt_text, excerpt_hash, "
+                "char_start, char_end, confidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (evidence_id, claim_id, extraction_run_id, extracted_observation_id, artifact_chunk_id,
+                 source_id, source_version_id, evidence_type, excerpt_text, excerpt_hash,
+                 char_start, char_end, confidence, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM claim_evidence WHERE id = ?", (evidence_id,))
+            row = await cursor.fetchone()
+        await self.lock_version_retention(source_version_id)
+        return dict(row)
+
+    async def list_claim_evidence(self, claim_id: str) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT ce.*, s.title AS source_title, s.canonical_uri "
+                "FROM claim_evidence ce "
+                "JOIN sources s ON s.id = ce.source_id "
+                "WHERE ce.claim_id = ? ORDER BY ce.created_at",
+                (claim_id,),
+            )
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def add_metric(
+        self, metric_name: str, claim_id: str | None = None, event_id: str | None = None,
+        entity_id: str | None = None, value_numeric: float | None = None,
+        value_text: str | None = None, unit: str | None = None,
+        currency_code: str | None = None, metadata: dict | None = None,
+    ) -> dict:
+        metric_id = _new_id()
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO metrics (id, claim_id, event_id, entity_id, metric_name, "
+                "value_numeric, value_text, unit, currency_code, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (metric_id, claim_id, event_id, entity_id, metric_name, value_numeric,
+                 value_text, unit, currency_code, json.dumps(metadata) if metadata else None, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM metrics WHERE id = ?", (metric_id,))
+            row = await cursor.fetchone()
+        return dict(row)
+
+    # -- resolution candidates (v1 merge/review queue) --------------------
+
+    async def add_entity_resolution_candidate(
+        self, entity_a_id: str, entity_b_id: str, score: float, method: str, reason: str | None = None,
+    ) -> tuple[dict, bool]:
+        left_id, right_id = sorted([entity_a_id, entity_b_id])
+        return await self._add_resolution_candidate(
+            "entity_duplicate", score, method, reason,
+            left_entity_id=left_id, right_entity_id=right_id,
+        )
+
+    async def add_claim_resolution_candidate(
+        self, claim_a_id: str, claim_b_id: str, score: float, method: str, reason: str | None = None,
+    ) -> tuple[dict, bool]:
+        left_id, right_id = sorted([claim_a_id, claim_b_id])
+        return await self._add_resolution_candidate(
+            "claim_duplicate", score, method, reason,
+            left_claim_id=left_id, right_claim_id=right_id,
+        )
+
+    async def _add_resolution_candidate(
+        self, candidate_type: str, score: float, method: str, reason: str | None,
+        left_entity_id: str | None = None, right_entity_id: str | None = None,
+        left_event_id: str | None = None, right_event_id: str | None = None,
+        left_claim_id: str | None = None, right_claim_id: str | None = None,
+    ) -> tuple[dict, bool]:
+        """De-duplicates on (candidate_type, left/right id pair) in application
+        code — a DB UNIQUE constraint can't do this here because SQLite (like
+        standard SQL) never treats NULL as equal to NULL, and every row has at
+        least one NULL id-pair (only one of entity/event/claim applies per
+        candidate_type)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM resolution_candidates WHERE candidate_type = ? "
+                "AND left_entity_id IS ? AND right_entity_id IS ? "
+                "AND left_event_id IS ? AND right_event_id IS ? "
+                "AND left_claim_id IS ? AND right_claim_id IS ?",
+                (candidate_type, left_entity_id, right_entity_id,
+                 left_event_id, right_event_id, left_claim_id, right_claim_id),
+            )
+            existing = await cursor.fetchone()
+            if existing:
+                return dict(existing), False
+
+            candidate_id = _new_id()
+            now = _now()
+            await db.execute(
+                "INSERT INTO resolution_candidates "
+                "(id, candidate_type, left_entity_id, right_entity_id, left_event_id, right_event_id, "
+                "left_claim_id, right_claim_id, score, reason, method, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+                (candidate_id, candidate_type, left_entity_id, right_entity_id,
+                 left_event_id, right_event_id, left_claim_id, right_claim_id,
+                 score, reason, method, now, now),
+            )
+            await db.commit()
+            cursor = await db.execute("SELECT * FROM resolution_candidates WHERE id = ?", (candidate_id,))
+            row = await cursor.fetchone()
+        return dict(row), True
+
+    async def list_resolution_candidates(
+        self, candidate_type: str | None = None, status: str | None = "open", limit: int = 100,
+    ) -> list[dict]:
+        query = "SELECT * FROM resolution_candidates WHERE 1=1"
+        params: list = []
+        if candidate_type:
+            query += " AND candidate_type = ?"
+            params.append(candidate_type)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY score DESC LIMIT ?"
+        params.append(limit)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_resolution_candidate(self, candidate_id: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM resolution_candidates WHERE id = ?", (candidate_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def review_resolution_candidate(
+        self, candidate_id: str, decision: str, reviewed_by: str | None = None,
+    ) -> dict:
+        """Changes the candidate's status only. Executing an accepted merge
+        (reassigning evidence to one canonical row, tombstoning the other) is
+        explicitly deferred — not implemented yet."""
+        if decision not in ("accepted", "rejected"):
+            raise ValueError(f"decision must be 'accepted' or 'rejected', got {decision!r}")
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE resolution_candidates SET status = ?, reviewed_by = ?, reviewed_at = ?, "
+                "updated_at = ? WHERE id = ?",
+                (decision, reviewed_by, now, now, candidate_id),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM resolution_candidates WHERE id = ?", (candidate_id,))
+            row = await cursor.fetchone()
+        return dict(row)
+
+    # -- extraction runs & observations ------------------------------------
+
+    async def find_extraction_run_by_signature(self, artifact_id: str, run_signature: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM extraction_runs WHERE artifact_id = ? AND run_signature = ? "
+                "AND status = 'completed'",
+                (artifact_id, run_signature),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def create_extraction_run(
+        self, artifact_id: str, run_signature: str, model_id: str, prompt_name: str,
+        prompt_version: str, extraction_schema_version: str, runtime: str | None = None,
+        parameters: dict | None = None, chunk_count: int | None = None,
+    ) -> dict:
+        run_id = _new_id()
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO extraction_runs (id, artifact_id, run_signature, model_id, runtime, "
+                "prompt_name, prompt_version, extraction_schema_version, parameters, status, "
+                "chunk_count, observation_count, started_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, 0, ?, ?, ?)",
+                (run_id, artifact_id, run_signature, model_id, runtime, prompt_name,
+                 prompt_version, extraction_schema_version,
+                 json.dumps(parameters) if parameters else None, chunk_count, now, now, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM extraction_runs WHERE id = ?", (run_id,))
+            row = await cursor.fetchone()
+        return dict(row)
+
+    async def complete_extraction_run(self, run_id: str, observation_count: int, status: str = "completed") -> None:
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE extraction_runs SET status = ?, observation_count = ?, "
+                "completed_at = ?, updated_at = ? WHERE id = ?",
+                (status, observation_count, now, now, run_id),
+            )
+            await db.commit()
+
+    async def add_observation(
+        self, extraction_run_id: str, artifact_chunk_id: str, raw_text: str,
+        raw_payload: dict, confidence: float | None = None, importance_score: float | None = None,
+        char_start: int | None = None, char_end: int | None = None,
+        quote_match_type: str | None = None, observation_type: str = "claim",
+    ) -> dict:
+        obs_id = _new_id()
+        now = _now()
+        normalized = normalize_ws(raw_text).lower()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO extracted_observations "
+                "(id, extraction_run_id, artifact_chunk_id, observation_type, raw_text, "
+                "normalized_text, raw_payload, confidence, importance_score, char_start, "
+                "char_end, quote_match_type, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)",
+                (obs_id, extraction_run_id, artifact_chunk_id, observation_type, raw_text,
+                 normalized, json.dumps(raw_payload), confidence, importance_score,
+                 char_start, char_end, quote_match_type, now, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM extracted_observations WHERE id = ?", (obs_id,))
+            row = await cursor.fetchone()
+        return dict(row)
+
+    async def list_observations(self, extraction_run_id: str, status: str | None = None) -> list[dict]:
+        query = "SELECT * FROM extracted_observations WHERE extraction_run_id = ?"
+        params: list = [extraction_run_id]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at"
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def mark_observation_promoted(self, observation_id: str, claim_id: str) -> None:
+        now = _now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE extracted_observations SET status = 'promoted', candidate_claim_id = ?, "
+                "updated_at = ? WHERE id = ?",
+                (claim_id, now, observation_id),
+            )
+            await db.commit()
+
+    async def get_artifact_chunk(self, chunk_id: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM artifact_chunks WHERE id = ?", (chunk_id,))
+            row = await cursor.fetchone()
+        return dict(row) if row else None

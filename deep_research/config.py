@@ -37,6 +37,15 @@ class KBConfig(BaseModel):
     """Knowledge base storage — deliberately separate from chat session storage."""
     db_path: str = "~/.local/share/deep_research/kb.db"
     snapshot_dir: str = "~/.local/share/deep_research/kb_snapshots"
+    # Extraction/resolution use their own model config, independent of the
+    # interactive research agent's `llm` section (MODELS.md: per-role model
+    # assignment, not one model for everything). Defaults match what the step-0
+    # spike validated: local llama.cpp for extraction, Ollama for embeddings.
+    extraction_llm_base_url: str = "http://localhost:8080/v1"
+    extraction_llm_model: str = ""  # empty = auto-detect from the llama.cpp server
+    embedding_base_url: str = "http://localhost:11434"
+    embedding_model: str = "nomic-embed-text:v1.5"
+    claim_duplicate_threshold: float = 0.85
 
 
 class Config(BaseModel):
@@ -76,16 +85,23 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_WEB_PORT": ("web", "port"),
         "DEEP_RESEARCH_KB_DB_PATH": ("kb", "db_path"),
         "DEEP_RESEARCH_KB_SNAPSHOT_DIR": ("kb", "snapshot_dir"),
+        "DEEP_RESEARCH_KB_EXTRACTION_LLM_BASE_URL": ("kb", "extraction_llm_base_url"),
+        "DEEP_RESEARCH_KB_EXTRACTION_LLM_MODEL": ("kb", "extraction_llm_model"),
+        "DEEP_RESEARCH_KB_EMBEDDING_BASE_URL": ("kb", "embedding_base_url"),
+        "DEEP_RESEARCH_KB_EMBEDDING_MODEL": ("kb", "embedding_model"),
+        "DEEP_RESEARCH_KB_CLAIM_DUPLICATE_THRESHOLD": ("kb", "claim_duplicate_threshold"),
     }
     data = config.model_dump()
     for env_var, (section, key) in env_map.items():
         val = os.environ.get(env_var)
         if val is not None:
-            # Coerce to int for integer fields
+            # Coerce to the field's declared scalar type
             field = config.__class__.model_fields[section].annotation
             sub_field = field.model_fields[key]
             if sub_field.annotation is int:
                 val = int(val)
+            elif sub_field.annotation is float:
+                val = float(val)
             data[section][key] = val
     return Config(**data)
 

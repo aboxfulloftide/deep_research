@@ -681,9 +681,34 @@ claim/evidence schema has stabilized.
    `92% GDP growth`) crashed FTS5's query parser — fixed by quoting each token as an
    FTS5 string literal before matching.
 
-4. Add the **extraction pipeline** for entities, events, claims, and metrics, with an
-   **`extraction_runs` provenance record** so re-extraction is idempotent and claims can
-   be traced to the model + prompt + params that produced them.
+4. **Done.** Add the **extraction pipeline** for entities, events, claims, and metrics,
+   with an **`extraction_runs` provenance record** so re-extraction is idempotent and
+   claims can be traced to the model + prompt + params that produced them. Implemented
+   in `deep_research/kb/extraction.py` (chunk-by-chunk extraction reusing the spike's
+   validated prompt, extended with a `metrics[]` field per decision 22; idempotent via
+   a model+prompt+schema signature hash on `extraction_runs`) and
+   `deep_research/kb/resolution.py` (promotion + resolution, implementing decision 25
+   exactly: entities/events auto-merge only on exact normalized-name/title match via DB
+   `UNIQUE` constraints; claims also get an exact-text-match tier — a safe addition
+   consistent with decision 25's intent, not a fuzzy/lexical merge; fuzzy entity
+   matches require a minimum name length before consideration, per the spike's finding;
+   claim near-duplicates are generated via embedding cosine similarity into
+   `resolution_candidates`, never auto-merged). `claim_evidence` creation is the first
+   real caller of `lock_version_retention` (stubbed in step 2) — verified the flag
+   actually flips on real data. CLI: `extract-source`, `list-claims`, `show-claim`,
+   `list-resolution-candidates`, `review-candidate` (review only changes candidate
+   status; merge execution is explicitly deferred, not implemented). Verified against
+   the real article and YouTube transcript: 44 and 81 observations respectively, exact
+   dedup and idempotent re-extraction both confirmed, a metrics table populated with
+   56 real values, entity fuzzy-candidate gating correctly avoided spike-style
+   nonsense matches, and claim resolution candidates reproduced the spike's precision
+   pattern — genuine same-fact duplicates ranked highest (0.94-0.95 cosine), degrading
+   into topically-related-but-distinct claims further down, all correctly queued for
+   review rather than merged. One specific cross-source duplicate the spike found
+   (the Jason Furman "92% of GDP growth" claim) didn't reappear verbatim this run —
+   traced to LLM extraction non-determinism (the source sentence is intact in its
+   chunk; the model simply phrased/omitted it differently on this pass), not a
+   pipeline defect.
 
 5. **Migrate to PostgreSQL** once the claim/evidence schema has stabilized. Migrating
    once, against a validated schema, is far cheaper than designing Postgres tables twice.
