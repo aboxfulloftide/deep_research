@@ -9,6 +9,7 @@ from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.extraction import run_extraction
 from deep_research.kb.ingest import ingest_file, ingest_web_page, ingest_youtube_video
+from deep_research.kb.merge import review_and_execute
 from deep_research.kb.reports import generate_topic_report
 from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
@@ -338,10 +339,18 @@ async def cmd_review_candidate(args):
         return
 
     decision = "accepted" if args.accept else "rejected"
-    updated = await kb_db.review_resolution_candidate(candidate["id"], decision)
-    console.print(f"Marked {updated['id']} as [bold]{decision}[/bold]")
-    if decision == "accepted":
-        console.print("[dim]Note: merge execution is not implemented yet — this only records the review decision.[/dim]")
+    result = await review_and_execute(kb_db, candidate["id"], decision)
+    console.print(f"Marked {result.candidate_id} as [bold]{decision}[/bold]")
+
+    if result.action == "merged":
+        noun = "entity" if result.candidate_type == "entity_duplicate" else "claim"
+        console.print(f"[green]Merged {noun} {result.loser_id} into {result.winner_id}[/green]")
+    elif result.action == "no_op_already_merged":
+        console.print(f"[dim]Both sides already resolve to the same {result.winner_id} — nothing to merge.[/dim]")
+    elif result.action == "contradiction_recorded":
+        console.print("[yellow]Recorded confirmed contradiction — both claims' status updated, no merge performed.[/yellow]")
+    elif result.action == "unknown_type":
+        console.print(f"[red]Unknown candidate type {result.candidate_type!r} — review decision recorded but no action taken.[/red]")
 
 
 def _print_verification_result(result):

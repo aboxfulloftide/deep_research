@@ -163,6 +163,10 @@ CREATE INDEX IF NOT EXISTS idx_artifact_chunks_tsv
 -- ever produces a resolution_candidates row for review. entity_mentions
 -- (per-chunk mention locations) is a deferred second-wave table — v1 reads
 -- mention locations out of extracted_observations.raw_payload instead.
+-- merged_into_entity_id is a tombstone, not a delete: accepting an
+-- entity_duplicate resolution_candidate (see merge.py) reassigns everything
+-- that referenced this row to the winner and sets this pointer, rather than
+-- deleting the row — preserving the audit trail of what got merged.
 CREATE TABLE IF NOT EXISTS entities (
     id TEXT PRIMARY KEY,
     entity_type TEXT NOT NULL,
@@ -170,10 +174,14 @@ CREATE TABLE IF NOT EXISTS entities (
     normalized_name TEXT NOT NULL,
     description TEXT,
     metadata JSONB,
+    merged_into_entity_id TEXT REFERENCES entities(id),
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(entity_type, normalized_name)
 );
+
+ALTER TABLE entities ADD COLUMN IF NOT EXISTS merged_into_entity_id TEXT REFERENCES entities(id);
+CREATE INDEX IF NOT EXISTS idx_entities_merged_into ON entities(merged_into_entity_id);
 
 -- Canonical events. UNIQUE(normalized_title) is the exact-match auto-merge tier
 -- decision 25 specifies for events (same pattern as entities). Fuzzy event
@@ -220,12 +228,18 @@ CREATE TABLE IF NOT EXISTS claims (
     is_user_reviewed BOOLEAN NOT NULL DEFAULT FALSE,
     reviewed_at TIMESTAMPTZ,
     reviewed_by TEXT,
+    -- Tombstone for accepted claim_duplicate merges (see merge.py) — the
+    -- 'deprecated' status already anticipated by the Claim Status Model is
+    -- what gets set on the loser; this pointer says which claim absorbed it.
+    merged_into_claim_id TEXT REFERENCES claims(id),
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(claim_type, normalized_text)
 );
 
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_notes JSONB;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS merged_into_claim_id TEXT REFERENCES claims(id);
+CREATE INDEX IF NOT EXISTS idx_claims_merged_into ON claims(merged_into_claim_id);
 
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
 CREATE INDEX IF NOT EXISTS idx_claims_event ON claims(event_id);
@@ -863,7 +877,11 @@ class KBDatabase:
         metadata: dict | None = None,
     ) -> tuple[dict, bool]:
         """Exact-match auto-merge tier (decision 25): same entity_type + same
-        normalized_name reuses the existing row via the UNIQUE constraint."""
+        normalized_name reuses the existing row via the UNIQUE constraint. If
+        that row has since been merged away (merged_into_entity_id set),
+        follows the pointer to the live winner instead of resurrecting a
+        tombstoned row — merge.py always points at the *ultimate* winner, so
+        one hop is enough."""
         normalized = normalize_name(name)
         entity_id = _new_id()
         now = _now()
@@ -880,23 +898,57 @@ class KBDatabase:
                 entity_type, normalized,
             )
         row = dict(row)
-        return row, row["id"] == entity_id
+        created = row["id"] == entity_id
+        if row.get("merged_into_entity_id"):
+            winner = await self.get_entity(row["merged_into_entity_id"])
+            if winner is not None:
+                return winner, False
+        return row, created
 
     async def get_entity(self, entity_id: str) -> dict | None:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM entities WHERE id = $1", entity_id)
         return dict(row) if row else None
 
-    async def list_entities(self, entity_type: str | None = None, limit: int = 500) -> list[dict]:
+    async def list_entities(
+        self, entity_type: str | None = None, limit: int = 500, include_merged: bool = False,
+    ) -> list[dict]:
+        merged_clause = "" if include_merged else "AND merged_into_entity_id IS NULL"
         async with self.pool.acquire() as conn:
             if entity_type:
                 rows = await conn.fetch(
-                    "SELECT * FROM entities WHERE entity_type = $1 ORDER BY updated_at DESC LIMIT $2",
+                    f"SELECT * FROM entities WHERE entity_type = $1 {merged_clause} "
+                    "ORDER BY updated_at DESC LIMIT $2",
                     entity_type, limit,
                 )
             else:
-                rows = await conn.fetch("SELECT * FROM entities ORDER BY updated_at DESC LIMIT $1", limit)
+                rows = await conn.fetch(
+                    f"SELECT * FROM entities WHERE TRUE {merged_clause} ORDER BY updated_at DESC LIMIT $1",
+                    limit,
+                )
         return [dict(r) for r in rows]
+
+    async def reassign_metrics_entity(self, loser_id: str, winner_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE metrics SET entity_id = $1 WHERE entity_id = $2", winner_id, loser_id)
+
+    async def reassign_resolution_candidates_entity(self, loser_id: str, winner_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE resolution_candidates SET left_entity_id = $1 WHERE left_entity_id = $2",
+                winner_id, loser_id,
+            )
+            await conn.execute(
+                "UPDATE resolution_candidates SET right_entity_id = $1 WHERE right_entity_id = $2",
+                winner_id, loser_id,
+            )
+
+    async def mark_entity_merged(self, loser_id: str, winner_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE entities SET merged_into_entity_id = $1, updated_at = $2 WHERE id = $3",
+                winner_id, _now(), loser_id,
+            )
 
     async def get_or_create_event(
         self, title: str, description: str | None = None, event_type: str | None = None,
@@ -940,7 +992,10 @@ class KBDatabase:
         normalized_text) reuses the existing claim row — this is the same safe
         exact-match case as entities/events, not the fuzzy/lexical similarity
         decision 25 ruled out for claims. Anything less than exact never merges
-        here; see the embedding-based candidate generation in resolution.py."""
+        here; see the embedding-based candidate generation in resolution.py.
+        If the matched row has since been merged away (merged_into_claim_id
+        set), follows the pointer to the live winner instead — merge.py
+        always points at the *ultimate* winner, so one hop is enough."""
         normalized = normalize_ws(canonical_text).lower()
         claim_id = _new_id()
         now = _now()
@@ -959,17 +1014,79 @@ class KBDatabase:
                 claim_type, normalized,
             )
         row = dict(row)
-        return row, row["id"] == claim_id
+        created = row["id"] == claim_id
+        if row.get("merged_into_claim_id"):
+            winner = await self.get_claim(row["merged_into_claim_id"])
+            if winner is not None:
+                return winner, False
+        return row, created
 
     async def get_claim(self, claim_id: str) -> dict | None:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM claims WHERE id = $1", claim_id)
         return dict(row) if row else None
 
-    async def list_claims(self, limit: int = 100) -> list[dict]:
+    async def list_claims(self, limit: int = 100, include_merged: bool = False) -> list[dict]:
+        merged_clause = "" if include_merged else "WHERE merged_into_claim_id IS NULL"
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM claims ORDER BY updated_at DESC LIMIT $1", limit)
+            rows = await conn.fetch(
+                f"SELECT * FROM claims {merged_clause} ORDER BY updated_at DESC LIMIT $1", limit,
+            )
         return [dict(r) for r in rows]
+
+    async def reassign_claim_evidence(self, loser_id: str, winner_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE claim_evidence SET claim_id = $1 WHERE claim_id = $2", winner_id, loser_id,
+            )
+
+    async def reassign_metrics_claim(self, loser_id: str, winner_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE metrics SET claim_id = $1 WHERE claim_id = $2", winner_id, loser_id)
+
+    async def reassign_observations_claim(self, loser_id: str, winner_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE extracted_observations SET candidate_claim_id = $1 WHERE candidate_claim_id = $2",
+                winner_id, loser_id,
+            )
+
+    async def reassign_claim_topics(self, loser_id: str, winner_id: str) -> None:
+        """topic_id+claim_id is unique, so a straight UPDATE could conflict if
+        the winner is already linked to a topic the loser is also linked to —
+        drop the loser's row in that case instead of erroring."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM claim_topics ct_loser "
+                    "USING claim_topics ct_winner "
+                    "WHERE ct_loser.claim_id = $1 AND ct_winner.claim_id = $2 "
+                    "AND ct_loser.topic_id = ct_winner.topic_id",
+                    loser_id, winner_id,
+                )
+                await conn.execute(
+                    "UPDATE claim_topics SET claim_id = $1 WHERE claim_id = $2", winner_id, loser_id,
+                )
+
+    async def reassign_resolution_candidates_claim(self, loser_id: str, winner_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE resolution_candidates SET left_claim_id = $1 WHERE left_claim_id = $2",
+                winner_id, loser_id,
+            )
+            await conn.execute(
+                "UPDATE resolution_candidates SET right_claim_id = $1 WHERE right_claim_id = $2",
+                winner_id, loser_id,
+            )
+
+    async def mark_claim_merged(self, loser_id: str, winner_id: str) -> None:
+        now = _now()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE claims SET status = 'deprecated', merged_into_claim_id = $1, updated_at = $2 "
+                "WHERE id = $3",
+                winner_id, now, loser_id,
+            )
 
     async def list_claims_above_importance(self, threshold: float, limit: int = 100) -> list[dict]:
         """Claims eligible for the importance-based verification trigger
@@ -1215,9 +1332,10 @@ class KBDatabase:
     async def review_resolution_candidate(
         self, candidate_id: str, decision: str, reviewed_by: str | None = None,
     ) -> dict:
-        """Changes the candidate's status only. Executing an accepted merge
-        (reassigning evidence to one canonical row, tombstoning the other) is
-        explicitly deferred — not implemented yet."""
+        """Changes the candidate's status only. Callers that need the actual
+        merge executed (reassigning evidence to one canonical row, tombstoning
+        the other) should go through kb.merge.review_and_execute instead,
+        which calls this method and then performs the merge."""
         if decision not in ("accepted", "rejected"):
             raise ValueError(f"decision must be 'accepted' or 'rejected', got {decision!r}")
         now = _now()

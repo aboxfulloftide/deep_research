@@ -765,8 +765,9 @@ claim/evidence schema has stabilized.
    `resolution_candidates`, never auto-merged). `claim_evidence` creation is the first
    real caller of `lock_version_retention` (stubbed in step 2) — verified the flag
    actually flips on real data. CLI: `extract-source`, `list-claims`, `show-claim`,
-   `list-resolution-candidates`, `review-candidate` (review only changes candidate
-   status; merge execution is explicitly deferred, not implemented). Verified against
+   `list-resolution-candidates`, `review-candidate` (review only changed candidate
+   status at the time; merge execution was added later — see the step-7 follow-up
+   below). Verified against
    the real article and YouTube transcript: 44 and 81 observations respectively, exact
    dedup and idempotent re-extraction both confirmed, a metrics table populated with
    56 real values, entity fuzzy-candidate gating correctly avoided spike-style
@@ -944,6 +945,58 @@ claim/evidence schema has stabilized.
    always headroom left for the model to finish its sentence. Re-verified on the same
    topic afterward: report ends cleanly, no truncation, same coherent multi-section
    structure.
+
+   **Follow-up: merge execution for accepted resolution_candidates.** Since step 4,
+   accepting an `entity_duplicate`/`claim_duplicate` candidate only flipped its status
+   flag — evidence, metrics, and topic links stayed split across both rows, so the KB
+   never actually got less duplicated. Implemented real merge execution:
+   - `entities.merged_into_entity_id` / `claims.merged_into_claim_id`: nullable
+     self-referential FK "tombstone" columns (`ALTER TABLE ... ADD COLUMN IF NOT
+     EXISTS`). A merged row is never deleted — evidence/audit trail stays intact —
+     just marked with a pointer to the winner. Claims reuse the existing `deprecated`
+     value from the Claim Status Model rather than adding a new status.
+   - `get_or_create_entity`/`get_or_create_claim` now dereference through
+     `merged_into_*_id` on an exact-match hit, so future extraction runs that
+     rediscover the loser's exact name/text resolve straight to the winner.
+     `list_entities`/`list_claims` exclude merged rows by default (`include_merged=True`
+     to see them).
+   - New reassignment primitives in `db.py` cover every FK that can point at an
+     entity or claim: `reassign_metrics_entity`, `reassign_resolution_candidates_entity`,
+     `reassign_claim_evidence`, `reassign_metrics_claim`, `reassign_observations_claim`,
+     `reassign_claim_topics` (uses a `DELETE ... USING` on the loser's side first
+     to avoid a `UNIQUE(topic_id, claim_id)` conflict when both claims already share
+     a topic, then reassigns what's left), `reassign_resolution_candidates_claim`.
+   - New `deep_research/kb/merge.py`: `merge_entities`/`merge_claims` pick a winner
+     (entities: older `created_at`; claims: higher `importance_score`, ties broken by
+     older `created_at`), follow `merged_into_*_id` chains on both sides first (so
+     merging into a row that itself got merged elsewhere lands on the true final
+     winner, idempotently — re-accepting an already-resolved pair is a safe no-op),
+     run all the reassignments, then tombstone the loser. Claim merges also refresh
+     `preferred_source_id` afterward, since the winner may now have more evidence.
+     `claim_contradiction` candidates go through a separate `apply_confirmed_contradiction`
+     path instead: a human confirming two claims genuinely conflict is not the same
+     claim, so no merge happens — just a `status` update on both sides (`contradicted`,
+     or `mixed` if a side already had independent support), reusing the existing
+     `update_claim_verification` primitive from step 6. `review_and_execute` wraps
+     `review_resolution_candidate` and dispatches on `candidate_type`.
+   - `cli/kb.py`'s `review-candidate` now calls `review_and_execute` and prints the
+     real outcome (which row merged into which, or that a contradiction was recorded)
+     instead of the old "not implemented yet" note. No equivalent web route exists for
+     resolution-candidate review at all (only topic-suggestion review has a web route),
+     so this stays CLI-only for now.
+   - Verified end-to-end against the live KB, not synthetic data: accepted a real
+     `claim_duplicate` candidate (two paraphrased claims about US equity market cap
+     vs. GDP, both linked to the same topic and sourced from the same evidence source)
+     — correctly picked the higher-importance claim as winner despite it being newer,
+     reassigned both evidence rows, avoided a duplicate topic-link row, and excluded
+     the loser from default listings. Accepted a real `entity_duplicate` candidate
+     ("data center" / "data centers") — correctly picked the older entity as winner,
+     confirmed `get_or_create_entity` now resolves the loser's name to the winner.
+     Re-accepted the same entity candidate a second time — correctly hit the
+     `no_op_already_merged` path, no double-merge. Rejected a candidate — confirmed
+     neither claim was touched. No real `claim_contradiction` candidates existed yet
+     in this KB, so created one synthetically and confirmed both claims' status
+     updated with no merge/tombstone, then cleaned it up.
 
 8. Add **embeddings / vector retrieval only after** the source/claim/evidence model is
    solid.
