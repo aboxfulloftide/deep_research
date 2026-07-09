@@ -22,11 +22,12 @@ export function useApi() {
     return resp.json()
   }
 
-  function streamResearch(query, model, sessionId, callbacks) {
+  function streamResearch(query, model, sessionId, callbacks, prioritizeKb = false) {
     const body = JSON.stringify({
       query,
       model: model || null,
       session_id: sessionId || null,
+      prioritize_kb: !!prioritizeKb,
     })
 
     const controller = new AbortController()

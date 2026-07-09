@@ -55,6 +55,7 @@ class QueryRequest(BaseModel):
     query: str
     model: str | None = None
     session_id: str | None = None
+    prioritize_kb: bool = False
 
 
 class SessionResponse(BaseModel):
@@ -124,12 +125,12 @@ async def research(req: QueryRequest):
     cfg.llm.model = model
 
     return EventSourceResponse(
-        _stream_research(cfg, req.query, req.session_id),
+        _stream_research(cfg, req.query, req.session_id, req.prioritize_kb),
         media_type="text/event-stream",
     )
 
 
-async def _stream_research(cfg, query: str, session_id: str | None):
+async def _stream_research(cfg, query: str, session_id: str | None, prioritize_kb: bool = False):
     """Generator that yields SSE events during research."""
     llm = LLMClient(cfg)
 
@@ -193,11 +194,11 @@ async def _stream_research(cfg, query: str, session_id: str | None):
         if gathered_data or not llm.supports_tools:
             # Text mode — direct answer
             yield {"event": "status", "data": json.dumps({"step": "generating", "detail": "Composing answer..."})}
-            answer = await _text_mode_answer(llm, query, gathered_data, cfg)
+            answer = await _text_mode_answer(llm, query, gathered_data, cfg, prioritize_kb)
         else:
             # Tool loop
             answer = ""
-            async for event in _tool_loop(llm, query, session_id, cfg):
+            async for event in _tool_loop(llm, query, session_id, cfg, prioritize_kb):
                 if event.get("event") == "answer":
                     answer = event["data"]
                 else:
@@ -213,9 +214,17 @@ async def _stream_research(cfg, query: str, session_id: str | None):
         await llm.close()
 
 
-async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg) -> str:
-    """Generate answer in text mode."""
+async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg, prioritize_kb: bool = False) -> str:
+    """Generate answer in text mode. This is the common fallback for models
+    without tool-calling support, so prioritize_kb has to affect it too, not
+    just the tool loop, to actually change behavior for most local models."""
     from deep_research.prompts import SYSTEM_PROMPT_NO_TOOLS
+    from deep_research.tools.kb_search import kb_search
+
+    if not gathered_data and prioritize_kb and kb_routes.kb_db:
+        kb_result = await kb_search(query[:200], kb_routes.kb_db)
+        if kb_result and not kb_result.startswith("No results found"):
+            gathered_data = kb_result
 
     if not gathered_data:
         try:
@@ -256,21 +265,32 @@ async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg)
     return resp["choices"][0]["message"].get("content", "No answer produced.")
 
 
-async def _tool_loop(llm: LLMClient, query: str, session_id: str, cfg):
+async def _tool_loop(llm: LLMClient, query: str, session_id: str, cfg, prioritize_kb: bool = False):
     """Run the agent tool loop, yielding SSE events."""
-    from deep_research.prompts import SYSTEM_PROMPT, TOOL_DEFINITIONS
+    from deep_research.prompts import (
+        KB_SEARCH_TOOL_DEFINITION,
+        SYSTEM_PROMPT_KB_FIRST,
+        SYSTEM_PROMPT_WEB_FIRST,
+        TOOL_DEFINITIONS,
+    )
+    from deep_research.tools.kb_search import kb_search
     from deep_research.tools.scrape import scrape_and_extract, scrape_page
     from deep_research.tools.search import web_search
 
+    # kb_search is only offered as a tool when a KBDatabase is actually up —
+    # see kb_routes.init_kb's best-effort connection.
+    tools = TOOL_DEFINITIONS + ([KB_SEARCH_TOOL_DEFINITION] if kb_routes.kb_db else [])
+    system_prompt = SYSTEM_PROMPT_KB_FIRST if (prioritize_kb and kb_routes.kb_db) else SYSTEM_PROMPT_WEB_FIRST
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": query},
     ]
 
     for step in range(cfg.agent.max_steps):
         yield {"event": "status", "data": json.dumps({"step": "thinking", "detail": f"Step {step + 1}"})}
 
-        resp = await llm.chat(messages, tools=TOOL_DEFINITIONS)
+        resp = await llm.chat(messages, tools=tools)
         msg = resp["choices"][0]["message"]
 
         tool_calls = msg.get("tool_calls")
@@ -302,6 +322,11 @@ async def _tool_loop(llm: LLMClient, query: str, session_id: str, cfg):
                         result = "\n".join(f"**{r.title}**\n{r.url}\n{r.snippet}\n" for r in results)
                     else:
                         result = "No results found."
+                elif tool_name == "kb_search":
+                    if kb_routes.kb_db:
+                        result = await kb_search(tool_args["query"], kb_routes.kb_db)
+                    else:
+                        result = "Local knowledge base is not available."
                 elif tool_name == "scrape_webpage":
                     page = await scrape_page(tool_args["url"], cfg)
                     if page.structured_data and page.structured_data.get("products"):

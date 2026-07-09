@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, nextTick, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Send, Loader, Globe, FileSearch, Bot, ChevronDown } from 'lucide-vue-next'
+import { Send, Loader, Globe, FileSearch, Bot, ChevronDown, Database } from 'lucide-vue-next'
 import { marked } from 'marked'
 import { useApi } from '../composables/useApi.js'
 
@@ -18,7 +18,15 @@ const status = ref(null)
 const isResearching = ref(false)
 const sessionId = ref(null)
 const messagesContainer = ref(null)
+// Decision 23 (hybrid retrieval): let the user choose whether the agent
+// checks the local knowledge base first or starts with a live web search.
+// Persisted the same way dark mode is, since it's a standing preference.
+const prioritizeKb = ref(localStorage.getItem('prioritizeKb') === 'true')
 let abortController = null
+
+watch(prioritizeKb, (val) => {
+  localStorage.setItem('prioritizeKb', val)
+})
 
 onMounted(async () => {
   // Load models
@@ -94,7 +102,7 @@ async function submitQuery() {
       status.value = null
       isResearching.value = false
     },
-  })
+  }, prioritizeKb.value)
 }
 
 function stopResearch() {
@@ -216,6 +224,17 @@ const statusText = computed(() => {
             </button>
           </div>
         </div>
+
+        <label
+          class="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer select-none"
+          :title="prioritizeKb
+            ? 'Check the local knowledge base first, fall back to web search only if it\'s thin'
+            : 'Start with a live web search (default)'"
+        >
+          <input type="checkbox" v-model="prioritizeKb" class="accent-blue-600" />
+          <Database class="w-3.5 h-3.5" :stroke-width="1.5" />
+          {{ prioritizeKb ? 'Prioritize local knowledge base' : 'Start with web search' }}
+        </label>
       </div>
 
       <!-- Query input -->

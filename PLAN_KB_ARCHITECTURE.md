@@ -159,6 +159,34 @@ From the planning discussion:
 - after model/schema/prompt improvements, mark affected sources outdated; re-extract
   on demand or via optional batch re-extraction for selected topics/sources
 
+  **Implemented (post-step-7 follow-up):** the original chat research agent
+  (`deep_research/agent.py`, predates the KB by several build-order steps) had never
+  actually been connected to it — every query did a fresh web search/scrape regardless
+  of what was already known locally. Added a `kb_search` tool (thin wrapper over the
+  step-3 FTS5 `search_chunks`) plus a user-facing toggle — "prioritize local knowledge
+  base" vs. "start with web search" — a checkbox in the web UI (persisted like dark
+  mode), `--prioritize-kb` on the CLI. Two system prompt variants
+  (`SYSTEM_PROMPT_KB_FIRST`/`SYSTEM_PROMPT_WEB_FIRST`) share one critical-rules block
+  and only differ in tool-priority instructions; `kb_search` is only ever offered as a
+  tool when a `KBDatabase` connection actually succeeded (both `cli/main.py` and
+  `web/kb_routes.py`'s KB init are now best-effort — the base research agent must keep
+  working standalone if Postgres isn't running, since it predates the KB entirely and
+  many users may never touch it). The toggle had to reach the **text-mode** path too
+  (`_run_text_mode`/`_text_mode_answer`), not just the tool-calling loop — text mode is
+  the common fallback for models without tool support, so a KB-first option that only
+  worked for tool-calling models would miss most real usage.
+
+  Verified end-to-end, including the GPU-contention lesson learned along the way:
+  Ollama and llama.cpp fighting over the same 16GB card for two separate 14B model
+  loads makes the Ollama-backed agent path unusably slow — tests were pointed at the
+  already-loaded llama.cpp instance instead. With the toggle on, the agent called
+  `kb_search` first (confirmed via CLI step log and browser network/status stream),
+  answered directly from KB chunks when sufficient, and fell back to `web_search` +
+  `scrape_webpage` when it wasn't (correctly re-finding the same Fortune article from
+  step 6's verification). With the toggle off, `kb_search` was never called — default
+  behavior unchanged. Browser-driven: checkbox renders, persists across reload, and a
+  live query completed with zero console errors.
+
 24. Operations and review workflow (from Batch 5):
 - jobs are hybrid: manual by default, background allowed for explicit monitoring or
   larger queued work

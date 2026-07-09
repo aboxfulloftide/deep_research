@@ -6,8 +6,16 @@ from rich.console import Console
 
 from deep_research.config import Config
 from deep_research.db import Database
+from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
-from deep_research.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_NO_TOOLS, TOOL_DEFINITIONS
+from deep_research.prompts import (
+    KB_SEARCH_TOOL_DEFINITION,
+    SYSTEM_PROMPT_KB_FIRST,
+    SYSTEM_PROMPT_NO_TOOLS,
+    SYSTEM_PROMPT_WEB_FIRST,
+    TOOL_DEFINITIONS,
+)
+from deep_research.tools.kb_search import kb_search
 from deep_research.tools.scrape import scrape_and_extract, scrape_page
 from deep_research.tools.search import web_search
 
@@ -106,13 +114,24 @@ def _compact_product_list(products: list[dict]) -> str:
 
 
 class ResearchAgent:
-    def __init__(self, config: Config, db: Database, llm: LLMClient):
+    def __init__(self, config: Config, db: Database, llm: LLMClient, kb_db: KBDatabase | None = None):
         self.config = config
         self.db = db
         self.llm = llm
+        self.kb_db = kb_db
+        # kb_search is only offered as a tool when a KBDatabase is actually
+        # configured — offering a tool that would just error on every call is
+        # worse than not offering it.
+        self.tools = TOOL_DEFINITIONS + ([KB_SEARCH_TOOL_DEFINITION] if kb_db else [])
 
-    async def run(self, query: str, session_id: str | None = None) -> str:
-        """Run the agent loop for a query. Returns the final answer."""
+    async def run(self, query: str, session_id: str | None = None, prioritize_kb: bool = False) -> str:
+        """Run the agent loop for a query. Returns the final answer.
+
+        prioritize_kb (decision 23, hybrid retrieval): check the local
+        knowledge base before the web, falling back to web search/scraping
+        only if local coverage is thin. Has no effect if this agent wasn't
+        given a kb_db.
+        """
         # Create or resume session
         if session_id:
             existing = await self.db.get_session(session_id)
@@ -145,17 +164,17 @@ class ResearchAgent:
 
         if self.llm.supports_tools and not gathered_data:
             # Only use tool loop if we didn't pre-gather (e.g., no URL in query)
-            return await self._run_tool_loop(query, session_id, gathered_data)
+            return await self._run_tool_loop(query, session_id, gathered_data, prioritize_kb)
         else:
             # Pre-gathered data or no tool support → text mode
-            return await self._run_text_mode(query, session_id, gathered_data)
+            return await self._run_text_mode(query, session_id, gathered_data, prioritize_kb)
 
     async def _probe_tool_support(self):
         """Quick probe to check if the model supports tool calling."""
         try:
             await self.llm.chat(
                 [{"role": "user", "content": "hi"}],
-                tools=[TOOL_DEFINITIONS[0]],
+                tools=[self.tools[0]],
             )
         except Exception:
             pass
@@ -183,9 +202,21 @@ class ResearchAgent:
         return "\n\n".join(parts), all_products
 
     async def _run_text_mode(
-        self, query: str, session_id: str, gathered_data: str
+        self, query: str, session_id: str, gathered_data: str, prioritize_kb: bool = False,
     ) -> str:
-        """Pass gathered data to the LLM with a focused prompt."""
+        """Pass gathered data to the LLM with a focused prompt.
+
+        This is the fallback path for models without tool-calling support (or
+        when a URL was already pre-scraped) — likely the *common* path for
+        smaller local models, so prioritize_kb needs to affect it too, not
+        just the tool loop, to actually change behavior for most users.
+        """
+        if not gathered_data and prioritize_kb and self.kb_db:
+            console.print("[dim]Checking local knowledge base first...[/dim]")
+            kb_result = await kb_search(query[:200], self.kb_db)
+            if kb_result and not kb_result.startswith("No results found"):
+                gathered_data = kb_result
+
         if not gathered_data:
             console.print("[dim]No URL found, searching...[/dim]")
             search_query = query[:200]
@@ -231,10 +262,11 @@ class ResearchAgent:
         return answer
 
     async def _run_tool_loop(
-        self, query: str, session_id: str, gathered_data: str
+        self, query: str, session_id: str, gathered_data: str, prioritize_kb: bool = False,
     ) -> str:
         """For models with tool calling — run the standard agent loop."""
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        system_prompt = SYSTEM_PROMPT_KB_FIRST if (prioritize_kb and self.kb_db) else SYSTEM_PROMPT_WEB_FIRST
+        messages = [{"role": "system", "content": system_prompt}]
 
         # Load any prior messages for session resumption
         prior = await self.db.get_session_messages(session_id)
@@ -248,7 +280,7 @@ class ResearchAgent:
         for step in range(self.config.agent.max_steps):
             console.print(f"\n[dim]Step {step + 1}...[/dim]")
 
-            resp = await self.llm.chat(messages, tools=TOOL_DEFINITIONS)
+            resp = await self.llm.chat(messages, tools=self.tools)
             choice = resp["choices"][0]
             msg = choice["message"]
 
@@ -320,6 +352,11 @@ class ResearchAgent:
                 for r in results:
                     lines.append(f"**{r.title}**\n{r.url}\n{r.snippet}\n")
                 return "\n".join(lines)
+
+            elif name == "kb_search":
+                if self.kb_db is None:
+                    return "Local knowledge base is not available."
+                return await kb_search(args["query"], self.kb_db)
 
             elif name == "scrape_webpage":
                 url = args["url"]

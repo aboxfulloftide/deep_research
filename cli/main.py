@@ -10,6 +10,7 @@ from rich.table import Table
 from deep_research.agent import ResearchAgent
 from deep_research.config import load_config
 from deep_research.db import Database
+from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
 
 console = Console()
@@ -79,20 +80,36 @@ async def setup_config(args):
     return config
 
 
+async def _init_kb_db(config) -> KBDatabase | None:
+    """Best-effort local KB connection. The research agent predates the KB
+    and must still work standalone if Postgres isn't running/configured —
+    a missing KB just means kb_search/--prioritize-kb have no effect."""
+    try:
+        kb_db = KBDatabase(config.kb.postgres_dsn)
+        await kb_db.init()
+        return kb_db
+    except Exception as e:
+        console.print(f"[dim]Local knowledge base unavailable ({e}); continuing without it.[/dim]")
+        return None
+
+
 async def run_query(args):
     config = await setup_config(args)
     db = Database(config.db_path)
     await db.init()
+    kb_db = await _init_kb_db(config)
     llm = LLMClient(config)
 
-    agent = ResearchAgent(config, db, llm)
+    agent = ResearchAgent(config, db, llm, kb_db=kb_db)
 
     try:
-        answer = await agent.run(args.query, session_id=args.session)
+        answer = await agent.run(args.query, session_id=args.session, prioritize_kb=args.prioritize_kb)
         console.print()
         console.print(Markdown(answer))
     finally:
         await llm.close()
+        if kb_db:
+            await kb_db.close()
 
 
 async def list_sessions(args):
@@ -124,9 +141,10 @@ async def interactive_session(args):
     config = await setup_config(args)
     db = Database(config.db_path)
     await db.init()
+    kb_db = await _init_kb_db(config)
     llm = LLMClient(config)
 
-    agent = ResearchAgent(config, db, llm)
+    agent = ResearchAgent(config, db, llm, kb_db=kb_db)
     session_id = args.session
 
     try:
@@ -134,7 +152,7 @@ async def interactive_session(args):
 
         # If a query was provided, run it first
         if args.query:
-            answer = await agent.run(args.query, session_id=session_id)
+            answer = await agent.run(args.query, session_id=session_id, prioritize_kb=args.prioritize_kb)
             console.print()
             console.print(Markdown(answer))
             # Use the session from the first run for follow-ups
@@ -157,7 +175,7 @@ async def interactive_session(args):
             if query.lower() in ("exit", "quit", "q"):
                 break
 
-            answer = await agent.run(query, session_id=session_id)
+            answer = await agent.run(query, session_id=session_id, prioritize_kb=args.prioritize_kb)
             console.print()
             console.print(Markdown(answer))
 
@@ -167,6 +185,8 @@ async def interactive_session(args):
                     session_id = sessions[0]["id"]
     finally:
         await llm.close()
+        if kb_db:
+            await kb_db.close()
 
 
 def main():
@@ -186,6 +206,10 @@ def main():
         help="Interactive mode — keep asking questions",
     )
     parser.add_argument("--config", "-c", help="Path to config.yaml")
+    parser.add_argument(
+        "--prioritize-kb", action="store_true",
+        help="Check the local knowledge base first, falling back to web search only if it's thin (decision 23, hybrid retrieval)",
+    )
 
     args = parser.parse_args()
 

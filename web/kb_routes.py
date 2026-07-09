@@ -23,10 +23,18 @@ kb_db: KBDatabase | None = None
 
 
 async def init_kb(cfg: Config):
+    """Best-effort — the app must still start if Postgres isn't running/
+    configured. A missing KB means /api/kb/* routes fail per-request instead
+    of the whole app failing to boot, and the research agent's kb_search
+    tool/prioritize_kb toggle are simply unavailable rather than fatal."""
     global config, kb_db
     config = cfg
-    kb_db = KBDatabase(cfg.kb.postgres_dsn)
-    await kb_db.init()
+    try:
+        kb_db = KBDatabase(cfg.kb.postgres_dsn)
+        await kb_db.init()
+    except Exception as e:
+        print(f"Local knowledge base unavailable ({e}); /api/kb/* routes and kb_search will not work.")
+        kb_db = None
 
 
 async def close_kb():
