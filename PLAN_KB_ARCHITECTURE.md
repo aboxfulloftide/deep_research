@@ -198,6 +198,47 @@ From the planning discussion:
 - v1 review UI: source list/detail, topic timelines, claim list with
   status/confidence, contradiction/conflict view, job/run status view
 
+27. Topic scope (from build-order step 7 pre-work):
+- topic attachment is hybrid: explicit attachment (topic_source_links,
+  claim_topics) is the core mechanism; the system also suggests likely-relevant
+  unattached claims/sources for the user to accept, using the same
+  suggest-then-review pattern as `resolution_candidates` rather than a fully
+  automatic dynamic query
+- topic suggestion is retroactive AND forward: creating a topic backfills
+  suggestions against all existing claims/entities once, and every subsequent
+  extraction is also checked against existing topics going forward. This is
+  the same class of gap already found and fixed once in claim-duplicate
+  candidate generation (step 4/6, which only checks new-vs-all-existing, never
+  old-vs-new) — deciding it deliberately here instead of repeating it
+- timeline entries are strict: only claims with an `event_id` and a start
+  date qualify, parsed best-effort at query time (e.g. a "2008–2013" range
+  takes the start). No loose inclusion of claims with a date-like phrase in
+  their text but no formal event — that risks pulling in claims that aren't
+  actually timeline-worthy. This requires extending the extraction prompt to
+  have the model self-report `date_precision` (exact/day/month/year/
+  approximate) rather than us inferring precision from free-text formatting
+  after the fact — that column already exists in the schema but nothing
+  populates it yet
+- `preferred_source_id` on conflicting claims is set automatically from the
+  highest `trust_tiers.rank_weight` among the claim's evidence sources, with a
+  manual override path (mirroring the existing `reviewed_by`/`reviewed_at`
+  pattern on claims) — consistent with every other automation-plus-review
+  pair already built (exact-match auto-merge + resolution_candidates,
+  embedding candidates + review, LLM-judged contradictions + recorded conflict)
+- reports keep a persisted row per generation (cheap, incidental audit trail),
+  but the product-facing behavior only ever shows the latest one for a topic —
+  decision 8 ("prefer latest data rather than reproducible snapshot reports")
+  already settled this; there is no report-history browsing feature in v1
+- both the CLI and the existing web UI (FastAPI + Vue) get the timeline/report
+  output in this step, not CLI-first-then-web-later like steps 2-6 — a
+  timeline is the first output in this project genuinely more useful rendered
+  visually than as a terminal table, and decision 26 already calls the web UI
+  the primary interface
+- topic membership is many-to-many (`claim_topics`, `topic_source_links`),
+  not one-topic-per-claim — decision 19 already implies claims/sources should
+  be reusable across topics created later, which is exactly what these join
+  tables (rather than a foreign key on `claims`/`sources`) are for
+
 ## Recommended Direction
 
 Build this as a small local data platform with an agent on top, not just as an agent that saves outputs.
@@ -758,11 +799,123 @@ claim/evidence schema has stabilized.
    short-lived process that exits immediately after, but worth cleaning up if this
    code is ever driven from a long-running process instead of one-shot CLI calls).
 
-6. Add the **verification workflow**, gated by a per-claim verification budget tied to
-   `importance_score` (see "Verification Policy and Budget") so search cost cannot
-   explode.
+6. **Done.** Add the **verification workflow**, gated by a per-claim verification budget
+   tied to `importance_score` (see "Verification Policy and Budget") so search cost
+   cannot explode. Implemented in `deep_research/kb/verification.py`: search the KB's
+   own data first via a live embedding-similarity pass against claims independent of the
+   target claim's own source(s) (not the possibly-stale `resolution_candidates` rows
+   from promotion time, since those never get retroactively recomputed for claims
+   created later); fall back to a real web search (reusing the existing SearXNG tool)
+   plus the full ingest → chunk → extract → promote pipeline only if internal coverage
+   is thin and budget remains. The budget counts distinct *sources* examined (not
+   candidate claims — several matching claims from one source count once), capped at
+   `verification_max_sources_examined` (3) and `verification_max_web_searches` (2).
 
-7. Add **topic reports and event comparison** (timeline first).
+   One new piece of infrastructure this needed: embedding similarity alone can't tell
+   "same fact, reworded" apart from "same topic, conflicting numbers." Added an LLM
+   comparison pass (supports/contradicts/unrelated) and validated it directly against 5
+   known pairs before building the pipeline around it — including a same-fact-different-
+   units case requiring real arithmetic (`$23,000/sec` vs `$83M/hour`) and a synthetic
+   contradiction — 5/5 correct. Contradictions are recorded via
+   `resolution_candidates(candidate_type='claim_contradiction')`, reusing the same v1
+   review queue as entity/claim duplicates rather than requiring the deferred
+   `claim_links` table — the original schema draft already anticipated this
+   `candidate_type` value. Added `claims.verification_notes` (jsonb) for a lightweight
+   audit trail (support/contradict counts, sources examined, searches used) alongside
+   `verification_attempted_at`.
+
+   Verified end-to-end on real claims: `verify-claim` on a claim with a known
+   transcript-side match found that internal support, then genuinely fell back to a
+   live web search, ingested a real, previously-unseen Fortune article, and found
+   independent corroboration there too — correctly reaching `supported`. A vague,
+   generic claim correctly exhausted its budget (1 support, 3 sources, 1 search) and
+   stayed `unverified` rather than guessing. `verify-source` (batch, importance-gated)
+   correctly rejected a known same-article "duplicate" as non-independent before
+   falling to web search, on both eligible claims. `--force` re-verification and the
+   default skip-if-already-attempted behavior both confirmed.
+
+   New CLI: `verify-claim <id> [--force]`, `verify-source <id> [--threshold] [--force]`.
+
+7. **Done.** Add **topic reports and event comparison** (timeline first). Implemented
+   per decision 27's scope resolution:
+   - Schema: `topics`, `topic_source_links`, `claim_topics` (many-to-many, decision 19),
+     `reports`. `link_status` on the two link tables carries both explicit attachment
+     and the suggest-then-review workflow in one column ('attached'/'suggested'/
+     'rejected') rather than a parallel suggestions table.
+   - `deep_research/kb/topics.py`: entity-overlap suggestion generation, both backfill
+     (`generate_topic_suggestions`, run at topic creation) and forward-check
+     (`check_claims_against_topics`, run after every `resolve_and_promote` via
+     `extract-source` — verified this actually re-surfaces a claim when simulated as
+     newly-created, closing the same "only new-vs-existing, never old-vs-new" gap
+     already found once in step 4/6's embedding candidates).
+   - `deep_research/kb/timeline.py`: strict timeline (event + parseable date only),
+     best-effort date parsing tested against every real messy format in the KB
+     ("2008–2013", "1999 and a part of 2000", month/year, year-only, full ISO).
+     Extraction prompt extended with `date_precision` (bumped to
+     `v3-with-date-precision`) so the model self-reports certainty instead of us
+     inferring it.
+   - Preferred-source: `recompute_preferred_source` runs automatically inside
+     `add_claim_evidence`, picks the highest `trust_tiers.rank_weight`, never
+     overwrites a manually-reviewed claim (`set_preferred_source_manual`).
+   - `deep_research/kb/reports.py`: LLM-synthesized markdown report, new `reports` row
+     per generation (decision 27) but only the latest is ever surfaced. Found and fixed
+     a real bug during first test: the input (130 claims) exceeded the local llama.cpp
+     server's configured 4096-token context, so report input is now built against a
+     configurable character budget (`kb.report_max_input_chars`), timeline content
+     first, undated claims by importance after — not a fixed claim count, since the
+     server's actual context window isn't something this app controls.
+   - CLI: `create-topic`, `list-topics`, `show-topic`, `attach-source`, `attach-claim`,
+     `backfill-topic-suggestions`, `review-topic-suggestion`, `generate-report`,
+     `set-preferred-source`.
+   - Web: `web/kb_routes.py` (new FastAPI router, separate from the chat-session API)
+     plus `TopicsView.vue`/`TopicDetailView.vue`, wired into the existing router/nav —
+     both CLI and web UI landed in this step per decision 27, not CLI-first.
+   - Verified end-to-end on the real AI-bubble topic: 130 claims auto-attached from two
+     seed sources, 22-24 chronologically-correct timeline entries (including an 1850
+     railway-bubble claim), 34 claims / 5 sources correctly suggested via entity
+     overlap (including sources discovered during step 6's verification web-fallback),
+     a coherent cited report, and the `SUPPORTED` status badge from step 6 correctly
+     flowing through to the timeline UI. Browser-driven with Playwright (no project
+     skill existed for this yet — recommend `/run-skill-generator` next time): topics
+     list, timeline, suggestions, and report all render correctly with zero console
+     errors, and a live accept/reject click was confirmed to actually persist (35 to 34
+     pending). One pre-existing gap noticed, not fixed (out of scope for this step):
+     the SPA has no server-side fallback route, so direct navigation/refresh on any
+     client-side route (`/history`, `/topics`, ...) 404s — only navigation via in-app
+     links works. Confirmed this predates step 7 (`/history` has the same issue).
+
+   **Follow-up: report generation is now map-reduce, not truncation.** The first
+   version bounded report input to a static guessed character budget and silently
+   dropped whatever didn't fit — correctness that degrades as topics grow, and the
+   budget was never the server's real limit anyway. Replaced with:
+   - `detect_context_size` (in `extraction.py`) queries llama.cpp's native `/slots`
+     endpoint (server root, not `/v1`) for the actual configured per-slot context,
+     instead of guessing. Falls back to `kb.report_context_fallback_tokens` only if
+     that endpoint is unavailable.
+   - If a topic's content doesn't fit in one pass, it's batched and each batch is
+     summarized (map, explicitly instructed to preserve every date/number/citation/
+     status flag), then the summaries are recursively re-batched and re-summarized
+     (reduce) until they fit one final synthesis call. Nothing is ever dropped — an
+     arbitrarily large topic just costs more LLM calls.
+   - If map-reduce had to run, the result carries a human-readable suggestion (detected
+     context size + a concrete `llama-server` flag recommendation), surfaced via CLI and
+     web UI. The pipeline never restarts the inference server itself — that stays the
+     user's call, since this app doesn't know the server's full original launch flags,
+     the server may be shared with other work, and more context means more VRAM for
+     the KV cache on a card that's already partly committed to the loaded model.
+
+   Found and fixed a second real bug while verifying this on the actual 130-claim
+   topic: even after map-reduce correctly shrank the *input*, the final synthesis
+   call's own *response* got cut off mid-sentence, because the token reserve used to
+   size the input budget (1200 tokens) assumed the same short output as a batch
+   summary — but the final call writes a full multi-section report, which runs much
+   longer. Fixed by splitting the reserve in two: `BATCH_RESPONSE_TOKEN_RESERVE` (700,
+   for the map/reduce steps' compact bullet-point output) and
+   `FINAL_RESPONSE_TOKEN_RESERVE` (2200, for the final report). The reduce loop now
+   converges toward the stricter final budget, not the looser batch budget, so there's
+   always headroom left for the model to finish its sentence. Re-verified on the same
+   topic afterward: report ends cleanly, no truncation, same coherent multi-section
+   structure.
 
 8. Add **embeddings / vector retrieval only after** the source/claim/evidence model is
    solid.

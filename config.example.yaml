@@ -32,3 +32,11 @@ kb:
   embedding_base_url: "http://localhost:11434"  # Ollama
   embedding_model: "nomic-embed-text:v1.5"
   claim_duplicate_threshold: 0.85
+  # Verification budget (build order step 6) — bounds cost per claim.
+  verification_max_web_searches: 2
+  verification_max_sources_examined: 3
+  verification_importance_threshold: 0.8
+  # Report generation auto-detects the server's real context window via
+  # llama.cpp's /slots endpoint and batches (map-reduce) whatever doesn't fit
+  # in one pass. This fallback only applies if that detection fails.
+  report_context_fallback_tokens: 4096

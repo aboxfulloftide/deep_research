@@ -27,7 +27,7 @@ from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
 
 PROMPT_NAME = "claim_extraction"
-PROMPT_VERSION = "v2-with-metrics"
+PROMPT_VERSION = "v3-with-date-precision"
 EXTRACTION_SCHEMA_VERSION = "v1"
 
 EXTRACTION_SYSTEM_PROMPT = """/no_think
@@ -37,7 +37,7 @@ For each claim, output an object with these exact fields:
 - claim_text: a single atomic factual statement, in your own words, not a blob of multiple facts
 - claim_type: one of "fact", "event_fact", "economic", "historical", "product_spec", "quote"
 - entities: array of {"name": str, "type": one of "person","organization","product","location","concept"} mentioned in the claim
-- event: {"title": str, "date": str or null} if the claim describes a dated/time-bound happening, otherwise null
+- event: {"title": str, "date": str or null, "date_precision": one of "exact","month","year","approximate", or null} if the claim describes a dated/time-bound happening, otherwise null. date_precision must honestly reflect how precisely the text specifies the date — "exact" only if a full date is given, "year" if only a year is stated, "approximate" for vague phrasing like "in the early 2000s". Do not fabricate a more precise date than the text actually supports.
 - metrics: array of {"name": str, "value": number or string, "unit": str or null, "currency": str or null} for any specific structured numeric/economic/spec value the claim states (a dollar amount, a percentage, a count, a spec number); empty array if the claim has no such value
 - supporting_quote: a short VERBATIM excerpt (max ~30 words) copied EXACTLY from the chunk text that supports this claim. Do not paraphrase this field.
 - confidence: your confidence 0.0-1.0 that this claim is accurately extracted from the text
@@ -71,6 +71,28 @@ async def detect_model(base_url: str) -> str:
     if not models:
         raise RuntimeError(f"No models reported by server at {base_url}")
     return models[0]["id"]
+
+
+async def detect_context_size(base_url: str) -> int | None:
+    """Queries llama.cpp's native /slots endpoint for the real per-slot
+    context window, so callers can size prompts against reality instead of a
+    static guess (this is what report generation hit a hard 400 on before —
+    the server's configured n_ctx, not the model's trained maximum). /slots
+    lives at the server root, not under /v1 like the OpenAI-compatible
+    endpoints, so strip a trailing /v1 if present. Returns None if the
+    endpoint isn't available (disabled, or a non-llama.cpp backend) so
+    callers can fall back to a conservative default."""
+    root_url = base_url[:-len("/v1")] if base_url.endswith("/v1") else base_url
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{root_url}/slots")
+            resp.raise_for_status()
+            slots = resp.json()
+    except Exception:
+        return None
+    if not slots or "n_ctx" not in slots[0]:
+        return None
+    return slots[0]["n_ctx"]
 
 
 def _parse_json_array(content: str) -> list[dict]:

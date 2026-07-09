@@ -104,5 +104,80 @@ export function useApi() {
     return controller
   }
 
-  return { fetchModels, fetchSessions, fetchSession, deleteSession, streamResearch }
+  // --- Knowledge base (topics/timeline/reports) ---
+
+  async function fetchTopics() {
+    const resp = await fetch(`${API_BASE}/kb/topics`)
+    return resp.json()
+  }
+
+  async function createTopic(name, description) {
+    const resp = await fetch(`${API_BASE}/kb/topics`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, description: description || null }),
+    })
+    return resp.json()
+  }
+
+  async function fetchTopic(id) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}`)
+    if (!resp.ok) throw new Error('Topic not found')
+    return resp.json()
+  }
+
+  async function fetchTimeline(id) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/timeline`)
+    return resp.json()
+  }
+
+  async function fetchTopicClaims(id, status = 'attached') {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/claims?status=${status}`)
+    return resp.json()
+  }
+
+  async function fetchTopicSources(id, status = 'attached') {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/sources?status=${status}`)
+    return resp.json()
+  }
+
+  async function reviewClaimSuggestion(topicId, claimId, decision) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${topicId}/claims/${claimId}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    })
+    return resp.json()
+  }
+
+  async function reviewSourceSuggestion(topicId, sourceId, decision) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${topicId}/sources/${sourceId}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    })
+    return resp.json()
+  }
+
+  async function backfillTopic(id) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/backfill`, { method: 'POST' })
+    return resp.json()
+  }
+
+  async function fetchReport(id) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/report`)
+    return resp.json()
+  }
+
+  async function generateReport(id) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/report`, { method: 'POST' })
+    return resp.json()
+  }
+
+  return {
+    fetchModels, fetchSessions, fetchSession, deleteSession, streamResearch,
+    fetchTopics, createTopic, fetchTopic, fetchTimeline, fetchTopicClaims,
+    fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,
+    backfillTopic, fetchReport, generateReport,
+  }
 }

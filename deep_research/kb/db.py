@@ -1,5 +1,6 @@
-"""Source registry, versioned ingestion, chunk storage/retrieval, and
-extraction/resolution storage (PLAN_KB_ARCHITECTURE.md, build order steps 2-5).
+"""Source registry, versioned ingestion, chunk storage/retrieval,
+extraction/resolution storage, verification, and topics/reports
+(PLAN_KB_ARCHITECTURE.md, build order steps 2-7).
 
 Deliberately a separate PostgreSQL database from chat sessions/messages
 (deep_research/db.py, still SQLite) per the plan's design goal of keeping chat
@@ -17,6 +18,7 @@ data. Notable upgrades that came for free with the migration:
 """
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -214,6 +216,7 @@ CREATE TABLE IF NOT EXISTS claims (
     confidence DOUBLE PRECISION,
     importance_score DOUBLE PRECISION,
     verification_attempted_at TIMESTAMPTZ,
+    verification_notes JSONB,
     is_user_reviewed BOOLEAN NOT NULL DEFAULT FALSE,
     reviewed_at TIMESTAMPTZ,
     reviewed_by TEXT,
@@ -221,6 +224,8 @@ CREATE TABLE IF NOT EXISTS claims (
     updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(claim_type, normalized_text)
 );
+
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_notes JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
 CREATE INDEX IF NOT EXISTS idx_claims_event ON claims(event_id);
@@ -340,6 +345,68 @@ CREATE TABLE IF NOT EXISTS metrics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_metrics_claim ON metrics(claim_id);
+
+-- Topics (build order step 7, decision 27). Topic-independent ingestion
+-- (decision 19) means sources/claims can exist long before a topic does —
+-- topics are attached after the fact, not required at ingest time.
+CREATE TABLE IF NOT EXISTS topics (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+-- link_status carries both the explicit-attachment mechanism AND the
+-- suggest-then-review workflow decision 27 calls for, in the same table
+-- rather than a parallel one: 'attached' rows are confirmed membership,
+-- 'suggested' rows are pending review, 'rejected' rows are a suggestion a
+-- human declined (kept, not deleted, so it is never re-suggested).
+CREATE TABLE IF NOT EXISTS topic_source_links (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL REFERENCES topics(id),
+    source_id TEXT NOT NULL REFERENCES sources(id),
+    link_status TEXT NOT NULL DEFAULT 'attached',
+    link_reason TEXT,
+    score DOUBLE PRECISION,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    UNIQUE(topic_id, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_topic_source_links_topic ON topic_source_links(topic_id, link_status);
+
+CREATE TABLE IF NOT EXISTS claim_topics (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL REFERENCES topics(id),
+    claim_id TEXT NOT NULL REFERENCES claims(id),
+    link_status TEXT NOT NULL DEFAULT 'attached',
+    link_reason TEXT,
+    score DOUBLE PRECISION,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    UNIQUE(topic_id, claim_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_topics_topic ON claim_topics(topic_id, link_status);
+CREATE INDEX IF NOT EXISTS idx_claim_topics_claim ON claim_topics(claim_id);
+
+-- Reports are outputs, not truth storage (Core Design Rule 5) — a new row per
+-- generation (decision 27), but the product-facing behavior only ever shows
+-- the latest one for a topic; there is no report-history browsing feature.
+CREATE TABLE IF NOT EXISTS reports (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL REFERENCES topics(id),
+    report_type TEXT NOT NULL DEFAULT 'timeline',
+    title TEXT,
+    content_markdown TEXT NOT NULL,
+    generated_from_scope JSONB,
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reports_topic ON reports(topic_id, created_at DESC);
 """
 
 SOURCE_TYPES = [
@@ -855,6 +922,11 @@ class KBDatabase:
         row = dict(row)
         return row, row["id"] == event_id
 
+    async def get_event(self, event_id: str) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM events WHERE id = $1", event_id)
+        return dict(row) if row else None
+
     async def list_events(self, limit: int = 500) -> list[dict]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("SELECT * FROM events ORDER BY updated_at DESC LIMIT $1", limit)
@@ -899,6 +971,53 @@ class KBDatabase:
             rows = await conn.fetch("SELECT * FROM claims ORDER BY updated_at DESC LIMIT $1", limit)
         return [dict(r) for r in rows]
 
+    async def list_claims_above_importance(self, threshold: float, limit: int = 100) -> list[dict]:
+        """Claims eligible for the importance-based verification trigger
+        (build order step 6) that haven't been checked yet."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM claims WHERE importance_score >= $1 AND verification_attempted_at IS NULL "
+                "ORDER BY importance_score DESC LIMIT $2",
+                threshold, limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_claims_independent_of(
+        self, excluded_source_ids: list[str], exclude_claim_id: str, limit: int = 2000,
+    ) -> list[dict]:
+        """Claims that have at least one piece of evidence from a source NOT in
+        excluded_source_ids — i.e. genuinely independent corroboration
+        candidates for verifying exclude_claim_id, not just the same source
+        restating itself."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT c.* FROM claims c "
+                "JOIN claim_evidence ce ON ce.claim_id = c.id "
+                "WHERE c.id != $1 AND ce.source_id != ALL($2::text[]) "
+                "ORDER BY c.updated_at DESC LIMIT $3",
+                exclude_claim_id, excluded_source_ids, limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_claim_source_ids(self, claim_id: str) -> set[str]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT source_id FROM claim_evidence WHERE claim_id = $1", claim_id,
+            )
+        return {r["source_id"] for r in rows}
+
+    async def update_claim_verification(
+        self, claim_id: str, status: str, verification_notes: dict | None = None,
+    ) -> dict:
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE claims SET status = $1, verification_attempted_at = $2, "
+                "verification_notes = $3, updated_at = $4 WHERE id = $5 RETURNING *",
+                status, now, verification_notes, now, claim_id,
+            )
+        return dict(row)
+
     async def add_claim_evidence(
         self, claim_id: str, artifact_chunk_id: str, source_id: str, source_version_id: str,
         evidence_type: str = "support", excerpt_text: str | None = None,
@@ -923,6 +1042,47 @@ class KBDatabase:
                 char_start, char_end, confidence, now,
             )
         await self.lock_version_retention(source_version_id)
+        await self.recompute_preferred_source(claim_id)
+        return dict(row)
+
+    async def recompute_preferred_source(self, claim_id: str) -> dict | None:
+        """Auto-sets preferred_source_id to the evidence source with the
+        highest trust_tiers.rank_weight (decision 27) — a no-op if the claim
+        has been manually reviewed (is_user_reviewed), so a human override
+        always wins over the automatic rule. Called after every new evidence
+        link so the preferred source stays current as corroboration accrues."""
+        async with self.pool.acquire() as conn:
+            claim = await conn.fetchrow("SELECT is_user_reviewed FROM claims WHERE id = $1", claim_id)
+            if claim is None or claim["is_user_reviewed"]:
+                return None
+            best = await conn.fetchrow(
+                "SELECT ce.source_id FROM claim_evidence ce "
+                "JOIN sources s ON s.id = ce.source_id "
+                "LEFT JOIN trust_tiers tt ON tt.id = s.trust_tier_id "
+                "WHERE ce.claim_id = $1 "
+                "ORDER BY COALESCE(tt.rank_weight, 0) DESC, s.created_at ASC LIMIT 1",
+                claim_id,
+            )
+            if best is None:
+                return None
+            row = await conn.fetchrow(
+                "UPDATE claims SET preferred_source_id = $1, updated_at = $2 "
+                "WHERE id = $3 AND is_user_reviewed = FALSE RETURNING *",
+                best["source_id"], _now(), claim_id,
+            )
+        return dict(row) if row else None
+
+    async def set_preferred_source_manual(self, claim_id: str, source_id: str, reviewed_by: str | None = None) -> dict:
+        """Manual override — marks is_user_reviewed so recompute_preferred_source
+        never overwrites it again, mirroring how resolution_candidates review
+        decisions are final once made."""
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE claims SET preferred_source_id = $1, is_user_reviewed = TRUE, "
+                "reviewed_by = $2, reviewed_at = $3, updated_at = $3 WHERE id = $4 RETURNING *",
+                source_id, reviewed_by, now, claim_id,
+            )
         return dict(row)
 
     async def list_claim_evidence(self, claim_id: str) -> list[dict]:
@@ -971,6 +1131,20 @@ class KBDatabase:
         left_id, right_id = sorted([claim_a_id, claim_b_id])
         return await self._add_resolution_candidate(
             "claim_duplicate", score, method, reason,
+            left_claim_id=left_id, right_claim_id=right_id,
+        )
+
+    async def add_claim_contradiction_candidate(
+        self, claim_a_id: str, claim_b_id: str, score: float, method: str, reason: str | None = None,
+    ) -> tuple[dict, bool]:
+        """Records a conflict found during verification (build order step 6) —
+        per the stop-condition policy, a contradiction is recorded for review,
+        not resolved inside the verification budget. Reuses the same v1
+        merge/review queue as entity/claim duplicates (candidate_type is one
+        of the values the original schema draft anticipated)."""
+        left_id, right_id = sorted([claim_a_id, claim_b_id])
+        return await self._add_resolution_candidate(
+            "claim_contradiction", score, method, reason,
             left_claim_id=left_id, right_claim_id=right_id,
         )
 
@@ -1140,4 +1314,283 @@ class KBDatabase:
     async def get_artifact_chunk(self, chunk_id: str) -> dict | None:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM artifact_chunks WHERE id = $1", chunk_id)
+        return dict(row) if row else None
+
+    # -- topics (build order step 7) --------------------------------------
+
+    async def create_topic(self, name: str, description: str | None = None, slug: str | None = None) -> dict:
+        topic_id = _new_id()
+        now = _now()
+        slug = slug or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO topics (id, slug, name, description, status, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, 'active', $5, $6) RETURNING *",
+                topic_id, slug, name, description, now, now,
+            )
+        return dict(row)
+
+    async def get_topic(self, topic_id: str) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM topics WHERE id = $1", topic_id)
+        return dict(row) if row else None
+
+    async def list_topics(self, limit: int = 100) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM topics ORDER BY updated_at DESC LIMIT $1", limit)
+        return [dict(r) for r in rows]
+
+    async def attach_claim_to_topic(
+        self, topic_id: str, claim_id: str, link_reason: str = "manual_attach", score: float | None = None,
+    ) -> dict:
+        """Always lands as 'attached', overriding any prior suggested/rejected
+        state — an explicit attach is authoritative."""
+        link_id = _new_id()
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO claim_topics (id, topic_id, claim_id, link_status, link_reason, score, "
+                "created_at, updated_at) VALUES ($1, $2, $3, 'attached', $4, $5, $6, $6) "
+                "ON CONFLICT (topic_id, claim_id) DO UPDATE SET "
+                "link_status = 'attached', link_reason = $4, updated_at = $6 "
+                "RETURNING *",
+                link_id, topic_id, claim_id, link_reason, score, now,
+            )
+        return dict(row)
+
+    async def suggest_claim_for_topic(
+        self, topic_id: str, claim_id: str, link_reason: str, score: float,
+    ) -> tuple[dict, bool]:
+        """Only ever creates a *new* 'suggested' row — never overwrites an
+        existing attached/rejected/suggested link, so a prior human rejection
+        is never silently re-suggested."""
+        link_id = _new_id()
+        now = _now()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO claim_topics (id, topic_id, claim_id, link_status, link_reason, score, "
+                "created_at, updated_at) VALUES ($1, $2, $3, 'suggested', $4, $5, $6, $6) "
+                "ON CONFLICT (topic_id, claim_id) DO NOTHING",
+                link_id, topic_id, claim_id, link_reason, score, now,
+            )
+            row = await conn.fetchrow(
+                "SELECT * FROM claim_topics WHERE topic_id = $1 AND claim_id = $2", topic_id, claim_id,
+            )
+        return dict(row), row["id"] == link_id
+
+    async def attach_source_to_topic(
+        self, topic_id: str, source_id: str, link_reason: str = "manual_attach", score: float | None = None,
+    ) -> dict:
+        """Attaching a source also attaches every claim already evidenced by
+        it — if an article is part of a topic, its extracted claims obviously
+        are too."""
+        link_id = _new_id()
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO topic_source_links (id, topic_id, source_id, link_status, link_reason, score, "
+                "created_at, updated_at) VALUES ($1, $2, $3, 'attached', $4, $5, $6, $6) "
+                "ON CONFLICT (topic_id, source_id) DO UPDATE SET "
+                "link_status = 'attached', link_reason = $4, updated_at = $6 "
+                "RETURNING *",
+                link_id, topic_id, source_id, link_reason, score, now,
+            )
+            claim_rows = await conn.fetch(
+                "SELECT DISTINCT claim_id FROM claim_evidence WHERE source_id = $1", source_id,
+            )
+        for r in claim_rows:
+            await self.attach_claim_to_topic(topic_id, r["claim_id"], link_reason="source_attached")
+        return dict(row)
+
+    async def suggest_source_for_topic(
+        self, topic_id: str, source_id: str, link_reason: str, score: float,
+    ) -> tuple[dict, bool]:
+        link_id = _new_id()
+        now = _now()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO topic_source_links (id, topic_id, source_id, link_status, link_reason, score, "
+                "created_at, updated_at) VALUES ($1, $2, $3, 'suggested', $4, $5, $6, $6) "
+                "ON CONFLICT (topic_id, source_id) DO NOTHING",
+                link_id, topic_id, source_id, link_reason, score, now,
+            )
+            row = await conn.fetchrow(
+                "SELECT * FROM topic_source_links WHERE topic_id = $1 AND source_id = $2", topic_id, source_id,
+            )
+        return dict(row), row["id"] == link_id
+
+    async def review_topic_claim_link(self, topic_id: str, claim_id: str, decision: str) -> dict:
+        if decision not in ("attached", "rejected"):
+            raise ValueError(f"decision must be 'attached' or 'rejected', got {decision!r}")
+        if decision == "attached":
+            return await self.attach_claim_to_topic(topic_id, claim_id, link_reason="suggestion_accepted")
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE claim_topics SET link_status = 'rejected', updated_at = $1 "
+                "WHERE topic_id = $2 AND claim_id = $3 RETURNING *",
+                now, topic_id, claim_id,
+            )
+        return dict(row)
+
+    async def review_topic_source_link(self, topic_id: str, source_id: str, decision: str) -> dict:
+        if decision not in ("attached", "rejected"):
+            raise ValueError(f"decision must be 'attached' or 'rejected', got {decision!r}")
+        if decision == "attached":
+            return await self.attach_source_to_topic(topic_id, source_id, link_reason="suggestion_accepted")
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE topic_source_links SET link_status = 'rejected', updated_at = $1 "
+                "WHERE topic_id = $2 AND source_id = $3 RETURNING *",
+                now, topic_id, source_id,
+            )
+        return dict(row)
+
+    async def list_topic_claims(self, topic_id: str, link_status: str | None = "attached") -> list[dict]:
+        query = (
+            "SELECT c.*, ct.link_status, ct.link_reason, ct.score AS link_score "
+            "FROM claim_topics ct JOIN claims c ON c.id = ct.claim_id WHERE ct.topic_id = $1"
+        )
+        params: list[Any] = [topic_id]
+        if link_status:
+            params.append(link_status)
+            query += f" AND ct.link_status = ${len(params)}"
+        query += " ORDER BY c.updated_at DESC"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+        return [dict(r) for r in rows]
+
+    async def list_topic_sources(self, topic_id: str, link_status: str | None = "attached") -> list[dict]:
+        query = (
+            "SELECT s.*, tsl.link_status, tsl.link_reason, tsl.score AS link_score "
+            "FROM topic_source_links tsl JOIN sources s ON s.id = tsl.source_id WHERE tsl.topic_id = $1"
+        )
+        params: list[Any] = [topic_id]
+        if link_status:
+            params.append(link_status)
+            query += f" AND tsl.link_status = ${len(params)}"
+        query += " ORDER BY s.updated_at DESC"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+        return [dict(r) for r in rows]
+
+    async def get_topic_claim_ids(self, topic_id: str, link_status: str | None = "attached") -> set[str]:
+        """link_status=None means any status (attached/suggested/rejected) —
+        used to find claims already linked in some way, so backfill doesn't
+        re-suggest or re-score them."""
+        async with self.pool.acquire() as conn:
+            if link_status:
+                rows = await conn.fetch(
+                    "SELECT claim_id FROM claim_topics WHERE topic_id = $1 AND link_status = $2",
+                    topic_id, link_status,
+                )
+            else:
+                rows = await conn.fetch("SELECT claim_id FROM claim_topics WHERE topic_id = $1", topic_id)
+        return {r["claim_id"] for r in rows}
+
+    async def get_claims_entities_bulk(self, claim_ids: list[str]) -> dict[str, list[dict]]:
+        """{claim_id: [{"name":..., "type":...}, ...]} read from
+        extracted_observations.raw_payload — v1 has no dedicated claim<->entity
+        link table (deferred, decision 25/step 4), so this is the source of
+        truth for "what entities does this claim mention"."""
+        if not claim_ids:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT candidate_claim_id, raw_payload FROM extracted_observations "
+                "WHERE candidate_claim_id = ANY($1::text[])",
+                claim_ids,
+            )
+        result: dict[str, list[dict]] = {cid: [] for cid in claim_ids}
+        for r in rows:
+            entities = (r["raw_payload"] or {}).get("entities") or []
+            result.setdefault(r["candidate_claim_id"], []).extend(
+                e for e in entities if isinstance(e, dict) and e.get("name")
+            )
+        return result
+
+    async def find_claims_by_entity_overlap(
+        self, normalized_entity_names: set[str], exclude_claim_ids: set[str],
+    ) -> list[tuple[dict, float, list[str]]]:
+        """Full scan of extracted_observations for claims whose promoted
+        entities overlap with normalized_entity_names — fine at v1 KB scale
+        (hundreds of rows), same baseline-scan approach resolution.py already
+        uses for embedding candidate generation. Returns
+        (claim, overlap_score, matched_entity_names) sorted by score desc.
+        Aggregates across every observation that promoted to a given claim
+        (not just one), since exact-match reuse means a claim can be
+        re-promoted from multiple chunks/extraction runs with slightly
+        different entity lists each time."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT candidate_claim_id, raw_payload "
+                "FROM extracted_observations WHERE candidate_claim_id IS NOT NULL"
+            )
+
+        names_by_claim: dict[str, set[str]] = {}
+        for r in rows:
+            cid = r["candidate_claim_id"]
+            if cid in exclude_claim_ids:
+                continue
+            entities = (r["raw_payload"] or {}).get("entities") or []
+            names = {
+                normalize_name(e["name"]) for e in entities
+                if isinstance(e, dict) and e.get("name")
+            }
+            names_by_claim.setdefault(cid, set()).update(names)
+
+        matched_names_by_claim: dict[str, list[str]] = {}
+        entity_count_by_claim: dict[str, int] = {}
+        for cid, names in names_by_claim.items():
+            entity_count_by_claim[cid] = len(names)
+            overlap = names & normalized_entity_names
+            if overlap:
+                matched_names_by_claim[cid] = sorted(overlap)
+
+        if not matched_names_by_claim:
+            return []
+
+        async with self.pool.acquire() as conn:
+            claim_rows = await conn.fetch(
+                "SELECT * FROM claims WHERE id = ANY($1::text[])", list(matched_names_by_claim.keys()),
+            )
+        claims_by_id = {r["id"]: dict(r) for r in claim_rows}
+
+        results = []
+        for cid, matched_names in matched_names_by_claim.items():
+            claim = claims_by_id.get(cid)
+            if claim is None:
+                continue
+            total = max(entity_count_by_claim.get(cid, 1), 1)
+            score = len(matched_names) / total
+            results.append((claim, score, matched_names))
+        results.sort(key=lambda t: -t[1])
+        return results
+
+    # -- reports -----------------------------------------------------------
+
+    async def add_report(
+        self, topic_id: str, content_markdown: str, report_type: str = "timeline",
+        title: str | None = None, generated_from_scope: dict | None = None,
+    ) -> dict:
+        report_id = _new_id()
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO reports (id, topic_id, report_type, title, content_markdown, "
+                "generated_from_scope, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
+                report_id, topic_id, report_type, title, content_markdown, generated_from_scope, now,
+            )
+        return dict(row)
+
+    async def get_latest_report(self, topic_id: str, report_type: str | None = None) -> dict | None:
+        query = "SELECT * FROM reports WHERE topic_id = $1"
+        params: list[Any] = [topic_id]
+        if report_type:
+            params.append(report_type)
+            query += f" AND report_type = ${len(params)}"
+        query += " ORDER BY created_at DESC LIMIT 1"
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, *params)
         return dict(row) if row else None

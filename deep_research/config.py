@@ -48,6 +48,18 @@ class KBConfig(BaseModel):
     embedding_base_url: str = "http://localhost:11434"
     embedding_model: str = "nomic-embed-text:v1.5"
     claim_duplicate_threshold: float = 0.85
+    # Verification budget (build order step 6, "Verification Policy and Budget"
+    # in PLAN_KB_ARCHITECTURE.md) — bounds cost so verifying a claim can't fan
+    # out into unbounded searches/scrapes/extraction passes.
+    verification_max_web_searches: int = 2
+    verification_max_sources_examined: int = 3
+    verification_importance_threshold: float = 0.8
+    # Report generation auto-detects the server's actual context window via
+    # llama.cpp's /slots endpoint and batches (map-reduce) whatever doesn't
+    # fit in one pass, rather than dropping content. This fallback is only
+    # used if that detection fails (a non-llama.cpp backend, or /slots
+    # disabled) — a deliberately conservative guess, not a tuning knob.
+    report_context_fallback_tokens: int = 4096
 
 
 class Config(BaseModel):
@@ -88,6 +100,10 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_KB_EMBEDDING_BASE_URL": ("kb", "embedding_base_url"),
         "DEEP_RESEARCH_KB_EMBEDDING_MODEL": ("kb", "embedding_model"),
         "DEEP_RESEARCH_KB_CLAIM_DUPLICATE_THRESHOLD": ("kb", "claim_duplicate_threshold"),
+        "DEEP_RESEARCH_KB_VERIFICATION_MAX_WEB_SEARCHES": ("kb", "verification_max_web_searches"),
+        "DEEP_RESEARCH_KB_VERIFICATION_MAX_SOURCES_EXAMINED": ("kb", "verification_max_sources_examined"),
+        "DEEP_RESEARCH_KB_VERIFICATION_IMPORTANCE_THRESHOLD": ("kb", "verification_importance_threshold"),
+        "DEEP_RESEARCH_KB_REPORT_CONTEXT_FALLBACK_TOKENS": ("kb", "report_context_fallback_tokens"),
     }
     data = config.model_dump()
     for env_var, (section, key) in env_map.items():

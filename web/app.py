@@ -17,6 +17,7 @@ from deep_research.db import Database
 from deep_research.llm import LLMClient
 from deep_research.tools.scrape import scrape_page
 from deep_research.tools.search import web_search
+from web import kb_routes
 
 # Global state
 config = None
@@ -29,7 +30,11 @@ async def lifespan(app: FastAPI):
     config = load_config()
     db = Database(config.db_path)
     await db.init()
-    yield
+    await kb_routes.init_kb(config)
+    try:
+        yield
+    finally:
+        await kb_routes.close_kb()
 
 
 app = FastAPI(title="Deep Research", lifespan=lifespan)
@@ -40,6 +45,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(kb_routes.router)
 
 
 # --- Request/Response models ---

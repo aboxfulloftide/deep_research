@@ -13,7 +13,7 @@ Two separate concerns, deliberately kept apart:
 """
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 from deep_research.config import Config
@@ -31,6 +31,7 @@ class PromotionResult:
     new_entity_count: int = 0
     entity_candidate_count: int = 0
     claim_candidate_count: int = 0
+    new_claim_ids: list[str] = field(default_factory=list)
 
 
 def _entity_similarity(norm_a: str, norm_b: str) -> tuple[float, str] | None:
@@ -142,6 +143,7 @@ async def resolve_and_promote(
         if isinstance(event_payload, dict) and event_payload.get("title"):
             event_row, _ = await kb_db.get_or_create_event(
                 title=event_payload["title"], start_at=event_payload.get("date"),
+                date_precision=event_payload.get("date_precision"),
             )
             event_id = event_row["id"]
 
@@ -190,5 +192,6 @@ async def resolve_and_promote(
         result.promoted_count += 1
 
     result.new_claim_count = len(new_claim_ids)
+    result.new_claim_ids = new_claim_ids
     result.claim_candidate_count = await generate_claim_resolution_candidates(kb_db, config, new_claim_ids)
     return result

@@ -9,8 +9,12 @@ from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.extraction import run_extraction
 from deep_research.kb.ingest import ingest_file, ingest_web_page, ingest_youtube_video
+from deep_research.kb.reports import generate_topic_report
 from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
+from deep_research.kb.timeline import get_topic_timeline
+from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
+from deep_research.kb.verification import verify_claim
 
 console = Console()
 
@@ -235,6 +239,17 @@ async def cmd_extract_source(args):
     console.print(f"  entity candidates: {promotion.entity_candidate_count}")
     console.print(f"  claim candidates:  {promotion.claim_candidate_count}")
 
+    # Forward-check (decision 27): new claims get checked against every
+    # existing topic, not just topics created after this point.
+    topic_results = await check_claims_against_topics(kb_db, promotion.new_claim_ids)
+    if topic_results:
+        console.print("  topic suggestions:")
+        for topic_id, result in topic_results.items():
+            topic = await kb_db.get_topic(topic_id)
+            console.print(
+                f"    {topic['name']}: {result.claims_suggested} claim(s), {result.sources_suggested} source(s)"
+            )
+
 
 async def cmd_list_claims(args):
     config, kb_db, _ = _kb_setup(args)
@@ -329,6 +344,240 @@ async def cmd_review_candidate(args):
         console.print("[dim]Note: merge execution is not implemented yet — this only records the review decision.[/dim]")
 
 
+def _print_verification_result(result):
+    verb = {
+        "supported": "[green]Supported[/green]",
+        "contradicted": "[red]Contradicted[/red]",
+        "mixed": "[yellow]Mixed[/yellow]",
+        "unverified": "[yellow]Still unverified[/yellow] (budget exhausted with no clear signal)",
+        "skipped": "[dim]Skipped[/dim] (already verified — use --force to recheck)",
+    }[result.status]
+    console.print(verb)
+    if result.status != "skipped":
+        console.print(f"  supports found:     {result.supports_found}")
+        console.print(f"  contradicts found:  {result.contradicts_found}")
+        console.print(f"  sources examined:   {result.sources_examined}")
+        console.print(f"  web searches used:  {result.web_searches_used}")
+        if result.contradiction_candidate_ids:
+            console.print(
+                f"  [red]recorded {len(result.contradiction_candidate_ids)} contradiction(s) "
+                f"for review — see list-resolution-candidates --type claim_contradiction[/red]"
+            )
+
+
+async def cmd_verify_claim(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+
+    claims = await kb_db.list_claims(limit=5000)
+    match = next((c for c in claims if c["id"].startswith(args.claim_id)), None)
+    if match is None:
+        console.print(f"[red]No claim found matching ID prefix {args.claim_id!r}[/red]")
+        return
+
+    console.print(f"Verifying: {match['canonical_text']}")
+    result = await verify_claim(kb_db, config, match["id"], force=args.force)
+    _print_verification_result(result)
+
+
+async def cmd_verify_source(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+
+    match = await _resolve_source(kb_db, args.source_id)
+    if match is None:
+        console.print(f"[red]No source found matching ID prefix {args.source_id!r}[/red]")
+        return
+
+    all_claims = await kb_db.list_claims(limit=5000)
+    evidence_by_claim = {}
+    for c in all_claims:
+        evidence = await kb_db.list_claim_evidence(c["id"])
+        if any(e["source_id"] == match["id"] for e in evidence):
+            evidence_by_claim[c["id"]] = c
+
+    threshold = args.threshold if args.threshold is not None else config.kb.verification_importance_threshold
+    eligible = [
+        c for c in evidence_by_claim.values()
+        if (c["importance_score"] or 0) >= threshold and c["verification_attempted_at"] is None
+    ]
+    if not eligible:
+        console.print(f"[dim]No unverified claims from this source at or above importance {threshold}.[/dim]")
+        return
+
+    console.print(f"Verifying {len(eligible)} claim(s) from {match.get('title') or match['id']}...")
+    for claim in eligible:
+        console.print(f"\n[bold]{claim['canonical_text']}[/bold]")
+        result = await verify_claim(kb_db, config, claim["id"], force=args.force)
+        _print_verification_result(result)
+
+
+async def _resolve_topic(kb_db, topic_id_prefix: str) -> dict | None:
+    topics = await kb_db.list_topics(limit=1000)
+    return next((t for t in topics if t["id"].startswith(topic_id_prefix) or t["slug"] == topic_id_prefix), None)
+
+
+async def cmd_create_topic(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    topic = await kb_db.create_topic(args.name, description=args.description)
+    console.print(f"[green]Created topic[/green] {topic['name']} ({topic['id']})")
+    console.print(f"  slug: {topic['slug']}")
+
+
+async def cmd_list_topics(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    topics = await kb_db.list_topics(limit=args.limit)
+    if not topics:
+        console.print("[dim]No topics yet.[/dim]")
+        return
+    table = Table(title="Topics")
+    table.add_column("ID", style="cyan", max_width=10)
+    table.add_column("Name", style="white")
+    table.add_column("Slug", style="dim")
+    table.add_column("Updated", style="dim")
+    for t in topics:
+        table.add_row(t["id"][:8] + "...", t["name"], t["slug"], _fmt_ts(t["updated_at"]))
+    console.print(table)
+
+
+async def cmd_attach_source(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    topic = await _resolve_topic(kb_db, args.topic_id)
+    if topic is None:
+        console.print(f"[red]No topic found matching {args.topic_id!r}[/red]")
+        return
+    source = await _resolve_source(kb_db, args.source_id)
+    if source is None:
+        console.print(f"[red]No source found matching ID prefix {args.source_id!r}[/red]")
+        return
+    await kb_db.attach_source_to_topic(topic["id"], source["id"], link_reason="manual_attach")
+    claims = await kb_db.list_topic_claims(topic["id"])
+    console.print(f"[green]Attached[/green] {source.get('title') or source['id']} to {topic['name']}")
+    console.print(f"  ({len(claims)} claims now attached to this topic in total)")
+
+
+async def cmd_attach_claim(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    topic = await _resolve_topic(kb_db, args.topic_id)
+    if topic is None:
+        console.print(f"[red]No topic found matching {args.topic_id!r}[/red]")
+        return
+    claims = await kb_db.list_claims(limit=5000)
+    claim = next((c for c in claims if c["id"].startswith(args.claim_id)), None)
+    if claim is None:
+        console.print(f"[red]No claim found matching ID prefix {args.claim_id!r}[/red]")
+        return
+    await kb_db.attach_claim_to_topic(topic["id"], claim["id"], link_reason="manual_attach")
+    console.print(f"[green]Attached[/green] claim to {topic['name']}: {claim['canonical_text'][:80]}")
+
+
+async def cmd_backfill_topic(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    topic = await _resolve_topic(kb_db, args.topic_id)
+    if topic is None:
+        console.print(f"[red]No topic found matching {args.topic_id!r}[/red]")
+        return
+    result = await generate_topic_suggestions(kb_db, topic["id"])
+    console.print(f"Backfilled suggestions for {topic['name']}:")
+    console.print(f"  claims suggested:  {result.claims_suggested}")
+    console.print(f"  sources suggested: {result.sources_suggested}")
+
+
+async def cmd_show_topic(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    topic = await _resolve_topic(kb_db, args.topic_id)
+    if topic is None:
+        console.print(f"[red]No topic found matching {args.topic_id!r}[/red]")
+        return
+
+    console.print(f"[bold]{topic['name']}[/bold]  ({topic['slug']})")
+    if topic.get("description"):
+        console.print(f"  {topic['description']}")
+
+    timeline = await get_topic_timeline(kb_db, topic["id"])
+    if timeline:
+        console.print(f"\n[bold]Timeline[/bold] ({len(timeline)} dated events)")
+        for entry in timeline:
+            console.print(f"\n  [cyan]{entry.event.get('start_at')}[/cyan] — {entry.event['title']}")
+            for claim in entry.claims:
+                console.print(f"    - {claim['canonical_text']}")
+
+    all_claims = await kb_db.list_topic_claims(topic["id"], link_status="attached")
+    console.print(f"\n[bold]Attached claims:[/bold] {len(all_claims)} total")
+
+    suggested_claims = await kb_db.list_topic_claims(topic["id"], link_status="suggested")
+    suggested_sources = await kb_db.list_topic_sources(topic["id"], link_status="suggested")
+    if suggested_claims or suggested_sources:
+        console.print(
+            f"\n[yellow]Pending suggestions:[/yellow] {len(suggested_claims)} claim(s), "
+            f"{len(suggested_sources)} source(s) — see review-topic-suggestion"
+        )
+
+
+async def cmd_review_topic_suggestion(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    topic = await _resolve_topic(kb_db, args.topic_id)
+    if topic is None:
+        console.print(f"[red]No topic found matching {args.topic_id!r}[/red]")
+        return
+
+    decision = "attached" if args.accept else "rejected"
+    if args.type == "claim":
+        claims = await kb_db.list_topic_claims(topic["id"], link_status="suggested")
+        match = next((c for c in claims if c["id"].startswith(args.item_id)), None)
+        if match is None:
+            console.print(f"[red]No suggested claim matching {args.item_id!r}[/red]")
+            return
+        updated = await kb_db.review_topic_claim_link(topic["id"], match["id"], decision)
+    else:
+        sources = await kb_db.list_topic_sources(topic["id"], link_status="suggested")
+        match = next((s for s in sources if s["id"].startswith(args.item_id)), None)
+        if match is None:
+            console.print(f"[red]No suggested source matching {args.item_id!r}[/red]")
+            return
+        updated = await kb_db.review_topic_source_link(topic["id"], match["id"], decision)
+    console.print(f"Marked as [bold]{decision}[/bold]")
+
+
+async def cmd_generate_report(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    topic = await _resolve_topic(kb_db, args.topic_id)
+    if topic is None:
+        console.print(f"[red]No topic found matching {args.topic_id!r}[/red]")
+        return
+    console.print(f"Generating report for {topic['name']}...")
+    result = await generate_topic_report(kb_db, config, topic["id"])
+    console.print()
+    console.print(result.content_markdown)
+    if result.suggestion:
+        console.print()
+        console.print(f"[yellow]{result.suggestion}[/yellow]")
+
+
+async def cmd_set_preferred_source(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    claims = await kb_db.list_claims(limit=5000)
+    claim = next((c for c in claims if c["id"].startswith(args.claim_id)), None)
+    if claim is None:
+        console.print(f"[red]No claim found matching ID prefix {args.claim_id!r}[/red]")
+        return
+    source = await _resolve_source(kb_db, args.source_id)
+    if source is None:
+        console.print(f"[red]No source found matching ID prefix {args.source_id!r}[/red]")
+        return
+    await kb_db.set_preferred_source_manual(claim["id"], source["id"], reviewed_by="user")
+    console.print(f"[green]Set preferred source[/green] for claim to {source.get('title') or source['id']}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deep Research — knowledge base source ingestion")
     parser.add_argument("--config", "-c", help="Path to config.yaml")
@@ -381,7 +630,9 @@ def main():
     p_show_claim.set_defaults(func=cmd_show_claim)
 
     p_candidates = subparsers.add_parser("list-resolution-candidates", help="List entity/claim merge candidates for review")
-    p_candidates.add_argument("--type", choices=["entity_duplicate", "claim_duplicate"], default=None)
+    p_candidates.add_argument(
+        "--type", choices=["entity_duplicate", "claim_duplicate", "claim_contradiction"], default=None,
+    )
     p_candidates.add_argument("--status", default="open")
     p_candidates.add_argument("--limit", type=int, default=50)
     p_candidates.set_defaults(func=cmd_list_resolution_candidates)
@@ -392,6 +643,66 @@ def main():
     group.add_argument("--accept", action="store_true")
     group.add_argument("--reject", action="store_true")
     p_review.set_defaults(func=cmd_review_candidate)
+
+    p_verify_claim = subparsers.add_parser("verify-claim", help="Verify a claim against the KB and, if needed, the web")
+    p_verify_claim.add_argument("claim_id", help="Claim ID or prefix")
+    p_verify_claim.add_argument("--force", action="store_true", help="Re-verify even if already attempted")
+    p_verify_claim.set_defaults(func=cmd_verify_claim)
+
+    p_verify_source = subparsers.add_parser(
+        "verify-source", help="Verify all unverified claims from a source above the importance threshold",
+    )
+    p_verify_source.add_argument("source_id", help="Source ID or prefix")
+    p_verify_source.add_argument("--threshold", type=float, default=None, help="Overrides kb.verification_importance_threshold")
+    p_verify_source.add_argument("--force", action="store_true")
+    p_verify_source.set_defaults(func=cmd_verify_source)
+
+    p_create_topic = subparsers.add_parser("create-topic", help="Create a topic")
+    p_create_topic.add_argument("name")
+    p_create_topic.add_argument("--description")
+    p_create_topic.set_defaults(func=cmd_create_topic)
+
+    p_list_topics = subparsers.add_parser("list-topics", help="List topics")
+    p_list_topics.add_argument("--limit", type=int, default=50)
+    p_list_topics.set_defaults(func=cmd_list_topics)
+
+    p_show_topic = subparsers.add_parser("show-topic", help="Show a topic's timeline, claims, and pending suggestions")
+    p_show_topic.add_argument("topic_id", help="Topic ID, ID prefix, or slug")
+    p_show_topic.set_defaults(func=cmd_show_topic)
+
+    p_attach_source = subparsers.add_parser("attach-source", help="Attach a source (and its claims) to a topic")
+    p_attach_source.add_argument("topic_id")
+    p_attach_source.add_argument("source_id")
+    p_attach_source.set_defaults(func=cmd_attach_source)
+
+    p_attach_claim = subparsers.add_parser("attach-claim", help="Attach a single claim to a topic")
+    p_attach_claim.add_argument("topic_id")
+    p_attach_claim.add_argument("claim_id")
+    p_attach_claim.set_defaults(func=cmd_attach_claim)
+
+    p_backfill = subparsers.add_parser(
+        "backfill-topic-suggestions", help="(Re-)scan the whole KB for entity-overlap suggestions for a topic",
+    )
+    p_backfill.add_argument("topic_id")
+    p_backfill.set_defaults(func=cmd_backfill_topic)
+
+    p_review_topic = subparsers.add_parser("review-topic-suggestion", help="Accept or reject a topic suggestion")
+    p_review_topic.add_argument("topic_id")
+    p_review_topic.add_argument("item_id", help="Claim or source ID/prefix")
+    p_review_topic.add_argument("--type", choices=["claim", "source"], required=True)
+    review_group = p_review_topic.add_mutually_exclusive_group(required=True)
+    review_group.add_argument("--accept", action="store_true")
+    review_group.add_argument("--reject", action="store_true")
+    p_review_topic.set_defaults(func=cmd_review_topic_suggestion)
+
+    p_report = subparsers.add_parser("generate-report", help="Generate a timeline report for a topic")
+    p_report.add_argument("topic_id")
+    p_report.set_defaults(func=cmd_generate_report)
+
+    p_pref_source = subparsers.add_parser("set-preferred-source", help="Manually override a claim's preferred source")
+    p_pref_source.add_argument("claim_id")
+    p_pref_source.add_argument("source_id")
+    p_pref_source.set_defaults(func=cmd_set_preferred_source)
 
     args = parser.parse_args()
     asyncio.run(args.func(args))
