@@ -13,6 +13,7 @@ Two separate concerns, deliberately kept apart:
 """
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
@@ -22,6 +23,33 @@ from deep_research.kb.embeddings import embed_texts
 
 MIN_FUZZY_ENTITY_NAME_LENGTH = 4
 FUZZY_ENTITY_TRIGRAM_THRESHOLD = 0.82
+# Below this shorter/longer normalized-name length ratio, a substring match is
+# usually a generic word buried in a much more specific name ("bank" inside
+# "Silicon Valley Bank", "economy" inside "British industrial economy") rather
+# than the same real-world thing referred to two ways -- not applied to
+# `person`, where a short surname matching a full name (`Clayton` inside
+# `Christopher Clayton`) is a genuinely common and valuable pattern that this
+# ratio would otherwise wrongly suppress.
+FUZZY_SUBSTRING_MIN_LENGTH_RATIO = 0.5
+# Two different dates are never "the same" fuzzy-adjacent entity the way a
+# nickname or acronym might be -- an identical date already auto-merges via
+# the exact-match tier, so fuzzy matching on dates only ever produces noise
+# ("June 22, 2026" scoring 0.917 against "June 29, 2026" by trigram overlap).
+NO_FUZZY_MATCH_ENTITY_TYPES = {"date"}
+
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")  # decimal point only consumed if followed by a digit
+
+
+def _extract_numbers(text: str) -> set[str]:
+    """Numbers as they literally appear in claim text (years, counts, dollar
+    amounts, percentages) — comma thousands separators stripped so '1,200'
+    and '1200' compare equal. Used as a cheap sanity check before treating two
+    structurally-similar claims as duplicates: 'X bank failures in 2009' and
+    'Y bank failures in 2010' score high on embedding similarity despite being
+    two distinct (and both true) facts — if two claims cite numbers at all,
+    and none of those numbers match, they're essentially never the same
+    fact."""
+    return {m.replace(",", "") for m in _NUMBER_RE.findall(text)}
 
 
 @dataclass
@@ -34,16 +62,53 @@ class PromotionResult:
     new_claim_ids: list[str] = field(default_factory=list)
 
 
-def _entity_similarity(norm_a: str, norm_b: str) -> tuple[float, str] | None:
+def _is_trivial_plural(shorter: str, longer: str) -> bool:
+    """True if `longer` is just the plural of `shorter`, and `shorter` is a
+    single bare word, not a multi-word phrase ("data center" -> "data
+    centers" is a real, specific concept pluralizing; "bank" -> "banks" is
+    just grammatical number on a generic noun). A single generic word
+    pluralizing is not a meaningful entity distinction worth a reviewer's
+    time either way."""
+    if " " in shorter:
+        return False
+    return longer in (shorter + "s", shorter + "es")
+
+
+def _is_trivial_qualifier(shorter: str, longer: str) -> bool:
+    """True if `longer`'s words are exactly `shorter`'s words plus one extra
+    qualifying word at the start or end ("capital cycle" + "theory",
+    "financial" + "regulators", "unemployment" + "rate", "US equity market" +
+    "capitalization"). A single qualifying word — whichever word it happens
+    to be — almost always makes it a distinctly different, more specific
+    concept, not the same entity spelled two ways."""
+    shorter_words = shorter.split()
+    longer_words = longer.split()
+    if len(longer_words) != len(shorter_words) + 1:
+        return False
+    return longer_words[1:] == shorter_words or longer_words[:-1] == shorter_words
+
+
+def _entity_similarity(norm_a: str, norm_b: str, entity_type: str) -> tuple[float, str] | None:
     """Guarded fuzzy match for entities: a minimum name length gate before any
     fuzzy method runs at all. The spike found unguarded substring matching
     unusably noisy (e.g. "ai" flagged as a duplicate of "britain" because
-    "britain" contains the substring "ai") — this length gate is the fix."""
+    "britain" contains the substring "ai") — this length gate is the fix.
+    entity_type gates several further, type-specific sources of noise: see
+    NO_FUZZY_MATCH_ENTITY_TYPES, _is_trivial_plural, _is_trivial_qualifier, and
+    FUZZY_SUBSTRING_MIN_LENGTH_RATIO above."""
     if norm_a == norm_b:
         return None  # exact match; handled by get_or_create_entity, not here
+    if entity_type in NO_FUZZY_MATCH_ENTITY_TYPES:
+        return None
     if len(norm_a) < MIN_FUZZY_ENTITY_NAME_LENGTH or len(norm_b) < MIN_FUZZY_ENTITY_NAME_LENGTH:
         return None
     if norm_a in norm_b or norm_b in norm_a:
+        shorter, longer = sorted([norm_a, norm_b], key=len)
+        if entity_type != "person":
+            if _is_trivial_plural(shorter, longer) or _is_trivial_qualifier(shorter, longer):
+                return None
+            if len(shorter) / len(longer) < FUZZY_SUBSTRING_MIN_LENGTH_RATIO:
+                return None
         return 0.85, "substring"
     ratio = SequenceMatcher(None, norm_a, norm_b).ratio()
     if ratio >= FUZZY_ENTITY_TRIGRAM_THRESHOLD:
@@ -52,12 +117,14 @@ def _entity_similarity(norm_a: str, norm_b: str) -> tuple[float, str] | None:
 
 
 async def _generate_entity_candidates(kb_db: KBDatabase, entity_row: dict) -> int:
+    if entity_row["entity_type"] in NO_FUZZY_MATCH_ENTITY_TYPES:
+        return 0
     others = await kb_db.list_entities(entity_type=entity_row["entity_type"], limit=2000)
     count = 0
     for other in others:
         if other["id"] == entity_row["id"]:
             continue
-        sim = _entity_similarity(entity_row["normalized_name"], other["normalized_name"])
+        sim = _entity_similarity(entity_row["normalized_name"], other["normalized_name"], entity_row["entity_type"])
         if sim is None:
             continue
         score, method = sim
@@ -102,7 +169,11 @@ async def generate_claim_resolution_candidates(
     run — the previous approach that became the actual bottleneck as the KB
     grew. Matches above config.kb.claim_duplicate_threshold become
     resolution_candidates (never auto-merged — the spike measured only 50%
-    precision even at 0.85)."""
+    precision even at 0.85). Matches whose numbers flatly disagree ("140 bank
+    failures in 2009" vs. "157 bank failures in 2010" — both true, not
+    duplicates) are suppressed entirely: structurally similar sentences score
+    high on embedding similarity regardless of the actual numbers inside them,
+    and this was measured as a real, recurring source of review-queue noise."""
     if not new_claim_ids:
         return 0
 
@@ -113,10 +184,14 @@ async def generate_claim_resolution_candidates(
         if claim is None or claim.get("embedding") is None:
             continue  # embedding failed best-effort at creation time; backfill will cover it
         embedding = claim["embedding"].to_list()
+        claim_numbers = _extract_numbers(claim["canonical_text"])
         neighbors = await kb_db.find_similar_claims(claim_id, embedding, limit=20)
         for other in neighbors:
             if other["similarity"] < threshold:
                 break  # find_similar_claims orders nearest-first (similarity descending)
+            other_numbers = _extract_numbers(other["canonical_text"])
+            if claim_numbers and other_numbers and claim_numbers.isdisjoint(other_numbers):
+                continue  # both claims cite numbers, but share none -- not the same fact
             _, created = await kb_db.add_claim_resolution_candidate(
                 claim_id, other["id"], other["similarity"], "embedding_cosine",
                 reason=f"cosine={other['similarity']:.3f}",

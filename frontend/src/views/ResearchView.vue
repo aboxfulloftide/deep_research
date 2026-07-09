@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, nextTick, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Send, Loader, Globe, FileSearch, Bot, ChevronDown, Database } from 'lucide-vue-next'
+import { Send, Loader, Globe, FileSearch, Bot, ChevronDown, Database, Server } from 'lucide-vue-next'
 import { marked } from 'marked'
 import { useApi } from '../composables/useApi.js'
 
@@ -22,17 +22,34 @@ const messagesContainer = ref(null)
 // checks the local knowledge base first or starts with a live web search.
 // Persisted the same way dark mode is, since it's a standing preference.
 const prioritizeKb = ref(localStorage.getItem('prioritizeKb') === 'true')
+// Which local model server the agent talks to -- see
+// deep_research/model_backends.py. Persisted like prioritizeKb, since it's
+// also a standing preference, not a per-query choice.
+const backend = ref(localStorage.getItem('llmBackend') || 'ollama')
 let abortController = null
 
 watch(prioritizeKb, (val) => {
   localStorage.setItem('prioritizeKb', val)
 })
 
-onMounted(async () => {
-  // Load models
-  const data = await api.fetchModels()
+watch(backend, (val) => {
+  localStorage.setItem('llmBackend', val)
+})
+
+async function loadModelsForBackend() {
+  const data = await api.fetchModels(backend.value)
   models.value = data.models || []
   model.value = data.default || (models.value[0] ?? '')
+}
+
+function switchBackend(newBackend) {
+  if (newBackend === backend.value) return
+  backend.value = newBackend
+  loadModelsForBackend()
+}
+
+onMounted(async () => {
+  await loadModelsForBackend()
 
   // If resuming a session
   if (route.params.id) {
@@ -66,6 +83,14 @@ function renderMarkdown(text) {
 function selectModel(m) {
   model.value = m
   modelDropdownOpen.value = false
+}
+
+// llama.cpp reports the full gguf file path as the model "id" (e.g.
+// /home/.../Qwen_Qwen3-14B-GGUF_Qwen3-14B-Q4_K_M.gguf) -- Ollama's tags
+// (gemma3:12b) are already short, so this only shortens the path-like case.
+function displayModelName(m) {
+  if (!m) return m
+  return m.includes('/') ? m.slice(m.lastIndexOf('/') + 1) : m
 }
 
 async function submitQuery() {
@@ -102,7 +127,7 @@ async function submitQuery() {
       status.value = null
       isResearching.value = false
     },
-  }, prioritizeKb.value)
+  }, prioritizeKb.value, backend.value)
 }
 
 function stopResearch() {
@@ -198,13 +223,31 @@ const statusText = computed(() => {
     <div class="border-t border-gray-200 dark:border-gray-700 pt-4">
       <!-- Model selector -->
       <div class="flex items-center gap-2 mb-3">
+        <div class="flex items-center rounded-md bg-gray-200 dark:bg-gray-700 text-xs overflow-hidden" title="Which local model server the agent talks to">
+          <button
+            v-for="b in ['ollama', 'llama_cpp']"
+            :key="b"
+            @click="switchBackend(b)"
+            :class="[
+              'flex items-center gap-1 px-2.5 py-1.5 transition-colors',
+              backend === b
+                ? 'bg-blue-600 text-white'
+                : 'hover:bg-gray-300 dark:hover:bg-gray-600'
+            ]"
+          >
+            <Server class="w-3.5 h-3.5" :stroke-width="1.5" />
+            {{ b === 'ollama' ? 'Ollama' : 'llama.cpp' }}
+          </button>
+        </div>
+
         <div class="relative">
           <button
             @click="modelDropdownOpen = !modelDropdownOpen"
             class="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors"
+            :title="model"
           >
             <Bot class="w-3.5 h-3.5" :stroke-width="1.5" />
-            {{ model || 'Select model' }}
+            {{ displayModelName(model) || 'Select model' }}
             <ChevronDown class="w-3 h-3" />
           </button>
           <div
@@ -215,12 +258,13 @@ const statusText = computed(() => {
               v-for="m in models"
               :key="m"
               @click="selectModel(m)"
+              :title="m"
               :class="[
                 'w-full text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors',
                 m === model ? 'text-blue-500 font-medium' : ''
               ]"
             >
-              {{ m }}
+              {{ displayModelName(m) }}
             </button>
           </div>
         </div>

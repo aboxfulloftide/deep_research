@@ -1329,6 +1329,27 @@ class KBDatabase:
             )
         return [dict(r) for r in rows]
 
+    async def get_claims_evidence_bulk(self, claim_ids: list[str]) -> dict[str, list[dict]]:
+        """One round trip for many claims' evidence, keyed by claim_id -- see
+        get_entities_bulk/get_claims_bulk. Used by the resolution-candidates
+        list API so a reviewer can see *why* two claims might be duplicates
+        (source + quoted excerpt), not just the bare claim text side by side."""
+        ids = list({i for i in claim_ids if i})
+        if not ids:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT ce.*, s.title AS source_title, s.canonical_uri "
+                "FROM claim_evidence ce "
+                "JOIN sources s ON s.id = ce.source_id "
+                "WHERE ce.claim_id = ANY($1::text[]) ORDER BY ce.created_at",
+                ids,
+            )
+        result: dict[str, list[dict]] = {}
+        for r in rows:
+            result.setdefault(r["claim_id"], []).append(dict(r))
+        return result
+
     async def add_metric(
         self, metric_name: str, claim_id: str | None = None, event_id: str | None = None,
         entity_id: str | None = None, value_numeric: float | None = None,

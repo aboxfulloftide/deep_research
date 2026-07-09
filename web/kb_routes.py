@@ -8,6 +8,7 @@ KB). init_kb() is called from app.py's lifespan to share one KBDatabase pool.
 """
 
 from fastapi import APIRouter, HTTPException
+from pgvector import Vector
 from pydantic import BaseModel
 
 from deep_research.config import Config
@@ -78,14 +79,22 @@ class PreferredSourceRequest(BaseModel):
 
 def _serialize(obj):
     """FastAPI/pydantic can't serialize asyncpg Record-derived dicts with
-    datetime objects out of the box via plain dict returns in some cases —
-    return plain JSON-safe dicts explicitly where dates are involved."""
+    datetime or pgvector.Vector objects out of the box via plain dict returns
+    — return plain JSON-safe dicts explicitly wherever those are involved.
+    Claims/entities carry a real `embedding` value since step 8 (previously
+    always NULL/None during earlier testing, which happens to encode fine —
+    this only started raising once real data existed), so any route
+    returning a raw claim/entity dict needs this or it 500s. Dropped (to
+    None) rather than sent as a raw 768-float list: no frontend view uses the
+    embedding, and it would otherwise bloat every claims/timeline response."""
     if isinstance(obj, dict):
         return {k: _serialize(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_serialize(v) for v in obj]
     if hasattr(obj, "isoformat"):
         return obj.isoformat()
+    if isinstance(obj, Vector):
+        return None
     return obj
 
 
@@ -225,13 +234,33 @@ async def set_preferred_source(claim_id: str, req: PreferredSourceRequest):
     return {"claim": _serialize(updated)}
 
 
-def _enrich_candidates(candidates: list[dict], entities: dict[str, dict], claims: dict[str, dict]) -> list[dict]:
+def _evidence_summary(rows: list[dict]) -> list[dict]:
+    """Trims claim_evidence rows down to what a reviewer actually needs to
+    judge a claim_duplicate/claim_contradiction candidate: which source it
+    came from and the exact quoted excerpt -- not the full evidence row."""
+    return [
+        {
+            "source_title": r.get("source_title") or r.get("canonical_uri"),
+            "canonical_uri": r.get("canonical_uri"),
+            "excerpt": r.get("excerpt_text"),
+        }
+        for r in rows
+    ]
+
+
+def _enrich_candidates(
+    candidates: list[dict], entities: dict[str, dict], claims: dict[str, dict],
+    claims_evidence: dict[str, list[dict]],
+) -> list[dict]:
     """Resolution candidates only store entity/claim IDs (see cli/kb.py's
     list-resolution-candidates for the same pattern) — resolve them to a
-    human-readable label for display. `entities`/`claims` are pre-fetched in
-    bulk by the caller (one query each for the whole list) rather than one
-    lookup per row, which turned a single list call into hundreds of
-    sequential round trips once the KB had a few hundred candidates."""
+    human-readable label, plus enough supporting context (evidence excerpts
+    for claims) for a human to actually judge the pair instead of comparing
+    two bare sentences with no idea where either came from. `entities`/
+    `claims`/`claims_evidence` are pre-fetched in bulk by the caller (one
+    query each for the whole list) rather than one lookup per row, which
+    turned a single list call into hundreds of sequential round trips once
+    the KB had a few hundred candidates."""
     enriched = []
     for c in candidates:
         row = _serialize(c)
@@ -240,11 +269,15 @@ def _enrich_candidates(candidates: list[dict], entities: dict[str, dict], claims
             right = entities.get(c["right_entity_id"])
             row["left_label"] = left["name"] if left else "(deleted entity)"
             row["right_label"] = right["name"] if right else "(deleted entity)"
+            row["left_entity_type"] = left["entity_type"] if left else None
+            row["right_entity_type"] = right["entity_type"] if right else None
         elif c.get("left_claim_id"):
             left = claims.get(c["left_claim_id"])
             right = claims.get(c["right_claim_id"])
             row["left_label"] = left["canonical_text"] if left else "(deleted claim)"
             row["right_label"] = right["canonical_text"] if right else "(deleted claim)"
+            row["left_evidence"] = _evidence_summary(claims_evidence.get(c["left_claim_id"], []))
+            row["right_evidence"] = _evidence_summary(claims_evidence.get(c["right_claim_id"], []))
         enriched.append(row)
     return enriched
 
@@ -254,8 +287,10 @@ async def list_resolution_candidates(status: str = "open", type: str | None = No
     candidates = await kb_db.list_resolution_candidates(candidate_type=type, status=status, limit=limit)
     entity_ids = [c[k] for c in candidates for k in ("left_entity_id", "right_entity_id") if c.get(k)]
     claim_ids = [c[k] for c in candidates for k in ("left_claim_id", "right_claim_id") if c.get(k)]
-    entities, claims = await kb_db.get_entities_bulk(entity_ids), await kb_db.get_claims_bulk(claim_ids)
-    return {"candidates": _enrich_candidates(candidates, entities, claims)}
+    entities = await kb_db.get_entities_bulk(entity_ids)
+    claims = await kb_db.get_claims_bulk(claim_ids)
+    claims_evidence = await kb_db.get_claims_evidence_bulk(claim_ids)
+    return {"candidates": _enrich_candidates(candidates, entities, claims, claims_evidence)}
 
 
 @router.post("/resolution-candidates/{candidate_id}/review")

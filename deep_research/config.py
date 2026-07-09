@@ -6,9 +6,20 @@ from pydantic import BaseModel
 
 
 class LLMConfig(BaseModel):
+    # base_url/model/api_key are the *currently active* triple that LLMClient
+    # actually reads. backend + the preset fields below exist so the CLI/web
+    # layer can switch the agent between Ollama and llama.cpp (see
+    # deep_research/model_backends.py) without touching LLMClient at all --
+    # switching just means resolving a preset's base_url/api_key into these
+    # three fields before constructing an LLMClient.
     base_url: str = "http://localhost:11434/v1"
     model: str = "llama3"
     api_key: str = "ollama"
+    backend: str = "ollama"  # "ollama" | "llama_cpp" -- which preset base_url/api_key currently reflects
+    ollama_base_url: str = "http://localhost:11434/v1"
+    ollama_api_key: str = "ollama"
+    llama_cpp_base_url: str = "http://localhost:8080/v1"
+    llama_cpp_api_key: str = "not-needed"
 
 
 class SearXNGConfig(BaseModel):
@@ -86,6 +97,11 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_LLM_BASE_URL": ("llm", "base_url"),
         "DEEP_RESEARCH_LLM_MODEL": ("llm", "model"),
         "DEEP_RESEARCH_LLM_API_KEY": ("llm", "api_key"),
+        "DEEP_RESEARCH_LLM_BACKEND": ("llm", "backend"),
+        "DEEP_RESEARCH_LLM_OLLAMA_BASE_URL": ("llm", "ollama_base_url"),
+        "DEEP_RESEARCH_LLM_OLLAMA_API_KEY": ("llm", "ollama_api_key"),
+        "DEEP_RESEARCH_LLM_LLAMA_CPP_BASE_URL": ("llm", "llama_cpp_base_url"),
+        "DEEP_RESEARCH_LLM_LLAMA_CPP_API_KEY": ("llm", "llama_cpp_api_key"),
         "DEEP_RESEARCH_SEARXNG_URL": ("searxng", "url"),
         "DEEP_RESEARCH_SCRAPING_TIMEOUT": ("scraping", "timeout"),
         "DEEP_RESEARCH_SCRAPING_MAX_CONTENT_LENGTH": ("scraping", "max_content_length"),

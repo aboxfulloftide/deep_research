@@ -1,8 +1,9 @@
 const API_BASE = '/api'
 
 export function useApi() {
-  async function fetchModels() {
-    const resp = await fetch(`${API_BASE}/models`)
+  async function fetchModels(backend = null) {
+    const qs = backend ? `?backend=${encodeURIComponent(backend)}` : ''
+    const resp = await fetch(`${API_BASE}/models${qs}`)
     return resp.json()
   }
 
@@ -22,10 +23,11 @@ export function useApi() {
     return resp.json()
   }
 
-  function streamResearch(query, model, sessionId, callbacks, prioritizeKb = false) {
+  function streamResearch(query, model, sessionId, callbacks, prioritizeKb = false, backend = null) {
     const body = JSON.stringify({
       query,
       model: model || null,
+      backend: backend || null,
       session_id: sessionId || null,
       prioritize_kb: !!prioritizeKb,
     })

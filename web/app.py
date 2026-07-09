@@ -4,7 +4,6 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +15,7 @@ from deep_research.agent import ResearchAgent, _analyze_products, _compact_produ
 from deep_research.config import load_config
 from deep_research.db import Database
 from deep_research.llm import LLMClient
+from deep_research.model_backends import apply_backend, list_models as backend_list_models
 from deep_research.tools.scrape import scrape_page
 from deep_research.tools.search import web_search
 from web import kb_routes
@@ -55,6 +55,7 @@ app.include_router(kb_routes.router)
 class QueryRequest(BaseModel):
     query: str
     model: str | None = None
+    backend: str | None = None  # "ollama" | "llama_cpp" -- defaults to config.llm.backend
     session_id: str | None = None
     prioritize_kb: bool = False
 
@@ -69,18 +70,21 @@ class SessionResponse(BaseModel):
 # --- API Routes ---
 
 @app.get("/api/models")
-async def list_models():
-    """List available models from the Ollama server."""
-    ollama_url = config.llm.base_url.replace("/v1", "")
+async def list_models(backend: str | None = None):
+    """List available models for the given backend (or the configured
+    default if omitted) -- Ollama and llama.cpp expose different endpoints/
+    response shapes, see deep_research/model_backends.py."""
+    backend = backend or config.llm.backend
+    cfg = apply_backend(config.model_copy(deep=True), backend)
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{ollama_url}/api/tags")
-            resp.raise_for_status()
-            data = resp.json()
-            models = [m["name"] for m in data.get("models", [])]
-            return {"models": models, "default": config.llm.model}
+        models = await backend_list_models(backend, cfg.llm.base_url)
+        # config.llm.model is a single global default that won't exist on
+        # every backend (e.g. "llama3" is neither an Ollama tag nor a
+        # llama.cpp model path) -- fall back to whatever's actually available.
+        default = cfg.llm.model if cfg.llm.model in models else (models[0] if models else "")
+        return {"models": models, "default": default, "backend": backend}
     except Exception as e:
-        return {"models": [], "default": config.llm.model, "error": str(e)}
+        return {"models": [], "default": "", "backend": backend, "error": str(e)}
 
 
 @app.get("/api/sessions")
@@ -119,11 +123,11 @@ async def delete_session(session_id: str):
 @app.post("/api/research")
 async def research(req: QueryRequest):
     """Run a research query and stream results via SSE."""
-    model = req.model or config.llm.model
+    backend = req.backend or config.llm.backend
 
-    # Create LLM client with selected model
-    cfg = config.model_copy()
-    cfg.llm.model = model
+    # Create LLM client for the selected backend + model
+    cfg = apply_backend(config.model_copy(deep=True), backend)
+    cfg.llm.model = req.model or cfg.llm.model
 
     return EventSourceResponse(
         _stream_research(cfg, req.query, req.session_id, req.prioritize_kb),

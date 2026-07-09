@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import sys
 
-import httpx
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
@@ -12,20 +11,14 @@ from deep_research.config import load_config
 from deep_research.db import Database
 from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
+from deep_research.model_backends import apply_backend, list_models
 
 console = Console()
 
 
-async def fetch_models(base_url: str) -> list[str]:
-    """Fetch available models from the Ollama server."""
-    # Ollama exposes /api/tags for model list
-    ollama_url = base_url.replace("/v1", "")
+async def fetch_models(backend: str, base_url: str) -> list[str]:
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{ollama_url}/api/tags")
-            resp.raise_for_status()
-            data = resp.json()
-            return [m["name"] for m in data.get("models", [])]
+        return await list_models(backend, base_url)
     except Exception as e:
         console.print(f"[yellow]Could not fetch models: {e}[/yellow]")
         return []
@@ -60,8 +53,13 @@ def prompt_model_selection(models: list[str], default: str) -> str:
 
 
 async def setup_config(args):
-    """Load config and optionally let user select a model."""
+    """Load config, resolve which backend (Ollama/llama.cpp) is active, and
+    optionally let the user select a model from that backend."""
     config = load_config(args.config)
+
+    backend = getattr(args, "backend", None) or config.llm.backend
+    apply_backend(config, backend)
+    console.print(f"[dim]Backend: {backend} ({config.llm.base_url})[/dim]")
 
     model = getattr(args, "model", None)
     if model:
@@ -69,9 +67,13 @@ async def setup_config(args):
         config.llm.model = model
     elif not getattr(args, "no_select", False):
         # Fetch and prompt for model selection
-        models = await fetch_models(config.llm.base_url)
+        models = await fetch_models(backend, config.llm.base_url)
         if models:
-            selected = prompt_model_selection(models, config.llm.model)
+            # config.llm.model is a single global default that won't exist on
+            # every backend (e.g. "llama3" is neither an Ollama tag nor a
+            # llama.cpp model path) -- fall back to whatever's actually available.
+            default = config.llm.model if config.llm.model in models else models[0]
+            selected = prompt_model_selection(models, default)
             config.llm.model = selected
             console.print(f"[bold]Using model:[/bold] {selected}")
         else:
@@ -194,6 +196,10 @@ def main():
         description="Deep Research — local LLM-powered research tool"
     )
     parser.add_argument("query", nargs="?", help="Research query")
+    parser.add_argument(
+        "--backend", choices=["ollama", "llama_cpp"],
+        help="Which local model server the agent talks to (default: config's llm.backend, 'ollama')",
+    )
     parser.add_argument(
         "--model", "-m", help="Model to use (skips selection prompt)"
     )

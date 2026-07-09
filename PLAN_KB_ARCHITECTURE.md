@@ -42,8 +42,11 @@ full-text and semantic search via Reciprocal Rank Fusion.
 
 **Local models:** llama.cpp (`llama-server`, OpenAI-compatible `/v1/*` plus native
 `/slots`/`/props`) runs extraction, verification, and report generation; Ollama runs
-embeddings (`nomic-embed-text`) and can also run the base chat agent. Both can hold
-models on the same GPU — see `HARDWARE.md` for VRAM tradeoffs.
+embeddings (`nomic-embed-text`). Both can hold models on the same GPU — see
+`HARDWARE.md` for VRAM tradeoffs. The interactive chat agent is switchable between
+either backend (`deep_research/model_backends.py`; `--backend` CLI flag or a toggle
+in the web UI next to the model picker) — it isn't tied to one the way the KB
+pipeline's per-role model assignment is.
 
 **Interfaces:** `cli/kb.py` (`deep-research-kb ...`) covers everything end-to-end; the
 web app (`web/app.py` + `web/kb_routes.py` + the Vue frontend) covers Research, History,
@@ -1169,6 +1172,22 @@ claim/evidence schema has stabilized.
      that predates this UI and was simply never visible in the CLI's own display
      order before now.)
 
+   **Follow-up: evidence context in the review queue.** User feedback after using the
+   page for real: seeing two bare claim sentences side by side with a similarity score
+   gave no way to actually judge whether they're duplicates — "like a random fact I'm
+   supposed to know off the top of my head." Fixed by surfacing each side's supporting
+   evidence (source title + the exact quoted excerpt) alongside the claim text, via a
+   new `get_claims_evidence_bulk` (same batched-lookup pattern as `get_entities_bulk`/
+   `get_claims_bulk`, to avoid reintroducing the N+1 query the earlier follow-up fixed).
+   Entities get their `entity_type` shown too. This immediately surfaced a real
+   precision problem in the underlying data, not just a UI gap: several "0.97 cosine"
+   claim_duplicate candidates turned out to be article-listing sidebar entries from the
+   same source page ("An article titled X was published on <date>") — textually
+   similar but not remotely duplicate facts — and a 0.967-scored pair ("140 bank
+   failures in 2009" vs. "157 bank failures in 2010") is obviously two distinct facts a
+   reviewer would now correctly reject, which they had no way to catch from the bare
+   text alone.
+
    **Follow-up: hardening pass.** Surveyed the KB pipeline (ingest, chunk, extract,
    resolve, verify, report) for missing error handling around local-model calls, since
    the feature set was now complete enough to make this worthwhile. Found and fixed:
@@ -1258,6 +1277,127 @@ claim/evidence schema has stabilized.
      `verify-claim` — confirmed the friendly message fires instead of a stack trace,
      and confirmed via grep that no other `RuntimeError` source exists that this catch
      could inappropriately swallow.
+
+   **Follow-up: numeric-mismatch filter for claim_duplicate candidates.** User feedback
+   after using the review queue's new evidence context (above): "140 bank failures in
+   2009" and "157 bank failures in 2010" were flagged as a 0.967-cosine claim_duplicate
+   candidate — both true, not duplicates. Structurally similar sentences ("X \<noun\> in
+   \<year\>") score high on embedding similarity regardless of the actual numbers inside
+   them, and this was a real, recurring source of false positives, not a one-off.
+   Added `_extract_numbers` (a regex over years/counts/dollar amounts/percentages,
+   comma thousands-separators normalized) to `resolution.py`; `generate_claim_resolution_
+   candidates` now suppresses a candidate when both claims contain numbers and share
+   none of them — a claim with no numbers at all doesn't trigger suppression, since
+   there's nothing to disagree with. One regex bug caught by its own unit test: the
+   first version's trailing `\.?\d*` greedily consumed an end-of-sentence period as if
+   it were a decimal point ("2009." != "2009"), which would have silently broken
+   matching for any number at the end of a sentence — fixed to `(?:\.\d+)?`, only
+   consuming a decimal point when at least one digit follows it.
+   Checked the real KB after implementing: 53 of 203 open `claim_duplicate` candidates
+   would now be suppressed. Retroactively rejected all 53 through `merge.
+   review_and_execute` (the same path the CLI/web review UI use — no merge happens on
+   a reject either way, so this only marks them reviewed) after confirming with the
+   user first, since this modifies real review-queue state rather than just changing
+   behavior for future candidates. The original bank-failures pair the user reported
+   turned out to already be rejected (`reviewed_by: web_ui`) from before this fix —
+   confirming the cleanup script correctly only touched still-open rows, not
+   already-reviewed ones.
+
+   **Follow-up: review-queue explanations.** User feedback: the page showed a bare A/B
+   pair and a score with no explanation of what judgment was actually being asked for —
+   "like a random fact I'm supposed to know off the top of my head." Added a per-tab
+   guidance callout (`ResolutionCandidatesView.vue`) explaining, for each candidate
+   type, what accept/reject actually mean and what to look for — e.g. the claims tab
+   now explicitly says a high score means similar *wording*, not matching facts, and
+   points at the evidence excerpts below to check the real numbers/dates/names.
+   Tooltips on the score (what the matching method means) and the accept/reject
+   buttons (accept means something different for a contradiction — record, not merge —
+   than for a duplicate) round this out. The intro text also now says explicitly that
+   rejecting is always a safe no-op, to reduce hesitation when unsure.
+
+   **Follow-up: entity fuzzy-match false positives (dates and generic words).** User
+   feedback after the entity_duplicate tab's evidence context: the whole date fleet
+   ("June 22, 2026" vs. "June 29, 2026", scored 0.917 by trigram) and several
+   generic-word matches ("bank" flagged against every organization containing "bank",
+   "economy" against "British industrial economy") were showing up as candidates
+   despite obviously being different things. Two fixes in `resolution.py`:
+   - `NO_FUZZY_MATCH_ENTITY_TYPES = {"date"}` — two different dates are never "the
+     same" fuzzy-adjacent entity the way a nickname or acronym might be (an identical
+     date already auto-merges via the exact-match tier), so fuzzy matching on dates
+     only ever produces noise. `_generate_entity_candidates` skips the whole
+     `list_entities` query for date-typed entities now, not just the comparison.
+   - `FUZZY_SUBSTRING_MIN_LENGTH_RATIO = 0.5` — a substring match where the shorter
+     name is much shorter than the longer one is usually a generic word buried in a
+     more specific name ("bank" inside "Silicon Valley Bank"), not the same thing
+     referred to two ways. Deliberately **not** applied to `entity_type == "person"`:
+     computed the actual length ratios for every real candidate in the KB first, and a
+     blanket ratio filter would have wrongly suppressed genuinely valuable low-ratio
+     matches like "Clayton" / "Christopher Clayton" (ratio 0.37) and "Coppola" /
+     "Antonio Coppola" (0.47) — a bare surname matching someone's full name is a
+     common, high-value pattern specifically for people, unlike organizations/concepts
+     where a short generic word matching a specific longer name is usually noise, not
+     signal.
+   Checked the real KB: 19 of 32 open `entity_duplicate` candidates would now be
+   suppressed (all 6 date pairs, plus the worst generic-word offenders — "bank",
+   "economy", "Yale", "CNBC", "fiber", "2008" each matched against several unrelated,
+   more specific names). Borderline cases (e.g. "unemployment" / "unemployment rate",
+   "bank" / "banks", "investors" / "human investors") deliberately remain open for
+   human judgment rather than being over-aggressively filtered. Retroactively rejected
+   all 19 through `merge.review_and_execute` after confirming with the user first,
+   same pattern as the claims cleanup above.
+
+   **Follow-up: concept-vs-metric suffix filter, then generalized.** User follow-up
+   after the fix above: "unemployment" / "unemployment rate" was still showing up.
+   First pass added `_is_concept_vs_specific_metric`: suppress a substring match when
+   the longer name is exactly the shorter name plus one trailing word from a fixed
+   metric-word list (rate, level, index, ratio, price, cost, capitalization, ...).
+   Checked the real KB, retroactively rejected the 2 matching pairs.
+
+   User followed up again: "bank"/"banks" and "capital cycle theory"/"capital cycle"
+   still showing up. This showed the fixed word-list approach doesn't generalize — a
+   single qualifying word makes something a different concept *regardless of which
+   word it is* ("theory" here, not just "rate"/"level"/etc.), and plain pluralization
+   of a bare generic noun ("bank" → "banks") wasn't handled at all (initially assessed
+   as a genuine duplicate correctly left for review — the user's continued reports
+   made clear that assessment was wrong for this KB's data). Replaced the fixed word
+   list with two general, word-list-free rules:
+   - `_is_trivial_plural`: `longer == shorter + "s"/"es"` AND `shorter` is a single
+     bare word (no space) — "bank"→"banks" suppressed, but "data center"→"data
+     centers" (a real, specific multi-word concept pluralizing) still matches, since
+     requiring no-space in `shorter` distinguishes a generic noun from a specific
+     phrase.
+   - `_is_trivial_qualifier`: `longer`'s words are exactly `shorter`'s words plus one
+     extra word at the start or end, for *any* word — covers "capital cycle" +
+     "theory", "financial" + "regulators", "unemployment" + "rate", "US equity market"
+     + "capitalization" uniformly, superseding the old fixed-list version entirely.
+   Both are gated to non-`person` types, same as the ratio filter, since the same
+   logic would wrongly suppress genuinely valuable low-word-count person matches
+   ("Christopher" + "Clayton", "Antonio" + "Coppola") that this whole line of fixes
+   depends on preserving.
+   Checked the real KB: 8 more pairs now suppressed, leaving exactly the 3 genuine
+   person matches (Coppola/Antonio Coppola, Clayton/Christopher Clayton, Jeremy
+   Grantham/Grantham) as the only open `entity_duplicate` candidates, down from an
+   original 32. Retroactively rejected all 8, same pattern as every cleanup above.
+
+   **Follow-up: Topics page stuck on "Loading...".** User-reported bug: navigating to
+   a specific topic never rendered — just stayed on "Loading..." indefinitely. Root
+   cause: `web/kb_routes.py`'s `_serialize` helper (used by every route that returns a
+   raw claim/entity dict — topics, timeline, claims, sources, preferred-source) didn't
+   know how to handle the `embedding` column added in step 8. Once claims actually had
+   real `pgvector.Vector` values (post-backfill; previously always `NULL`/`None`, which
+   happens to encode as JSON `null` just fine — that's why this wasn't caught when
+   step 8 first landed), FastAPI's `jsonable_encoder` failed with a `TypeError` trying
+   to serialize the `Vector` object, and Starlette's default error handler returned
+   plain text ("Internal Server Error"), not JSON. The frontend's `resp.json()` then
+   threw a JSON parse error inside `Promise.all(...)` in `TopicDetailView.vue`'s
+   `loadAll()`, which meant execution never reached the `loading.value = false` at the
+   end — silently stuck forever, no visible error. Fixed by teaching `_serialize` to
+   convert a `Vector` to `None` (dropped rather than sent as a raw 768-float list —
+   no frontend view uses a claim's embedding, and sending it would needlessly bloat
+   every timeline/claims response). Verified live: `/api/kb/topics/{id}/timeline` and
+   `/claims` both went from 500 to 200, and a fresh Playwright run confirmed the page
+   actually renders the full timeline (not just a non-500 response) with zero console
+   errors.
 
 Important notes:
 
