@@ -91,16 +91,34 @@ async def _classify_relationship(llm: LLMClient, claim_text: str, other_text: st
 
 
 async def _rank_candidates_by_similarity(
-    config: Config, claim_text: str, candidates: list[dict],
+    config: Config, claim: dict, candidates: list[dict],
 ) -> list[tuple[dict, float]]:
+    """Step 8: claims are embedded once at creation time (resolution.py's
+    embed_new_claims) and persisted, so both the target claim and its
+    candidates almost always already carry an embedding here -- this only
+    falls back to a live embed_texts call for the rare claim that predates
+    that feature and hasn't been backfilled yet."""
     if not candidates:
         return []
     base_url = config.kb.embedding_base_url
     model = config.kb.embedding_model
-    vectors = await embed_texts([claim_text] + [c["canonical_text"] for c in candidates], base_url, model)
-    target_vec, other_vecs = vectors[0], vectors[1:]
+
+    target_vec = claim["embedding"].to_list() if claim.get("embedding") is not None else None
+    missing = [c for c in candidates if c.get("embedding") is None]
+    to_embed_texts = ([claim["canonical_text"]] if target_vec is None else []) + [
+        c["canonical_text"] for c in missing
+    ]
+    if to_embed_texts:
+        fresh_vectors = await embed_texts(to_embed_texts, base_url, model)
+        if target_vec is None:
+            target_vec = fresh_vectors[0]
+            fresh_vectors = fresh_vectors[1:]
+        for c, v in zip(missing, fresh_vectors):
+            c["_vec"] = v
+
     scored = [
-        (c, cosine(target_vec, v)) for c, v in zip(candidates, other_vecs)
+        (c, cosine(target_vec, c["_vec"] if "_vec" in c else c["embedding"].to_list()))
+        for c in candidates
     ]
     scored = [(c, s) for c, s in scored if s >= CANDIDATE_SIMILARITY_FLOOR]
     scored.sort(key=lambda pair: pair[1], reverse=True)
@@ -190,7 +208,7 @@ async def verify_claim(
     try:
         # Phase 1: search the KB's own data first (decision 23, hybrid retrieval).
         internal_candidates = await kb_db.get_claims_independent_of(list(own_source_ids), claim_id)
-        ranked = await _rank_candidates_by_similarity(config, claim["canonical_text"], internal_candidates)
+        ranked = await _rank_candidates_by_similarity(config, claim, internal_candidates)
         await _examine_candidates(kb_db, config, llm, claim, ranked, budget, examined_source_ids, contradiction_ids)
 
         # Phase 2: fall back to the internet only if internal coverage was thin
@@ -214,7 +232,7 @@ async def verify_claim(
 
                 source = await kb_db.get_source(ingest_result.source_id)
                 version = await kb_db.get_source_version(ingest_result.version_id)
-                chunk_result = await build_artifact_for_version(kb_db, snapshot_store, source, version)
+                chunk_result = await build_artifact_for_version(kb_db, snapshot_store, source, version, config=config)
                 if chunk_result.chunk_count == 0:
                     continue
 
@@ -227,7 +245,7 @@ async def verify_claim(
                 new_source_claims = await kb_db.get_claims_independent_of(
                     list(examined_source_ids), claim_id,
                 )
-                new_ranked = await _rank_candidates_by_similarity(config, claim["canonical_text"], new_source_claims)
+                new_ranked = await _rank_candidates_by_similarity(config, claim, new_source_claims)
                 await _examine_candidates(
                     kb_db, config, llm, claim, new_ranked, budget, examined_source_ids, contradiction_ids,
                 )

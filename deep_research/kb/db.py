@@ -24,10 +24,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
+from pgvector.asyncpg import register_vector
 
 from deep_research.kb.chunking import normalize_name, normalize_ws
 
 SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE IF NOT EXISTS source_types (
     id SERIAL PRIMARY KEY,
     code TEXT NOT NULL UNIQUE,
@@ -149,12 +152,21 @@ CREATE TABLE IF NOT EXISTS artifact_chunks (
     UNIQUE(artifact_id, chunk_index)
 );
 
+-- Step 8 (embeddings / vector retrieval): nomic-embed-text is a 768-dim model.
+-- Nullable because chunks ingested before this feature (or embedded before the
+-- background job catches up) simply have no vector yet -- semantic search and
+-- resolution candidate generation both skip rows where this is NULL rather
+-- than treating it as an error.
+ALTER TABLE artifact_chunks ADD COLUMN IF NOT EXISTS embedding vector(768);
+
 CREATE INDEX IF NOT EXISTS idx_artifact_chunks_artifact
     ON artifact_chunks(artifact_id, page_number);
 CREATE INDEX IF NOT EXISTS idx_artifact_chunks_time
     ON artifact_chunks(artifact_id, time_start_seconds);
 CREATE INDEX IF NOT EXISTS idx_artifact_chunks_tsv
     ON artifact_chunks USING GIN(chunk_tsv);
+CREATE INDEX IF NOT EXISTS idx_artifact_chunks_embedding
+    ON artifact_chunks USING hnsw (embedding vector_cosine_ops);
 
 -- Canonical entities. UNIQUE(entity_type, normalized_name) *is* the exact-match
 -- auto-merge tier from decision 25 — INSERT ... ON CONFLICT DO NOTHING + a
@@ -240,6 +252,13 @@ CREATE TABLE IF NOT EXISTS claims (
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_notes JSONB;
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS merged_into_claim_id TEXT REFERENCES claims(id);
 CREATE INDEX IF NOT EXISTS idx_claims_merged_into ON claims(merged_into_claim_id);
+
+-- Step 8: same embedding column as artifact_chunks, same nullable-until-embedded
+-- contract. Persisting this replaces resolution.py's previous behavior of
+-- re-embedding every claim in the KB on every single resolution run.
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS embedding vector(768);
+CREATE INDEX IF NOT EXISTS idx_claims_embedding
+    ON claims USING hnsw (embedding vector_cosine_ops);
 
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
 CREATE INDEX IF NOT EXISTS idx_claims_event ON claims(event_id);
@@ -458,13 +477,18 @@ async def _register_jsonb_codec(conn: asyncpg.Connection) -> None:
     )
 
 
+async def _register_pool_codecs(conn: asyncpg.Connection) -> None:
+    await _register_jsonb_codec(conn)
+    await register_vector(conn)
+
+
 class KBDatabase:
     def __init__(self, dsn: str):
         self.dsn = dsn
         self.pool: asyncpg.Pool | None = None
 
     async def init(self):
-        self.pool = await asyncpg.create_pool(self.dsn, init=_register_jsonb_codec)
+        self.pool = await asyncpg.create_pool(self.dsn, init=_register_pool_codecs)
         async with self.pool.acquire() as conn:
             await conn.execute(SCHEMA)
             for code, label in SOURCE_TYPES:
@@ -870,6 +894,48 @@ class KBDatabase:
             )
         return [dict(r) for r in rows]
 
+    async def set_chunk_embedding(self, chunk_id: str, embedding: list[float]) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE artifact_chunks SET embedding = $1 WHERE id = $2", embedding, chunk_id)
+
+    async def list_chunks_missing_embedding(self, limit: int = 5000) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT c.* FROM artifact_chunks c JOIN artifacts a ON a.id = c.artifact_id "
+                "WHERE c.embedding IS NULL AND a.is_current = TRUE ORDER BY c.created_at LIMIT $1",
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def search_chunks_semantic(self, embedding: list[float], limit: int = 20) -> list[dict]:
+        """Step 8's counterpart to search_chunks: nearest neighbors by cosine
+        similarity via the HNSW index, over current-generation chunks with an
+        embedding. Same output shape as search_chunks (minus the ts_headline
+        snippet, which needs a text query, not a vector) so callers can merge
+        both result sets uniformly."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    c.id AS chunk_id, c.chunk_index, c.page_number,
+                    c.time_start_seconds, c.time_end_seconds,
+                    c.chunk_text,
+                    a.id AS artifact_id, a.artifact_type,
+                    sv.id AS source_version_id, sv.version_number,
+                    s.id AS source_id, s.title AS source_title, s.canonical_uri,
+                    1 - (c.embedding <=> $1) AS score
+                FROM artifact_chunks c
+                JOIN artifacts a ON a.id = c.artifact_id AND a.is_current = TRUE
+                JOIN source_versions sv ON sv.id = a.source_version_id
+                JOIN sources s ON s.id = sv.source_id
+                WHERE c.embedding IS NOT NULL
+                ORDER BY c.embedding <=> $1
+                LIMIT $2
+                """,
+                embedding, limit,
+            )
+        return [dict(r) for r in rows]
+
     # -- entities/events/claims (build order step 4) ---------------------
 
     async def get_or_create_entity(
@@ -1031,6 +1097,35 @@ class KBDatabase:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT * FROM claims {merged_clause} ORDER BY updated_at DESC LIMIT $1", limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def set_claim_embedding(self, claim_id: str, embedding: list[float]) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE claims SET embedding = $1 WHERE id = $2", embedding, claim_id)
+
+    async def list_claims_missing_embedding(self, limit: int = 5000) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM claims WHERE embedding IS NULL AND merged_into_claim_id IS NULL "
+                "ORDER BY created_at LIMIT $1",
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def find_similar_claims(
+        self, claim_id: str, embedding: list[float], limit: int = 10,
+    ) -> list[dict]:
+        """Nearest neighbors by cosine similarity via the HNSW index (step 8),
+        excluding the claim itself and already-merged rows. `<=>` is pgvector's
+        cosine *distance* operator (0 = identical, 2 = opposite), so similarity
+        is 1 - distance."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT *, 1 - (embedding <=> $1) AS similarity FROM claims "
+                "WHERE id != $2 AND embedding IS NOT NULL AND merged_into_claim_id IS NULL "
+                "ORDER BY embedding <=> $1 LIMIT $3",
+                embedding, claim_id, limit,
             )
         return [dict(r) for r in rows]
 

@@ -18,7 +18,7 @@ from difflib import SequenceMatcher
 
 from deep_research.config import Config
 from deep_research.kb.db import KBDatabase
-from deep_research.kb.embeddings import cosine, embed_texts
+from deep_research.kb.embeddings import embed_texts
 
 MIN_FUZZY_ENTITY_NAME_LENGTH = 4
 FUZZY_ENTITY_TRIGRAM_THRESHOLD = 0.82
@@ -70,42 +70,59 @@ async def _generate_entity_candidates(kb_db: KBDatabase, entity_row: dict) -> in
     return count
 
 
+async def embed_new_claims(kb_db: KBDatabase, config: Config, new_claim_ids: list[str]) -> None:
+    """Step 8: embeds and persists each newly-promoted claim once, at creation
+    time, so candidate generation (below) and future resolution runs never
+    need to re-embed it again. Best-effort — if the embedding backend (Ollama)
+    is unreachable, claims are simply left with embedding=NULL and picked up
+    later by the `backfill-embeddings` CLI command; embeddings are a retrieval/
+    resolution enhancement, not something that should block promotion."""
+    if not new_claim_ids:
+        return
+    try:
+        new_claims = [await kb_db.get_claim(cid) for cid in new_claim_ids]
+        vectors = await embed_texts(
+            [c["canonical_text"] for c in new_claims],
+            config.kb.embedding_base_url, config.kb.embedding_model,
+        )
+        for claim, vector in zip(new_claims, vectors):
+            await kb_db.set_claim_embedding(claim["id"], vector)
+    except Exception:
+        pass
+
+
 async def generate_claim_resolution_candidates(
     kb_db: KBDatabase, config: Config, new_claim_ids: list[str],
 ) -> int:
     """Embedding-similarity candidate generation for claims — the tier decision
     25 requires because lexical matching measured zero true positives in the
-    spike. Compares each newly-created claim against all existing claims;
-    matches above config.kb.claim_duplicate_threshold become resolution_candidates
-    (never auto-merged — the spike measured only 50% precision even at 0.85)."""
+    spike. Compares each newly-created claim against every other claim via the
+    HNSW nearest-neighbor index over persisted embeddings (embed_new_claims
+    above), instead of re-embedding the whole KB on every single resolution
+    run — the previous approach that became the actual bottleneck as the KB
+    grew. Matches above config.kb.claim_duplicate_threshold become
+    resolution_candidates (never auto-merged — the spike measured only 50%
+    precision even at 0.85)."""
     if not new_claim_ids:
         return 0
 
-    new_claims = [await kb_db.get_claim(cid) for cid in new_claim_ids]
-    all_claims = await kb_db.list_claims(limit=5000)
-    if len(all_claims) < 2:
-        return 0
-
-    base_url = config.kb.embedding_base_url
-    model = config.kb.embedding_model
     threshold = config.kb.claim_duplicate_threshold
-
-    new_vectors = await embed_texts([c["canonical_text"] for c in new_claims], base_url, model)
-    all_vectors = await embed_texts([c["canonical_text"] for c in all_claims], base_url, model)
-
     candidate_count = 0
-    for i, new_claim in enumerate(new_claims):
-        for j, other_claim in enumerate(all_claims):
-            if other_claim["id"] == new_claim["id"]:
-                continue
-            score = cosine(new_vectors[i], all_vectors[j])
-            if score >= threshold:
-                _, created = await kb_db.add_claim_resolution_candidate(
-                    new_claim["id"], other_claim["id"], score, "embedding_cosine",
-                    reason=f"cosine={score:.3f}",
-                )
-                if created:
-                    candidate_count += 1
+    for claim_id in new_claim_ids:
+        claim = await kb_db.get_claim(claim_id)
+        if claim is None or claim.get("embedding") is None:
+            continue  # embedding failed best-effort at creation time; backfill will cover it
+        embedding = claim["embedding"].to_list()
+        neighbors = await kb_db.find_similar_claims(claim_id, embedding, limit=20)
+        for other in neighbors:
+            if other["similarity"] < threshold:
+                break  # find_similar_claims orders nearest-first (similarity descending)
+            _, created = await kb_db.add_claim_resolution_candidate(
+                claim_id, other["id"], other["similarity"], "embedding_cosine",
+                reason=f"cosine={other['similarity']:.3f}",
+            )
+            if created:
+                candidate_count += 1
     return candidate_count
 
 
@@ -193,5 +210,6 @@ async def resolve_and_promote(
 
     result.new_claim_count = len(new_claim_ids)
     result.new_claim_ids = new_claim_ids
+    await embed_new_claims(kb_db, config, new_claim_ids)
     result.claim_candidate_count = await generate_claim_resolution_candidates(kb_db, config, new_claim_ids)
     return result

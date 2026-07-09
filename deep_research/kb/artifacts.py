@@ -19,9 +19,11 @@ from bs4 import BeautifulSoup
 from docx import Document as DocxDocument
 from pypdf import PdfReader
 
+from deep_research.config import Config
 from deep_research.kb.canonical import sha256_bytes
 from deep_research.kb.chunking import chunk_text, chunk_transcript_segments, estimate_tokens
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.embeddings import embed_texts
 from deep_research.kb.storage import SnapshotStore
 from deep_research.tools.scrape import _extract_text
 
@@ -34,6 +36,7 @@ class ArtifactBuildResult:
     artifact_id: str | None = None
     artifact_created: bool = False
     chunk_count: int = 0
+    embedded_count: int = 0
 
 
 def _chunk_params_hash(chunk_size: int, extractor: str) -> str:
@@ -61,6 +64,7 @@ async def build_artifact_for_version(
     snapshot_store: SnapshotStore,
     source: dict,
     version: dict,
+    config: Config | None = None,
     chunk_size: int = 1200,
 ) -> ArtifactBuildResult:
     source_type_code = await kb_db.get_source_type_code(source["source_type_id"])
@@ -134,35 +138,56 @@ async def build_artifact_for_version(
         )
 
     chunk_count = 0
+    created_chunks = []
     if text is not None:
         for idx, (chunk_str, char_start, char_end) in enumerate(chunk_text(text, chunk_size)):
-            await kb_db.add_chunk(
+            created_chunks.append(await kb_db.add_chunk(
                 artifact_id, idx, chunk_str, sha256_bytes(chunk_str.encode()),
                 char_start=char_start, char_end=char_end,
                 token_estimate=estimate_tokens(chunk_str),
-            )
+            ))
             chunk_count += 1
     elif pages is not None:
         idx = 0
         for page_number, page_text in enumerate(pages, start=1):
             for chunk_str, char_start, char_end in chunk_text(page_text, chunk_size):
-                await kb_db.add_chunk(
+                created_chunks.append(await kb_db.add_chunk(
                     artifact_id, idx, chunk_str, sha256_bytes(chunk_str.encode()),
                     char_start=char_start, char_end=char_end,
                     token_estimate=estimate_tokens(chunk_str), page_number=page_number,
-                )
+                ))
                 idx += 1
                 chunk_count += 1
     else:
         for idx, (chunk_str, t_start, t_end) in enumerate(chunk_transcript_segments(segments, chunk_size)):
-            await kb_db.add_chunk(
+            created_chunks.append(await kb_db.add_chunk(
                 artifact_id, idx, chunk_str, sha256_bytes(chunk_str.encode()),
                 token_estimate=estimate_tokens(chunk_str),
                 time_start_seconds=t_start, time_end_seconds=t_end,
-            )
+            ))
             chunk_count += 1
+
+    embedded_count = 0
+    if created_chunks and config is not None:
+        try:
+            vectors = await embed_texts(
+                [c["chunk_text"] for c in created_chunks],
+                config.kb.embedding_base_url, config.kb.embedding_model,
+            )
+            for chunk_row, vector in zip(created_chunks, vectors):
+                await kb_db.set_chunk_embedding(chunk_row["id"], vector)
+                embedded_count += 1
+        except Exception:
+            # Best-effort: embeddings are a retrieval enhancement, not a
+            # correctness requirement -- ingestion must still succeed if the
+            # embedding backend (Ollama) is unreachable. `backfill-embeddings`
+            # picks up anything left NULL here.
+            pass
 
     if chunk_count == 0:
         return ArtifactBuildResult(status="empty", artifact_id=artifact_id, artifact_created=True, chunk_count=0)
 
-    return ArtifactBuildResult(status="chunked", artifact_id=artifact_id, artifact_created=True, chunk_count=chunk_count)
+    return ArtifactBuildResult(
+        status="chunked", artifact_id=artifact_id, artifact_created=True,
+        chunk_count=chunk_count, embedded_count=embedded_count,
+    )

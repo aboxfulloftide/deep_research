@@ -213,7 +213,7 @@ class ResearchAgent:
         """
         if not gathered_data and prioritize_kb and self.kb_db:
             console.print("[dim]Checking local knowledge base first...[/dim]")
-            kb_result = await kb_search(query[:200], self.kb_db)
+            kb_result = await kb_search(query[:200], self.kb_db, self.config)
             if kb_result and not kb_result.startswith("No results found"):
                 gathered_data = kb_result
 
@@ -356,7 +356,7 @@ class ResearchAgent:
             elif name == "kb_search":
                 if self.kb_db is None:
                     return "Local knowledge base is not available."
-                return await kb_search(args["query"], self.kb_db)
+                return await kb_search(args["query"], self.kb_db, self.config)
 
             elif name == "scrape_webpage":
                 url = args["url"]

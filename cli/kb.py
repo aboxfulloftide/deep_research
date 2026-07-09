@@ -7,6 +7,7 @@ from rich.table import Table
 from deep_research.config import load_config
 from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.embeddings import backfill_embeddings, embed_texts
 from deep_research.kb.extraction import run_extraction
 from deep_research.kb.ingest import ingest_file, ingest_web_page, ingest_youtube_video
 from deep_research.kb.merge import review_and_execute
@@ -162,7 +163,9 @@ async def cmd_chunk_source(args):
         console.print(f"[red]No ingested version found for source {match['id']}[/red]")
         return
 
-    result = await build_artifact_for_version(kb_db, snapshot_store, match, version, chunk_size=args.chunk_size)
+    result = await build_artifact_for_version(
+        kb_db, snapshot_store, match, version, config=config, chunk_size=args.chunk_size,
+    )
 
     verb = {
         "chunked": "[green]Chunked[/green]",
@@ -172,26 +175,35 @@ async def cmd_chunk_source(args):
     console.print(f"{verb} {match.get('title') or match['id']}")
     console.print(f"  artifact_id: {result.artifact_id} ({'new generation' if result.artifact_created else 'existing'})")
     console.print(f"  chunks:      {result.chunk_count}")
+    if result.status == "chunked":
+        console.print(f"  embedded:    {result.embedded_count}/{result.chunk_count}")
 
 
 async def cmd_search(args):
     config, kb_db, _ = _kb_setup(args)
     await kb_db.init()
 
-    results = await kb_db.search_chunks(args.query, limit=args.limit)
+    if args.semantic:
+        vectors = await embed_texts([args.query], config.kb.embedding_base_url, config.kb.embedding_model)
+        results = await kb_db.search_chunks_semantic(vectors[0], limit=args.limit)
+    else:
+        results = await kb_db.search_chunks(args.query, limit=args.limit)
     if not results:
         console.print("[dim]No matching chunks.[/dim]")
         return
 
     for r in results:
-        console.print(f"\n[bold]{r['source_title'] or r['canonical_uri']}[/bold]  [dim]({r['artifact_type']})[/dim]")
+        header = f"\n[bold]{r['source_title'] or r['canonical_uri']}[/bold]  [dim]({r['artifact_type']})[/dim]"
+        if args.semantic:
+            header += f"  [dim]score={r['score']:.3f}[/dim]"
+        console.print(header)
         location = f"chunk {r['chunk_index']}"
         if r["page_number"] is not None:
             location += f", page {r['page_number']}"
         if r["time_start_seconds"] is not None:
             location += f", t={r['time_start_seconds']:.0f}s"
         console.print(f"  [dim]{location}[/dim]")
-        console.print(f"  {r['snippet']}")
+        console.print(f"  {r['chunk_text'][:300] if args.semantic else r['snippet']}")
 
 
 async def cmd_extract_source(args):
@@ -497,6 +509,20 @@ async def cmd_backfill_topic(args):
     console.print(f"  sources suggested: {result.sources_suggested}")
 
 
+async def cmd_backfill_embeddings(args):
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+    result = await backfill_embeddings(kb_db, config)
+    console.print("Backfilled embeddings:")
+    console.print(f"  chunks embedded: {result.chunks_embedded}"
+                  + (f" [red]({result.chunks_failed} failed)[/red]" if result.chunks_failed else ""))
+    console.print(f"  claims embedded: {result.claims_embedded}"
+                  + (f" [red]({result.claims_failed} failed)[/red]" if result.claims_failed else ""))
+    if result.chunks_failed or result.claims_failed:
+        console.print("[yellow]Some batches failed -- is Ollama running? Re-run this command once it's up; "
+                      "already-embedded rows are skipped.[/yellow]")
+
+
 async def cmd_show_topic(args):
     config, kb_db, _ = _kb_setup(args)
     await kb_db.init()
@@ -623,6 +649,7 @@ def main():
     p_search = subparsers.add_parser("search", help="Full-text search over chunked content")
     p_search.add_argument("query")
     p_search.add_argument("--limit", type=int, default=10)
+    p_search.add_argument("--semantic", action="store_true", help="Use embedding similarity instead of full-text search")
     p_search.set_defaults(func=cmd_search)
 
     p_extract = subparsers.add_parser("extract-source", help="Extract claims/entities/events from a chunked source")
@@ -694,6 +721,11 @@ def main():
     )
     p_backfill.add_argument("topic_id")
     p_backfill.set_defaults(func=cmd_backfill_topic)
+
+    p_backfill_emb = subparsers.add_parser(
+        "backfill-embeddings", help="Embed any chunks/claims missing a vector (idempotent, safe to re-run)",
+    )
+    p_backfill_emb.set_defaults(func=cmd_backfill_embeddings)
 
     p_review_topic = subparsers.add_parser("review-topic-suggestion", help="Accept or reject a topic suggestion")
     p_review_topic.add_argument("topic_id")

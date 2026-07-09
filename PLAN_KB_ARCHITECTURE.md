@@ -912,6 +912,7 @@ claim/evidence schema has stabilized.
      the SPA has no server-side fallback route, so direct navigation/refresh on any
      client-side route (`/history`, `/topics`, ...) 404s — only navigation via in-app
      links works. Confirmed this predates step 7 (`/history` has the same issue).
+     Fixed after step 8: see the SPA fallback route note below.
 
    **Follow-up: report generation is now map-reduce, not truncation.** The first
    version bounded report input to a static guessed character budget and silently
@@ -998,8 +999,81 @@ claim/evidence schema has stabilized.
      in this KB, so created one synthetically and confirmed both claims' status
      updated with no merge/tombstone, then cleaned it up.
 
-8. Add **embeddings / vector retrieval only after** the source/claim/evidence model is
-   solid.
+8. **Done.** Add **embeddings / vector retrieval**, now that the source/claim/evidence
+   model is solid. Until this step, embeddings were computed ad hoc and thrown away —
+   `resolution.py`'s claim-duplicate candidate generation re-embedded every claim in the
+   KB on every single resolution run, and there was no vector-based retrieval at all;
+   `kb_search` (the agent-facing tool from the decision-23 hybrid-retrieval integration)
+   was pure keyword FTS. Implemented:
+   - **Postgres switched to the `pgvector/pgvector:pg16` image** (drop-in, same data
+     volume/binary-compatible) with `CREATE EXTENSION IF NOT EXISTS vector` baked into
+     `db.py`'s schema migration. Hit a collation-version mismatch on the image swap
+     (`2.41` vs. the OS's `2.36`) — fixed with `ALTER DATABASE ... REFRESH COLLATION
+     VERSION` plus a full `REINDEX DATABASE`, rather than ignoring the warning, since an
+     unresolved mismatch risks silently wrong text sort order on existing btree indexes.
+   - `artifact_chunks.embedding` / `claims.embedding` as nullable `vector(768)` columns
+     (`nomic-embed-text:v1.5`'s native dimension) with HNSW indexes
+     (`vector_cosine_ops`) — nullable because chunks/claims that predate this feature,
+     or whose write-time embed call failed, simply have no vector yet; every read path
+     treats `NULL` as "not yet embedded," never as an error. `pgvector`'s asyncpg codec
+     is registered pool-wide (same `init=` callback as the existing JSONB codec), so
+     Python code passes/receives plain float lists (`Vector.to_list()` on read).
+   - **Embedding at write time**: `build_artifact_for_version` (in `artifacts.py`, now
+     takes a `config` param) batch-embeds a source's chunks in one call right after
+     they're created; `resolution.py`'s new `embed_new_claims` does the same for
+     newly-promoted claims, right before candidate generation. Both are best-effort —
+     wrapped in a bare `except Exception: pass` — because embeddings are a retrieval/
+     resolution enhancement, not a correctness requirement; ingestion and promotion
+     must still succeed if Ollama is unreachable, leaving the row for
+     `backfill-embeddings` to pick up later.
+   - **`deep-research-kb backfill-embeddings`**: idempotent CLI command that embeds
+     every chunk/claim still missing a vector, in batches, with a failed/succeeded count
+     printed per type. Safe to re-run any time.
+   - **`generate_claim_resolution_candidates` rewritten** to compare each new claim
+     against the whole KB via `find_similar_claims` (an HNSW nearest-neighbor query,
+     `ORDER BY embedding <=> $1 LIMIT n`) over the *persisted* embeddings, instead of
+     re-embedding every claim in the KB on every run — the previous approach that was
+     the actual bottleneck as the KB grew. Verification's `_rank_candidates_by_similarity`
+     (step 6) got the same fix in passing, since it's the identical pattern: prefer each
+     claim's persisted embedding, only falling back to a live `embed_texts` call for the
+     rare not-yet-backfilled claim.
+   - **Hybrid chunk retrieval**: new `search_chunks_semantic` (cosine distance via the
+     HNSW index) alongside the existing FTS `search_chunks`. The agent-facing
+     `kb_search` tool now runs both and blends them with Reciprocal Rank Fusion (a
+     rank-based combination that needs no score-scale tuning between an FTS rank score
+     and a cosine similarity) — catches exact terms/numbers *and* paraphrased content,
+     where either signal alone misses one or the other. `deep-research-kb search` also
+     gained a `--semantic` flag for testing the vector path directly.
+   - Verified end-to-end against the real KB, not synthetic data: backfilled 624 chunks
+     and 240 pre-existing claims with zero embedding failures; confirmed a genuinely
+     paraphrased query ("stock market value is worth twice as much as the whole
+     economy") returns **zero** FTS results but correctly surfaces the real "Buffett
+     indicator... total stock market value is more than twice the size of the U.S.
+     economy" passage via semantic search, and that the hybrid `kb_search` blend
+     surfaces sensible results for both an exact-keyword query and a paraphrase query in
+     the same run. Confirmed write-time embedding fires immediately on a fresh chunking
+     pass (4/4 chunks embedded with no backfill needed) and on newly-promoted claims
+     (`embed_new_claims` + `generate_claim_resolution_candidates` directly tested,
+     producing a correct `cosine=0.863` match between two paraphrased unemployment-rate
+     claims). All test artifacts/claims/candidates created for verification were cleaned
+     up afterward.
+
+   **Follow-up: SPA fallback route.** Closed the gap flagged (not fixed) during step 7's
+   verification: `web/app.py` mounted the built Vue app with plain `StaticFiles`, which
+   only serves `index.html` for `/` — any other client-side route (`/topics`, `/history`,
+   ...) has no matching file on disk, so direct navigation or a page refresh 404'd
+   instead of letting Vue Router handle it. Fixed with a small `SPAStaticFiles`
+   subclass that catches the `StarletteHTTPException(404)` `StaticFiles.get_response`
+   raises on an unmatched path and retries with `index.html`, so the client-side router
+   takes over — while real assets (JS/CSS) and the FastAPI API routes are unaffected.
+   One bug caught during this fix: the first version caught `fastapi.HTTPException`,
+   which looked right but never actually triggered, because FastAPI's `HTTPException`
+   is a *subclass* of Starlette's, and `StaticFiles` (a Starlette component, not a
+   FastAPI one) raises the Starlette base class directly — catching the child class
+   doesn't catch a parent-class instance. Verified end-to-end with Playwright:
+   direct navigation to `/topics` and `/history` (fresh browser context, no prior
+   in-app navigation) both render the correct page with real data and zero console
+   errors, not just a 200 status code.
 
 Important notes:
 

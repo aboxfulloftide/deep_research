@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from deep_research.agent import ResearchAgent, _analyze_products, _compact_product_list, _URL_RE
 from deep_research.config import load_config
@@ -349,7 +350,23 @@ async def _tool_loop(llm: LLMClient, query: str, session_id: str, cfg, prioritiz
     yield {"event": "answer", "data": "Max steps reached. Could not complete research."}
 
 
+class SPAStaticFiles(StaticFiles):
+    """StaticFiles serves index.html for `/` but raises a 404 on any other
+    client-side route (e.g. /topics, /history) since no such file exists on
+    disk -- breaking direct navigation and page refresh in the Vue Router SPA.
+    Falls back to index.html on that 404 so the client-side router can take
+    over, while still serving real assets (JS/CSS/images) normally."""
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
+
+
 # Mount static frontend (built Vue app)
 frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
 if frontend_dist.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
+    app.mount("/", SPAStaticFiles(directory=str(frontend_dist), html=True), name="frontend")
