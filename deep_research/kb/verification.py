@@ -173,7 +173,15 @@ async def _examine_candidates(
         examined_source_ids.update(new_sources)
         budget.sources_examined += 1
 
-        result = await _classify_relationship(llm, claim["canonical_text"], other_claim["canonical_text"])
+        try:
+            result = await _classify_relationship(llm, claim["canonical_text"], other_claim["canonical_text"])
+        except Exception:
+            # A transient LLM failure on this one comparison shouldn't abort
+            # the whole verification and lose everything found so far —
+            # counts against the source-examined budget like any other
+            # inconclusive comparison, but the loop moves on to the next
+            # candidate instead of raising out of verify_claim entirely.
+            continue
         relationship = result.get("relationship")
         if relationship == "supports":
             budget.supports += 1
@@ -230,25 +238,34 @@ async def verify_claim(
                 if ingest_result.status == "failed" or ingest_result.source_id in examined_source_ids:
                     continue
 
-                source = await kb_db.get_source(ingest_result.source_id)
-                version = await kb_db.get_source_version(ingest_result.version_id)
-                chunk_result = await build_artifact_for_version(kb_db, snapshot_store, source, version, config=config)
-                if chunk_result.chunk_count == 0:
-                    continue
+                try:
+                    source = await kb_db.get_source(ingest_result.source_id)
+                    version = await kb_db.get_source_version(ingest_result.version_id)
+                    chunk_result = await build_artifact_for_version(
+                        kb_db, snapshot_store, source, version, config=config,
+                    )
+                    if chunk_result.chunk_count == 0:
+                        continue
 
-                artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
-                extraction_result = await run_extraction(kb_db, config, artifacts[0]["id"])
-                if extraction_result.observation_count == 0:
-                    continue
-                await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
+                    artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
+                    extraction_result = await run_extraction(kb_db, config, artifacts[0]["id"])
+                    if extraction_result.observation_count == 0:
+                        continue
+                    await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
 
-                new_source_claims = await kb_db.get_claims_independent_of(
-                    list(examined_source_ids), claim_id,
-                )
-                new_ranked = await _rank_candidates_by_similarity(config, claim, new_source_claims)
-                await _examine_candidates(
-                    kb_db, config, llm, claim, new_ranked, budget, examined_source_ids, contradiction_ids,
-                )
+                    new_source_claims = await kb_db.get_claims_independent_of(
+                        list(examined_source_ids), claim_id,
+                    )
+                    new_ranked = await _rank_candidates_by_similarity(config, claim, new_source_claims)
+                    await _examine_candidates(
+                        kb_db, config, llm, claim, new_ranked, budget, examined_source_ids, contradiction_ids,
+                    )
+                except Exception:
+                    # One bad web-fallback source (unparseable page, extraction
+                    # LLM hiccup) shouldn't abort the whole verification and
+                    # lose everything found so far -- treat it like any other
+                    # unusable source and move on to the next search result.
+                    continue
     finally:
         await llm.close()
 

@@ -1075,6 +1075,89 @@ claim/evidence schema has stabilized.
    in-app navigation) both render the correct page with real data and zero console
    errors, not just a 200 status code.
 
+   **Follow-up: web UI for resolution-candidate review.** `review-candidate` (the
+   merge-execution work above) was CLI-only; added a web equivalent so reviewers don't
+   need the terminal. New `GET/POST /api/kb/resolution-candidates[/{id}/review]` routes
+   in `web/kb_routes.py` (list open candidates by type, review via the same
+   `merge.review_and_execute` the CLI uses — one code path, two front ends) and a new
+   `ResolutionCandidatesView.vue` page ("Review" in the nav) with per-type tabs
+   (entities/claims/contradictions), accept/reject buttons, and an outcome banner
+   showing what actually happened (which row merged into which, or that a
+   contradiction was recorded — mirroring the CLI's output).
+   Two real bugs found and fixed while building/verifying this, not pre-existing:
+   - **Backend N+1 query**: the first version resolved each candidate's entity/claim
+     labels with one `get_entity`/`get_claim` call per row — fine at CLI scale, but the
+     list route needs this for the *whole* page at once, so a 200-candidate response
+     meant 200-400 sequential DB round trips. Fixed with `get_entities_bulk`/
+     `get_claims_bulk` (one `WHERE id = ANY($1)` query for the whole list, keyed by id)
+     — cut a multi-hundred-millisecond, N+1 response down to ~50ms measured directly.
+   - **Frontend race condition**, only exposed *because* of how slow the N+1 version
+     was: switching tabs fires a new fetch without waiting for the previous one, and
+     the slower "All" request (many more rows to enrich) could resolve *after* a faster,
+     smaller type-filtered request and silently overwrite it with stale/wrong data —
+     caught directly in Playwright (the "Entities" tab briefly showed claim text).
+     Fixed with a request-sequence guard: each `load()` call stamps a counter, and a
+     response is only applied if no newer request has started since. Verified with a
+     rapid tab-switch stress test (All → Entities with no wait in between) that the
+     final state is always correct.
+   - Verified end-to-end against the real KB via Playwright: entity/claim tabs show
+     correctly-typed content only, accepting an `entity_duplicate` candidate produced
+     the expected `merged` outcome and the row disappeared from the list, rejecting a
+     `claim_duplicate` candidate produced the expected `rejected` outcome, and the
+     rapid-switch stress test confirmed the race-condition fix. Zero console errors
+     throughout. (Noted, not fixed: the `reason` text for entity candidates can show
+     A/B in the opposite order from the `left_label`/`right_label` display — a
+     pre-existing cosmetic inconsistency in `resolution.py`'s candidate generation
+     that predates this UI and was simply never visible in the CLI's own display
+     order before now.)
+
+   **Follow-up: hardening pass.** Surveyed the KB pipeline (ingest, chunk, extract,
+   resolve, verify, report) for missing error handling around local-model calls, since
+   the feature set was now complete enough to make this worthwhile. Found and fixed:
+   - **No retry on transient failures anywhere.** Every `llm.chat`/`embed_texts` call
+     was single-shot — a momentary connection reset or 503 from llama.cpp/Ollama (e.g.
+     mid-restart) failed the calling operation outright with no attempt to recover.
+     Added `deep_research/retry.py` (`with_retries`, one shared helper — used by both
+     `LLMClient.chat` and `embed_texts` since duplicating the backoff/exception-
+     classification logic in each would've been the worse option at two call sites):
+     retries only `httpx.ConnectError/ConnectTimeout/ReadTimeout/PoolTimeout` and
+     502/503/504, with exponential backoff (1s, 2s), up to 3 attempts total. A genuine
+     4xx (bad request, unsupported params) still raises immediately — retrying a
+     request that's wrong on its face wastes time and hides the real bug. Verified in
+     isolation (immediate success, recovers after 2 injected failures, a 400 raises
+     with zero retries, a persistent failure raises after exhausting all 3 attempts)
+     and against the real llama.cpp/Ollama servers (both still work normally with the
+     wrapper in place).
+   - **`verify_claim` lost all progress on one transient failure.** Despite decision
+     24's whole "keep partial results, never abort" philosophy already being followed
+     for `web_search`/`ingest_web_page` failures, two spots weren't: the per-candidate
+     LLM comparison inside `_examine_candidates`, and the per-search-result web-fallback
+     block (chunk → extract → resolve → re-rank → re-examine) in `verify_claim`'s phase
+     2. Either raising (e.g. extraction's `detect_model` failing because llama.cpp is
+     down, or a malformed scraped page crashing the chunker) would propagate all the
+     way out of `verify_claim` — skipping the final `update_claim_verification` call
+     entirely and losing every support/contradiction found earlier in the *same* run,
+     not just the one that failed. Fixed by wrapping each with a
+     try/except-continue, matching the existing pattern one line above for
+     `web_search`. Verified by injecting a simulated failure directly (not just
+     confirming the happy path still works, which wouldn't prove the fix does
+     anything): a `ConnectionError` on the first of three LLM comparisons was caught
+     and the loop still examined all three; a `RuntimeError` raised from
+     `build_artifact_for_version` for every fake web-fallback result across two full
+     search rounds was caught every time, and `verify_claim` still returned normally
+     with `status="unverified"` (correct, given every source was fake/failing) instead
+     of raising. One test claim's real verification data was incidentally overwritten
+     by the injected-failure test (it calls the real `verify_claim`, not a mock) and
+     was restored afterward with a genuine re-verification.
+   - Noted but not implemented (lower priority, out of scope for this pass): report
+     generation's map-reduce batching is char-budget-based (an estimate), so a single
+     genuinely oversized block could in principle still hit a real context-exceeded
+     400 from the server despite batching — would need bisect-and-retry to handle
+     gracefully rather than crash. Also, CLI commands don't currently catch
+     `detect_model`/`run_extraction` failures with a clean error message — an
+     unreachable extraction server currently surfaces as a raw Python traceback rather
+     than a friendly message. Both are UX/robustness polish, not correctness bugs.
+
 Important notes:
 
 - do not start with embeddings first — for news/events/history, the

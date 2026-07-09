@@ -1,5 +1,5 @@
 <script setup>
-import { Search, History, FolderClock, Sun, Moon } from 'lucide-vue-next'
+import { Search, History, FolderClock, GitMerge, Sun, Moon } from 'lucide-vue-next'
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -59,6 +59,14 @@ function applyTheme() {
             >
               <FolderClock class="w-4 h-4" />
               Topics
+            </router-link>
+            <router-link
+              to="/resolution-queue"
+              class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              active-class="bg-gray-100 dark:bg-gray-700"
+            >
+              <GitMerge class="w-4 h-4" />
+              Review
             </router-link>
           </nav>
         </div>

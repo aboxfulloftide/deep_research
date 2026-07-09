@@ -976,6 +976,18 @@ class KBDatabase:
             row = await conn.fetchrow("SELECT * FROM entities WHERE id = $1", entity_id)
         return dict(row) if row else None
 
+    async def get_entities_bulk(self, entity_ids: list[str]) -> dict[str, dict]:
+        """One round trip for many entities, keyed by id -- for callers (like
+        the resolution-candidates list API) that would otherwise do an
+        `get_entity` per row and turn an N-row list into an N-round-trip
+        request."""
+        ids = list({i for i in entity_ids if i})
+        if not ids:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM entities WHERE id = ANY($1::text[])", ids)
+        return {r["id"]: dict(r) for r in rows}
+
     async def list_entities(
         self, entity_type: str | None = None, limit: int = 500, include_merged: bool = False,
     ) -> list[dict]:
@@ -1091,6 +1103,15 @@ class KBDatabase:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM claims WHERE id = $1", claim_id)
         return dict(row) if row else None
+
+    async def get_claims_bulk(self, claim_ids: list[str]) -> dict[str, dict]:
+        """One round trip for many claims, keyed by id -- see get_entities_bulk."""
+        ids = list({i for i in claim_ids if i})
+        if not ids:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM claims WHERE id = ANY($1::text[])", ids)
+        return {r["id"]: dict(r) for r in rows}
 
     async def list_claims(self, limit: int = 100, include_merged: bool = False) -> list[dict]:
         merged_clause = "" if include_merged else "WHERE merged_into_claim_id IS NULL"

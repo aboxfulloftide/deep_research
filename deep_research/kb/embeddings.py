@@ -14,6 +14,7 @@ import httpx
 
 from deep_research.config import Config
 from deep_research.kb.db import KBDatabase
+from deep_research.retry import with_retries
 
 
 async def embed_texts(
@@ -22,10 +23,15 @@ async def embed_texts(
     if not texts:
         return []
     prefixed = [f"{instruction_prefix}{t}" for t in texts]
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(f"{base_url}/api/embed", json={"model": model, "input": prefixed})
-        resp.raise_for_status()
-        return resp.json()["embeddings"]
+
+    async def _post() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(f"{base_url}/api/embed", json={"model": model, "input": prefixed})
+            resp.raise_for_status()
+            return resp
+
+    resp = await with_retries(_post)
+    return resp.json()["embeddings"]
 
 
 def cosine(a: list[float], b: list[float]) -> float:

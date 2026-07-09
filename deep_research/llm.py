@@ -5,6 +5,7 @@ from typing import AsyncIterator
 import httpx
 
 from deep_research.config import Config
+from deep_research.retry import with_retries
 
 # Pattern to strip reasoning/thinking tags from models like qwen3, deepseek
 _THINK_RE = re.compile(r"<think>[\s\S]*?</think>\s*", re.IGNORECASE)
@@ -52,16 +53,19 @@ class LLMClient:
         if use_tools:
             payload["tools"] = tools
 
-        try:
+        async def _post() -> httpx.Response:
             resp = await self._client.post("/chat/completions", json=payload)
             resp.raise_for_status()
+            return resp
+
+        try:
+            resp = await with_retries(_post)
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 400 and use_tools:
                 # Model doesn't support tool calling — retry without tools
                 self.supports_tools = False
                 payload.pop("tools", None)
-                resp = await self._client.post("/chat/completions", json=payload)
-                resp.raise_for_status()
+                resp = await with_retries(_post)
             else:
                 raise
 

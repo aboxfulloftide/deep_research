@@ -6,6 +6,7 @@ import ResearchView from './views/ResearchView.vue'
 import HistoryView from './views/HistoryView.vue'
 import TopicsView from './views/TopicsView.vue'
 import TopicDetailView from './views/TopicDetailView.vue'
+import ResolutionCandidatesView from './views/ResolutionCandidatesView.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -15,6 +16,7 @@ const router = createRouter({
     { path: '/session/:id', name: 'session', component: ResearchView },
     { path: '/topics', name: 'topics', component: TopicsView },
     { path: '/topics/:id', name: 'topic', component: TopicDetailView },
+    { path: '/resolution-queue', name: 'resolution-queue', component: ResolutionCandidatesView },
   ],
 })
 

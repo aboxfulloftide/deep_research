@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from deep_research.config import Config
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.merge import review_and_execute
 from deep_research.kb.reports import generate_topic_report
 from deep_research.kb.timeline import get_topic_timeline
 from deep_research.kb.topics import generate_topic_suggestions
@@ -57,6 +58,10 @@ class CreateTopicRequest(BaseModel):
 
 class ReviewRequest(BaseModel):
     decision: str  # "attached" | "rejected"
+
+
+class ReviewCandidateRequest(BaseModel):
+    decision: str  # "accepted" | "rejected"
 
 
 class AttachSourceRequest(BaseModel):
@@ -218,6 +223,55 @@ async def set_preferred_source(claim_id: str, req: PreferredSourceRequest):
         raise HTTPException(404, "Claim not found")
     updated = await kb_db.set_preferred_source_manual(claim_id, req.source_id, reviewed_by="web_ui")
     return {"claim": _serialize(updated)}
+
+
+def _enrich_candidates(candidates: list[dict], entities: dict[str, dict], claims: dict[str, dict]) -> list[dict]:
+    """Resolution candidates only store entity/claim IDs (see cli/kb.py's
+    list-resolution-candidates for the same pattern) — resolve them to a
+    human-readable label for display. `entities`/`claims` are pre-fetched in
+    bulk by the caller (one query each for the whole list) rather than one
+    lookup per row, which turned a single list call into hundreds of
+    sequential round trips once the KB had a few hundred candidates."""
+    enriched = []
+    for c in candidates:
+        row = _serialize(c)
+        if c.get("left_entity_id"):
+            left = entities.get(c["left_entity_id"])
+            right = entities.get(c["right_entity_id"])
+            row["left_label"] = left["name"] if left else "(deleted entity)"
+            row["right_label"] = right["name"] if right else "(deleted entity)"
+        elif c.get("left_claim_id"):
+            left = claims.get(c["left_claim_id"])
+            right = claims.get(c["right_claim_id"])
+            row["left_label"] = left["canonical_text"] if left else "(deleted claim)"
+            row["right_label"] = right["canonical_text"] if right else "(deleted claim)"
+        enriched.append(row)
+    return enriched
+
+
+@router.get("/resolution-candidates")
+async def list_resolution_candidates(status: str = "open", type: str | None = None, limit: int = 200):
+    candidates = await kb_db.list_resolution_candidates(candidate_type=type, status=status, limit=limit)
+    entity_ids = [c[k] for c in candidates for k in ("left_entity_id", "right_entity_id") if c.get(k)]
+    claim_ids = [c[k] for c in candidates for k in ("left_claim_id", "right_claim_id") if c.get(k)]
+    entities, claims = await kb_db.get_entities_bulk(entity_ids), await kb_db.get_claims_bulk(claim_ids)
+    return {"candidates": _enrich_candidates(candidates, entities, claims)}
+
+
+@router.post("/resolution-candidates/{candidate_id}/review")
+async def review_candidate(candidate_id: str, req: ReviewCandidateRequest):
+    candidate = await kb_db.get_resolution_candidate(candidate_id)
+    if candidate is None:
+        raise HTTPException(404, "Resolution candidate not found")
+    result = await review_and_execute(kb_db, candidate_id, req.decision, reviewed_by="web_ui")
+    return {
+        "candidate_id": result.candidate_id,
+        "decision": result.decision,
+        "candidate_type": result.candidate_type,
+        "action": result.action,
+        "winner_id": result.winner_id,
+        "loser_id": result.loser_id,
+    }
 
 
 @router.get("/sources")

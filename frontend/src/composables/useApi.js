@@ -175,10 +175,27 @@ export function useApi() {
     return resp.json()
   }
 
+  async function fetchResolutionCandidates(type = null, status = 'open') {
+    const params = new URLSearchParams({ status })
+    if (type) params.set('type', type)
+    const resp = await fetch(`${API_BASE}/kb/resolution-candidates?${params}`)
+    return resp.json()
+  }
+
+  async function reviewResolutionCandidate(candidateId, decision) {
+    const resp = await fetch(`${API_BASE}/kb/resolution-candidates/${candidateId}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    })
+    return resp.json()
+  }
+
   return {
     fetchModels, fetchSessions, fetchSession, deleteSession, streamResearch,
     fetchTopics, createTopic, fetchTopic, fetchTimeline, fetchTopicClaims,
     fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,
     backfillTopic, fetchReport, generateReport,
+    fetchResolutionCandidates, reviewResolutionCandidate,
   }
 }
