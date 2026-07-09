@@ -1,5 +1,63 @@
 # Knowledge Base / Local Research Tool Plan
 
+## Current State (as of 2026-07-09)
+
+This document is a planning + build log — it's dense, and much of what follows below
+(starting with "Current Goal") is the *original* planning discussion, written before any
+of it was built and superseded in places once real output showed a different approach
+was needed (e.g. the lexical/trigram resolution idea a few sections down was overturned
+by the step-0 spike). Read this section for what's actually true today; read the
+Decision Register for *why* each non-obvious choice was made; read the numbered Build
+Order steps for the full history of what was built, what broke, and how it was verified.
+
+**What this is now:** the original session-oriented chat research tool (SQLite chat
+sessions, Ollama/OpenAI-compatible client, SearXNG web search, page scraping) still
+exists and still works standalone, but now sits alongside a full knowledge base that
+persists everything it finds instead of discarding it after one session.
+
+**KB pipeline (build order steps 0-8, all done):** ingest a URL, YouTube video, or file
+→ chunk it → extract claims/entities/events/metrics with a local LLM → resolve
+(entities/claims/events auto-merge only on exact normalized-text match; everything else
+— fuzzy entity matches, embedding-similar claims, event matches — becomes a
+`resolution_candidates` row for human review, never auto-merged) → optionally verify a
+claim against independent sources (budgeted: KB search first, web fallback only if
+thin) → attach claims to topics (explicit or auto-suggested) → generate a timeline
+report per topic.
+
+**Storage:** PostgreSQL (`deep_research/kb/db.py`) for the KB — JSONB columns with a
+registered asyncpg codec, `TIMESTAMPTZ` throughout, native full-text search
+(`tsvector`/`websearch_to_tsquery`), and `pgvector` for embedding-based semantic search
+(chunks and claims both get a persisted 768-dim embedding). Chat sessions still use the
+original separate SQLite db — that split is intentional, not a migration in progress.
+
+**Merge execution:** accepting an `entity_duplicate`/`claim_duplicate` candidate
+(`deep_research/kb/merge.py`) actually reassigns evidence/metrics/topic links to a
+picked winner and tombstones the loser (never hard-deleted); accepting a
+`claim_contradiction` just updates both claims' status, no merge. Reviewable via CLI
+(`deep-research-kb review-candidate`) or the web UI's "Review" page.
+
+**Retrieval:** the chat agent (`deep_research/agent.py`) has a user-facing toggle to
+check the local KB first or start with a live web search. KB search itself blends
+full-text and semantic search via Reciprocal Rank Fusion.
+
+**Local models:** llama.cpp (`llama-server`, OpenAI-compatible `/v1/*` plus native
+`/slots`/`/props`) runs extraction, verification, and report generation; Ollama runs
+embeddings (`nomic-embed-text`) and can also run the base chat agent. Both can hold
+models on the same GPU — see `HARDWARE.md` for VRAM tradeoffs.
+
+**Interfaces:** `cli/kb.py` (`deep-research-kb ...`) covers everything end-to-end; the
+web app (`web/app.py` + `web/kb_routes.py` + the Vue frontend) covers Research, History,
+Topics (timeline/suggestions/report), and the resolution Review queue.
+
+**Testing:** `tests/` has a pytest suite (45 tests) covering resolution, merge, and
+verification/report resilience logic, using a dedicated `deep_research_kb_test`
+database (truncated between tests) so it never touches real data — see
+`tests/conftest.py`. Everything else is still verified manually/Playwright per change,
+not covered by the suite.
+
+**Not yet built / explicitly deferred:** Ollama isn't containerized in
+`docker-compose.yml` (relies on a host systemd service).
+
 ## Current Goal
 
 Evolve this repo from a session-oriented local research tool into a knowledge-base-driven system that can:
@@ -1149,14 +1207,57 @@ claim/evidence schema has stabilized.
      of raising. One test claim's real verification data was incidentally overwritten
      by the injected-failure test (it calls the real `verify_claim`, not a mock) and
      was restored afterward with a genuine re-verification.
-   - Noted but not implemented (lower priority, out of scope for this pass): report
-     generation's map-reduce batching is char-budget-based (an estimate), so a single
-     genuinely oversized block could in principle still hit a real context-exceeded
-     400 from the server despite batching — would need bisect-and-retry to handle
-     gracefully rather than crash. Also, CLI commands don't currently catch
-     `detect_model`/`run_extraction` failures with a clean error message — an
-     unreachable extraction server currently surfaces as a raw Python traceback rather
-     than a friendly message. Both are UX/robustness polish, not correctness bugs.
+   - Noted but not implemented at the time (both since done — see the follow-up
+     below): report generation's map-reduce batching is char-budget-based (an
+     estimate), so a single genuinely oversized block could in principle still hit a
+     real context-exceeded 400 from the server despite batching; and CLI commands
+     didn't catch `detect_model`/`run_extraction` connection failures with a clean
+     error message, surfacing a raw Python traceback instead.
+
+   **Follow-up: pytest test suite + the two remaining hardening items.** Until now
+   every change in this project was verified manually (CLI smoke tests, direct Python
+   scripts, Playwright) — real, but with no regression protection between sessions.
+   Added a real suite:
+   - `tests/conftest.py`'s `kb_db` fixture points at a dedicated `deep_research_kb_test`
+     database (never the real KB), truncating all content tables after each test
+     (reference tables `source_types`/`trust_tiers` are left alone, since they're
+     static lookup data seeded by `KBDatabase.init()`, not a test subject). Confirmed
+     directly that truncation actually isolates tests from each other and that the
+     real KB is untouched by a full suite run. Skips gracefully (not a hard failure)
+     if the test database isn't reachable, so pure-logic tests still run without
+     Postgres up. Creating the test database also surfaced the same collation-version
+     mismatch from the pgvector image swap (step 8) on the server's `template1` —
+     fixed the same way (`REFRESH COLLATION VERSION`), since every new database clones
+     from `template1` and would otherwise inherit the warning.
+   - 45 tests across `test_retry.py` (transient vs. non-transient classification),
+     `test_verification.py` (`_Budget`'s pure state machine, and a real regression
+     test injecting a failure into `_examine_candidates` to prove the hardening-pass
+     resilience fix actually works, not just that the happy path still passes),
+     `test_resolution.py` (`_entity_similarity`'s length-gate/substring/trigram
+     branches, entity candidate generation against a real DB, and claim embedding/
+     candidate generation with `embed_texts` mocked out so the SQL/threshold logic is
+     tested without needing a live embedding server), and `test_merge.py`
+     (winner/loser selection, tombstone + reassignment against a real DB, chain
+     resolution when a prior winner later becomes a loser, contradiction handling,
+     and `review_and_execute`'s dispatch per `candidate_type`).
+   - **Bisect-and-retry for oversized report batches**: `_batch_blocks` now returns
+     the original block lists (not pre-joined strings), so `_summarize_batch` can
+     split a batch in half and retry each half separately if the server rejects it
+     with the specific `exceed_context_size_error` type (checked precisely, not just
+     "any 400" — a genuinely malformed request shouldn't be retried). Verified with a
+     fake LLM that fails until a batch shrinks to a single block, proving the
+     bisection recursion actually recovers, plus a real end-to-end regression run
+     against the live 145-claim "AI Investment Bubble" topic (grown further since
+     step 7) to confirm the refactor didn't break the normal map-reduce path — it
+     completed correctly via 2 batches, no bisection needed this run.
+   - **Friendly CLI errors**: `cli/kb.py`'s single `asyncio.run(args.func(args))` call
+     site now catches `httpx.ConnectError`/`ConnectTimeout` and the one `RuntimeError`
+     in the whole codebase (`detect_model`'s "no models reported"), printing a clean
+     message with actionable next steps instead of a traceback. Verified live by
+     pointing `DEEP_RESEARCH_KB_EXTRACTION_LLM_BASE_URL` at a closed port and running
+     `verify-claim` — confirmed the friendly message fires instead of a stack trace,
+     and confirmed via grep that no other `RuntimeError` source exists that this catch
+     could inappropriately swallow.
 
 Important notes:
 

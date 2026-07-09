@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import sys
 
+import httpx
 from rich.console import Console
 from rich.table import Table
 
@@ -746,7 +748,21 @@ def main():
     p_pref_source.set_defaults(func=cmd_set_preferred_source)
 
     args = parser.parse_args()
-    asyncio.run(args.func(args))
+    try:
+        asyncio.run(args.func(args))
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        console.print(f"[red]Could not reach a local model server: {e}[/red]")
+        console.print(
+            "[dim]Check that llama-server / Ollama is running and reachable at the "
+            "configured base URL (DEEP_RESEARCH_KB_EXTRACTION_LLM_BASE_URL / "
+            "DEEP_RESEARCH_KB_EMBEDDING_BASE_URL, or config.yaml).[/dim]"
+        )
+        sys.exit(1)
+    except RuntimeError as e:
+        # e.g. detect_model()'s "No models reported by server at ..." when the
+        # server responds but has nothing loaded.
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,8 @@ call to make.
 
 from dataclasses import dataclass
 
+import httpx
+
 from deep_research.config import Config, LLMConfig
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.extraction import detect_context_size, detect_model
@@ -59,6 +61,7 @@ CHARS_PER_TOKEN_ESTIMATE = 4  # rough heuristic, used only to turn a token budge
 BATCH_RESPONSE_TOKEN_RESERVE = 700
 FINAL_RESPONSE_TOKEN_RESERVE = 2200
 MAX_REDUCE_ROUNDS = 5  # safety cap against a pathological non-converging reduce loop
+MAX_BISECTION_DEPTH = 6  # safety cap on _summarize_batch's split-in-half retries below
 
 
 @dataclass
@@ -100,31 +103,63 @@ def _budget_chars(context_tokens: int, reserve_tokens: int) -> int:
     return usable_tokens * CHARS_PER_TOKEN_ESTIMATE
 
 
-def _batch_blocks(blocks: list[str], budget_chars: int) -> list[str]:
-    """Greedily groups text blocks into batches (each returned as one joined
-    string) that fit within budget_chars. A single oversized block becomes
-    its own over-budget batch rather than being silently dropped."""
-    batches: list[str] = []
+def _batch_blocks(blocks: list[str], budget_chars: int) -> list[list[str]]:
+    """Greedily groups text blocks into batches (each a list of the original
+    blocks, not pre-joined — _summarize_batch needs the list form to bisect a
+    batch that turns out to be oversized) that fit within budget_chars. A
+    single oversized block becomes its own over-budget batch rather than
+    being silently dropped."""
+    batches: list[list[str]] = []
     current: list[str] = []
     current_len = 0
     for block in blocks:
         block_len = len(block) + 2
         if current and current_len + block_len > budget_chars:
-            batches.append("\n\n".join(current))
+            batches.append(current)
             current, current_len = [], 0
         current.append(block)
         current_len += block_len
     if current:
-        batches.append("\n\n".join(current))
+        batches.append(current)
     return batches
 
 
-async def _summarize_batch(llm: LLMClient, topic_name: str, batch_text: str) -> str:
-    resp = await llm.chat([
-        {"role": "system", "content": BATCH_SUMMARY_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Topic: {topic_name}\n\n{batch_text}"},
-    ])
-    return resp["choices"][0]["message"]["content"] or ""
+def _is_context_exceeded_error(exc: Exception) -> bool:
+    """llama.cpp returns a 400 with `type: exceed_context_size_error` when a
+    request genuinely doesn't fit — distinct from other 400s (bad params,
+    etc.) that bisecting and retrying wouldn't fix and would just waste calls
+    on."""
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 400:
+        return False
+    try:
+        return exc.response.json().get("error", {}).get("type") == "exceed_context_size_error"
+    except Exception:
+        return False
+
+
+async def _summarize_batch(llm: LLMClient, topic_name: str, blocks: list[str], depth: int = 0) -> str:
+    """Our batch sizing is a char-per-token *estimate* (CHARS_PER_TOKEN_ESTIMATE)
+    — it can still be wrong, and _batch_blocks explicitly allows a single
+    pathologically large block to become its own over-budget batch rather
+    than dropping it. If the server rejects a batch as genuinely too large for
+    its context, split the blocks in half and summarize each half separately
+    instead of failing the whole report — nothing gets dropped, it just costs
+    an extra LLM call. Only bisects on the specific exceed-context-size error;
+    any other failure (including a single unsplittable block) propagates."""
+    batch_text = "\n\n".join(blocks)
+    try:
+        resp = await llm.chat([
+            {"role": "system", "content": BATCH_SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Topic: {topic_name}\n\n{batch_text}"},
+        ])
+        return resp["choices"][0]["message"]["content"] or ""
+    except httpx.HTTPStatusError as e:
+        if not _is_context_exceeded_error(e) or len(blocks) <= 1 or depth >= MAX_BISECTION_DEPTH:
+            raise
+        mid = len(blocks) // 2
+        left = await _summarize_batch(llm, topic_name, blocks[:mid], depth + 1)
+        right = await _summarize_batch(llm, topic_name, blocks[mid:], depth + 1)
+        return f"{left}\n\n{right}"
 
 
 async def _reduce_to_single_input(

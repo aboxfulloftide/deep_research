@@ -25,9 +25,19 @@ dependencies = [
     "pgvector>=0.3",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
 [project.scripts]
 deep-research = "cli.main:main"
 deep-research-kb = "cli.kb:main"
 
 [tool.setuptools.packages.find]
 include = ["deep_research*", "cli*", "web*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
