@@ -20,7 +20,7 @@ from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import backfill_embeddings, embed_texts
 from deep_research.kb.extraction import run_extraction
-from deep_research.kb.ingest import ingest_file, ingest_web_page, ingest_youtube_video
+from deep_research.kb.ingest import ingest_file, ingest_pasted_text, ingest_web_page, ingest_youtube_video
 from deep_research.kb.merge import review_and_execute
 from deep_research.kb.reports import generate_topic_report
 from deep_research.kb.resolution import resolve_and_promote
@@ -98,6 +98,13 @@ class IngestUrlRequest(BaseModel):
 class IngestYoutubeRequest(BaseModel):
     url: str
     trust_tier: str | None = None
+
+
+class IngestConversationRequest(BaseModel):
+    text: str
+    title: str | None = None
+    trust_tier: str | None = None
+    threshold: float | None = None
 
 
 class ChunkSourceRequest(BaseModel):
@@ -441,6 +448,66 @@ async def ingest_file_route(file: UploadFile = File(...), trust_tier: str | None
     dest.write_bytes(await file.read())
     result = await ingest_file(dest, kb_db, snapshot_store, trust_tier_code=trust_tier)
     return {"result": asdict(result)}
+
+
+@router.post("/sources/ingest-conversation")
+async def ingest_conversation_route(req: IngestConversationRequest):
+    """Paste a chat conversation, get claims extracted (tagged with who said
+    them, via the conversation-turn chunker's section_label) and verified
+    against independent sources -- ingest, chunk, extract, and verify all in
+    one call, rather than the multi-step flow other source types use, since
+    the point of pasting a conversation is usually "just tell me what's true
+    in this," not building up a long-lived source incrementally."""
+    ingest_result = await ingest_pasted_text(
+        req.text, kb_db, snapshot_store, title=req.title, trust_tier_code=req.trust_tier,
+    )
+    if ingest_result.status == "failed":
+        raise HTTPException(400, ingest_result.error or "Ingestion failed")
+
+    source = await kb_db.get_source(ingest_result.source_id)
+    version = await kb_db.get_source_version(ingest_result.version_id)
+
+    chunk_result = await build_artifact_for_version(kb_db, snapshot_store, source, version, config=config)
+    if chunk_result.chunk_count == 0:
+        return {"source_id": source["id"], "claim_count": 0, "verified_count": 0, "claims": [],
+                "message": "No text found to extract claims from."}
+
+    artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
+    extraction_result = await run_extraction(kb_db, config, artifacts[0]["id"])
+
+    if extraction_result.observation_count > 0:
+        promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
+        await check_claims_against_topics(kb_db, promotion.new_claim_ids)
+
+    claims = await kb_db.list_claims_for_source(source["id"], limit=500)
+    speakers = await kb_db.get_claim_speakers_for_source(source["id"])
+
+    threshold = req.threshold if req.threshold is not None else config.kb.verification_importance_threshold
+    eligible = [
+        c for c in claims
+        if (c["importance_score"] or 0) >= threshold and c["verification_attempted_at"] is None
+    ]
+    outcomes = await verify_claims_concurrently(kb_db, config, eligible)
+    outcomes_by_id = {claim["id"]: (status, result) for claim, status, result in outcomes}
+
+    claim_results = []
+    for c in claims:
+        status, result = outcomes_by_id.get(c["id"], (c["status"], None))
+        claim_results.append({
+            "id": c["id"],
+            "canonical_text": c["canonical_text"],
+            "speakers": speakers.get(c["id"], []),
+            "status": status,
+            "importance_score": c["importance_score"],
+            "verified": c["id"] in outcomes_by_id,
+        })
+
+    return {
+        "source_id": source["id"],
+        "claim_count": len(claims),
+        "verified_count": len(outcomes),
+        "claims": claim_results,
+    }
 
 
 async def _resolve_source_or_404(source_id: str) -> dict:

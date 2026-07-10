@@ -22,6 +22,7 @@ from pypdf import PdfReader
 from deep_research.config import Config
 from deep_research.kb.canonical import sha256_bytes
 from deep_research.kb.chunking import chunk_text, chunk_transcript_segments, estimate_tokens
+from deep_research.kb.conversation import parse_conversation_turns
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import embed_texts
 from deep_research.kb.storage import SnapshotStore
@@ -69,6 +70,7 @@ async def build_artifact_for_version(
 ) -> ArtifactBuildResult:
     source_type_code = await kb_db.get_source_type_code(source["source_type_id"])
     raw_bytes = Path(version["snapshot_path"]).read_bytes()
+    turns = None
 
     if source_type_code in ("web", "html_file"):
         artifact_type, extractor = "clean_text", "bs4_extract_text_v1"
@@ -95,6 +97,12 @@ async def build_artifact_for_version(
         segments = json.loads(raw_bytes.decode("utf-8"))
         text = None
         pages = None
+    elif source_type_code == "conversation":
+        artifact_type, extractor = "conversation_turns", "conversation_turn_parser_v1"
+        turns = parse_conversation_turns(raw_bytes.decode("utf-8", errors="replace"))
+        text = None
+        pages = None
+        segments = None
     else:
         raise ValueError(f"No artifact extractor for source type: {source_type_code!r}")
 
@@ -104,6 +112,8 @@ async def build_artifact_for_version(
         content_for_hash = text.encode("utf-8")
     elif pages is not None:
         content_for_hash = "\f".join(pages).encode("utf-8")
+    elif turns is not None:
+        content_for_hash = json.dumps(turns, sort_keys=True).encode("utf-8")
     else:
         content_for_hash = json.dumps(segments, sort_keys=True).encode("utf-8")
     content_hash = sha256_bytes(content_for_hash)
@@ -155,6 +165,17 @@ async def build_artifact_for_version(
                     artifact_id, idx, chunk_str, sha256_bytes(chunk_str.encode()),
                     char_start=char_start, char_end=char_end,
                     token_estimate=estimate_tokens(chunk_str), page_number=page_number,
+                ))
+                idx += 1
+                chunk_count += 1
+    elif turns is not None:
+        idx = 0
+        for speaker, turn_text in turns:
+            for chunk_str, char_start, char_end in chunk_text(turn_text, chunk_size):
+                created_chunks.append(await kb_db.add_chunk(
+                    artifact_id, idx, chunk_str, sha256_bytes(chunk_str.encode()),
+                    char_start=char_start, char_end=char_end,
+                    token_estimate=estimate_tokens(chunk_str), section_label=speaker,
                 ))
                 idx += 1
                 chunk_count += 1

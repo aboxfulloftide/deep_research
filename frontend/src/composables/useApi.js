@@ -230,6 +230,19 @@ export function useApi() {
     return resp.json()
   }
 
+  async function ingestConversation(text, title = null, trustTier = null) {
+    const resp = await fetch(`${API_BASE}/kb/sources/ingest-conversation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, title, trust_tier: trustTier }),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to ingest conversation')
+    }
+    return resp.json()
+  }
+
   async function ingestFile(file, trustTier = null) {
     const formData = new FormData()
     formData.append('file', file)
@@ -341,7 +354,7 @@ export function useApi() {
     fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,
     backfillTopic, fetchReport, generateReport,
     fetchResolutionCandidates, reviewResolutionCandidate,
-    fetchSources, fetchSource, fetchSourceClaims, ingestUrl, ingestYoutube, ingestFile,
+    fetchSources, fetchSource, fetchSourceClaims, ingestUrl, ingestYoutube, ingestFile, ingestConversation,
     chunkSource, extractSource, verifySource, backfillEmbeddings,
     fetchClaims, fetchClaim, verifyClaim, setPreferredSource, searchChunks,
     fetchVerificationRuns, fetchCurrentVerificationRun, triggerVerificationRun,

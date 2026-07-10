@@ -262,6 +262,57 @@ async def ingest_youtube_video(
     )
 
 
+async def ingest_pasted_text(
+    text: str,
+    kb_db: KBDatabase,
+    snapshot_store: SnapshotStore,
+    title: str | None = None,
+    trust_tier_code: str | None = None,
+) -> IngestResult:
+    """For pasted content with no URL or file behind it (e.g. a chat
+    conversation copied out of another tool) -- identity is content-addressed
+    (pasting the exact same text again is a no-op "unchanged" version of the
+    same source, not a new one), unlike ingest_file's path-addressed
+    identity, since there's no path here at all."""
+    text = text.strip()
+    started_at = _now()
+    if not text:
+        return IngestResult(status="failed", error="No text provided")
+
+    content = text.encode("utf-8")
+    content_hash = sha256_bytes(content)
+    canonical_key = f"conversation:{content_hash}"
+    canonical_uri = f"pasted-conversation:{content_hash[:16]}"
+
+    source, source_created = await kb_db.get_or_create_source(
+        source_type_code="conversation",
+        canonical_uri=canonical_uri,
+        canonical_key=canonical_key,
+        title=title or (text[:80] + ("…" if len(text) > 80 else "")),
+        trust_tier_code=trust_tier_code,
+    )
+    source_id = source["id"]
+
+    version_row, version_created, pruned_ids = await _finalize_version(
+        kb_db, snapshot_store, source_id, content, content_hash, ".txt",
+        http_status=None, mime_type="text/plain", metadata=None,
+    )
+
+    await kb_db.add_fetch_attempt(
+        source_id=source_id, attempt_type="fetch", status="succeeded",
+        requested_uri=canonical_uri, source_version_id=version_row["id"],
+        started_at=started_at, completed_at=_now(),
+        metadata=None if version_created else {"note": "content_unchanged"},
+    )
+
+    return IngestResult(
+        status="ingested" if version_created else "unchanged",
+        source_id=source_id, source_created=source_created,
+        version_id=version_row["id"], version_created=version_created,
+        pruned_version_ids=pruned_ids,
+    )
+
+
 async def ingest_file(
     path: str | Path,
     kb_db: KBDatabase,

@@ -481,6 +481,7 @@ SOURCE_TYPES = [
     ("html_file", "Local HTML file"),
     ("docx", "Word document"),
     ("text", "Plain text document"),
+    ("conversation", "Pasted conversation"),
 ]
 
 TRUST_TIERS = [
@@ -1167,6 +1168,25 @@ class KBDatabase:
                 source_id, limit,
             )
         return [dict(r) for r in rows]
+
+    async def get_claim_speakers_for_source(self, source_id: str) -> dict[str, list[str]]:
+        """Which conversation speaker(s) (artifact_chunks.section_label,
+        set by the conversation-turn chunker) said each claim, for claims
+        with evidence from this source -- lets a pasted-conversation result
+        show who said what, not just that it was said. Empty for any other
+        source type (section_label is only set for conversation chunks)."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT ce.claim_id, ac.section_label "
+                "FROM claim_evidence ce "
+                "JOIN artifact_chunks ac ON ac.id = ce.artifact_chunk_id "
+                "WHERE ce.source_id = $1 AND ac.section_label IS NOT NULL",
+                source_id,
+            )
+        result: dict[str, list[str]] = {}
+        for r in rows:
+            result.setdefault(r["claim_id"], []).append(r["section_label"])
+        return result
 
     async def set_claim_embedding(self, claim_id: str, embedding: list[float]) -> None:
         async with self.pool.acquire() as conn:
