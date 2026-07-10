@@ -65,6 +65,20 @@ class KBConfig(BaseModel):
     verification_max_web_searches: int = 2
     verification_max_sources_examined: int = 3
     verification_importance_threshold: float = 0.8
+    # A web-fallback source only needs extraction run on the handful of
+    # chunks actually relevant to the claim being checked, not the whole
+    # page -- extracting a whole page is the same expensive full-source
+    # extraction pass used for deliberate ingestion, and on a long page can
+    # dump hundreds to (observed) 1000+ tangential claims into the KB just
+    # to check one fact. Chunks are ranked by embedding similarity to the
+    # claim first; only the top N get extracted.
+    verification_max_chunks_per_page: int = 3
+    # How many claims to verify concurrently in a batch (nightly sweep, or
+    # verifying every unverified claim from one source). Should match
+    # llama-server's --parallel so a batch actually uses both slots instead
+    # of leaving one idle -- see HARDWARE.md's "Verification bottleneck
+    # measurement" section for the concurrency test this was validated with.
+    verification_concurrency: int = 2
     # Report generation auto-detects the server's actual context window via
     # llama.cpp's /slots endpoint and batches (map-reduce) whatever doesn't
     # fit in one pass, rather than dropping content. This fallback is only
@@ -119,6 +133,8 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_KB_VERIFICATION_MAX_WEB_SEARCHES": ("kb", "verification_max_web_searches"),
         "DEEP_RESEARCH_KB_VERIFICATION_MAX_SOURCES_EXAMINED": ("kb", "verification_max_sources_examined"),
         "DEEP_RESEARCH_KB_VERIFICATION_IMPORTANCE_THRESHOLD": ("kb", "verification_importance_threshold"),
+        "DEEP_RESEARCH_KB_VERIFICATION_CONCURRENCY": ("kb", "verification_concurrency"),
+        "DEEP_RESEARCH_KB_VERIFICATION_MAX_CHUNKS_PER_PAGE": ("kb", "verification_max_chunks_per_page"),
         "DEEP_RESEARCH_KB_REPORT_CONTEXT_FALLBACK_TOKENS": ("kb", "report_context_fallback_tokens"),
     }
     data = config.model_dump()

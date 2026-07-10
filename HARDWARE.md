@@ -284,6 +284,64 @@ heavy model, and embeddings model loaded at the same time (build order steps 1, 
 6 — resolution, extraction pipeline, verification) — not because first-pass extraction
 quality needs it. RAM and storage are safe to buy anytime regardless.
 
+### Verification bottleneck measurement and `--parallel` test (2026-07-10)
+
+Timed two real claim verifications end-to-end (wall-clock breakdown by phase,
+instrumented in `deep_research/kb/verification.py`, persisted per-claim in
+`claims.verification_notes.timings`):
+
+| Phase | Run 1 (78.8s total) | Run 2 (172.1s total) |
+|---|---|---|
+| LLM extraction (of newly-scraped pages) | 67.7s (86%) | 157.2s (91%) |
+| LLM classify (supports/contradicts) | 6.5s (8%) | 8.4s (5%) |
+| Web search, scrape, embeddings, DB, chunking (combined) | ~4.6s (6%) | ~6.5s (4%) |
+
+**Finding: verification is GPU token-generation-bound, not I/O-bound.** LLM
+extraction of freshly-scraped web pages (the same extraction pipeline used
+for normal source ingestion, invoked live during the web-fallback phase)
+dominates wall time by a wide margin. Network I/O, embeddings, and the
+database are single-digit seconds combined even on a run that made 2 web
+searches and scraped/extracted multiple pages.
+
+Since a single claim's steps are inherently sequential (can't classify before
+extracting, can't extract before scraping), a second GPU doesn't speed up one
+claim's critical path — its value is running *multiple claims'* verification
+concurrently during a batch sweep (e.g. the nightly cron job).
+
+Tested this directly: `llama-server` was running with `--parallel 1`, so only
+one generation request could be served at a time regardless of queue depth.
+Raised it to `--parallel 2` (ctx-size must scale with it — llama.cpp splits
+`--ctx-size` across slots, so it was doubled from `4096` to `8192` to keep
+`4096` tokens per slot, same as before):
+
+```
+llama-server -m <model.gguf> --host 127.0.0.1 --port 8080 \
+  --ctx-size 8192 --parallel 2 --n-gpu-layers 999 --jinja
+```
+
+Result on the existing single `16 GB` card (`RTX 5060 Ti`):
+
+- VRAM: `10.5 GB` → `11.1 GB` used (`+~600 MB` for the second slot's KV
+  cache), `~4.7 GB` still free — comfortable headroom, no crowding of Ollama's
+  embedding model or anything else on the card.
+- Real concurrency test (2 chat-completion requests, 300 tokens each):
+  sequential = `15.03s` total; concurrent (`asyncio.gather`) = `8.54s` total —
+  close to the ideal ~2x throughput, confirming `--parallel 2` genuinely
+  serves two generations at once rather than silently queuing them.
+
+Practical implication: **the current single 16 GB card has more concurrency
+headroom left before a second GPU is needed.** `--parallel 2` (maybe `3`)
+fits today; a second card's main benefit for this project is raising that
+ceiling further, not fixing a bottleneck that's already hit. To actually
+benefit from `--parallel 2` for the nightly sweep, `run_verification_sweep`
+still needs to process claims concurrently instead of one at a time in a
+plain `for` loop — that change hasn't been made yet.
+
+Since `llama-server` has no systemd unit (manually launched, by choice — see
+`PLAN_KB_ARCHITECTURE.md`'s "Not yet built / explicitly deferred"), anyone
+restarting it by hand should use the `--ctx-size 8192 --parallel 2` command
+above, not the old `--ctx-size 4096 --parallel 1` one.
+
 ### Bottom-line recommendation
 
 If you want the shortest answer:

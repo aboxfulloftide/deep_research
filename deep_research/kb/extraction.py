@@ -130,20 +130,36 @@ def _run_signature(model: str) -> str:
 
 async def run_extraction(
     kb_db: KBDatabase, config: Config, artifact_id: str, force: bool = False,
+    chunk_ids: list[str] | None = None,
 ) -> ExtractionRunResult:
+    """`chunk_ids`, if given, restricts extraction to just those chunks
+    instead of the whole artifact -- used by verify_claim's web-fallback
+    phase, which only needs the handful of chunks relevant to the claim
+    being checked, not a full-source extraction pass (see
+    verification_max_chunks_per_page). A chunk-scoped run gets a signature
+    that can never match (or be matched by) a full-page extraction's
+    signature, and never consults/writes the reuse cache -- otherwise a
+    partial run could be mistaken later for "this artifact was already fully
+    extracted" and silently skip the rest of its chunks."""
     artifact = await kb_db.get_artifact(artifact_id)
     if artifact is None:
         raise ValueError(f"No such artifact: {artifact_id}")
 
     chunks = await kb_db.list_chunks(artifact_id)
+    if chunk_ids is not None:
+        wanted = set(chunk_ids)
+        chunks = [c for c in chunks if c["id"] in wanted]
     if not chunks:
         return ExtractionRunResult(status="empty", chunk_count=0)
 
     base_url = config.kb.extraction_llm_base_url
     model = config.kb.extraction_llm_model or await detect_model(base_url)
     run_signature = _run_signature(model)
+    if chunk_ids is not None:
+        scope_hash = hashlib.sha256(",".join(sorted(chunk_ids)).encode()).hexdigest()[:16]
+        run_signature += f":partial:{scope_hash}"
 
-    if not force:
+    if not force and chunk_ids is None:
         existing = await kb_db.find_extraction_run_by_signature(artifact_id, run_signature)
         if existing is not None:
             observations = await kb_db.list_observations(existing["id"])

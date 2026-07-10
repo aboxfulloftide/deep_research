@@ -193,11 +193,157 @@ export function useApi() {
     return resp.json()
   }
 
+  // --- Knowledge base (sources: ingest/chunk/extract/verify) ---
+
+  async function fetchSources(q = '', limit = 50) {
+    const params = new URLSearchParams({ q, limit })
+    const resp = await fetch(`${API_BASE}/kb/sources?${params}`)
+    return resp.json()
+  }
+
+  async function fetchSource(id) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}`)
+    if (!resp.ok) throw new Error('Source not found')
+    return resp.json()
+  }
+
+  async function fetchSourceClaims(id) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/claims`)
+    return resp.json()
+  }
+
+  async function ingestUrl(url, trustTier = null) {
+    const resp = await fetch(`${API_BASE}/kb/sources/ingest-url`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, trust_tier: trustTier }),
+    })
+    return resp.json()
+  }
+
+  async function ingestYoutube(url, trustTier = null) {
+    const resp = await fetch(`${API_BASE}/kb/sources/ingest-youtube`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, trust_tier: trustTier }),
+    })
+    return resp.json()
+  }
+
+  async function ingestFile(file, trustTier = null) {
+    const formData = new FormData()
+    formData.append('file', file)
+    if (trustTier) formData.append('trust_tier', trustTier)
+    const resp = await fetch(`${API_BASE}/kb/sources/ingest-file`, {
+      method: 'POST',
+      body: formData,
+    })
+    return resp.json()
+  }
+
+  async function chunkSource(id, chunkSize = 1200) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/chunk`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chunk_size: chunkSize }),
+    })
+    return resp.json()
+  }
+
+  async function extractSource(id, force = false) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/extract`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    })
+    return resp.json()
+  }
+
+  async function verifySource(id, force = false, threshold = null) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force, threshold }),
+    })
+    return resp.json()
+  }
+
+  async function backfillEmbeddings() {
+    const resp = await fetch(`${API_BASE}/kb/embeddings/backfill`, { method: 'POST' })
+    return resp.json()
+  }
+
+  // --- Knowledge base (claims: browse/verify/search) ---
+
+  async function fetchClaims(limit = 100) {
+    const resp = await fetch(`${API_BASE}/kb/claims?limit=${limit}`)
+    return resp.json()
+  }
+
+  async function fetchClaim(id) {
+    const resp = await fetch(`${API_BASE}/kb/claims/${id}`)
+    if (!resp.ok) throw new Error('Claim not found')
+    return resp.json()
+  }
+
+  async function verifyClaim(id, force = false) {
+    const resp = await fetch(`${API_BASE}/kb/claims/${id}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    })
+    return resp.json()
+  }
+
+  async function setPreferredSource(claimId, sourceId) {
+    const resp = await fetch(`${API_BASE}/kb/claims/${claimId}/preferred-source`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source_id: sourceId }),
+    })
+    return resp.json()
+  }
+
+  async function searchChunks(q, semantic = false, limit = 20) {
+    const params = new URLSearchParams({ q, semantic, limit })
+    const resp = await fetch(`${API_BASE}/kb/search?${params}`)
+    return resp.json()
+  }
+
+  // --- Knowledge base (verification runs: history/current/trigger) ---
+
+  async function fetchVerificationRuns(limit = 30) {
+    const resp = await fetch(`${API_BASE}/kb/verification-runs?limit=${limit}`)
+    return resp.json()
+  }
+
+  async function fetchCurrentVerificationRun() {
+    const resp = await fetch(`${API_BASE}/kb/verification-runs/current`)
+    return resp.json()
+  }
+
+  async function triggerVerificationRun(threshold = null, force = false) {
+    const resp = await fetch(`${API_BASE}/kb/verification-runs/trigger`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ threshold, force }),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to start verification run')
+    }
+    return resp.json()
+  }
+
   return {
     fetchModels, fetchSessions, fetchSession, deleteSession, streamResearch,
     fetchTopics, createTopic, fetchTopic, fetchTimeline, fetchTopicClaims,
     fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,
     backfillTopic, fetchReport, generateReport,
     fetchResolutionCandidates, reviewResolutionCandidate,
+    fetchSources, fetchSource, fetchSourceClaims, ingestUrl, ingestYoutube, ingestFile,
+    chunkSource, extractSource, verifySource, backfillEmbeddings,
+    fetchClaims, fetchClaim, verifyClaim, setPreferredSource, searchChunks,
+    fetchVerificationRuns, fetchCurrentVerificationRun, triggerVerificationRun,
   }
 }

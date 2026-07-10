@@ -1,5 +1,5 @@
 <script setup>
-import { Search, History, FolderClock, GitMerge, Sun, Moon } from 'lucide-vue-next'
+import { Search, History, FolderClock, GitMerge, Database, Quote, ShieldCheck, Sun, Moon } from 'lucide-vue-next'
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -53,6 +53,22 @@ function applyTheme() {
               History
             </router-link>
             <router-link
+              to="/sources"
+              class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              active-class="bg-gray-100 dark:bg-gray-700"
+            >
+              <Database class="w-4 h-4" />
+              Sources
+            </router-link>
+            <router-link
+              to="/claims"
+              class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              active-class="bg-gray-100 dark:bg-gray-700"
+            >
+              <Quote class="w-4 h-4" />
+              Claims
+            </router-link>
+            <router-link
               to="/topics"
               class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
               active-class="bg-gray-100 dark:bg-gray-700"
@@ -67,6 +83,14 @@ function applyTheme() {
             >
               <GitMerge class="w-4 h-4" />
               Review
+            </router-link>
+            <router-link
+              to="/verification-status"
+              class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              active-class="bg-gray-100 dark:bg-gray-700"
+            >
+              <ShieldCheck class="w-4 h-4" />
+              Verification
             </router-link>
           </nav>
         </div>

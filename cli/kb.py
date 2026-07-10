@@ -18,7 +18,7 @@ from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
 from deep_research.kb.timeline import get_topic_timeline
 from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
-from deep_research.kb.verification import verify_claim
+from deep_research.kb.verification import run_verification_sweep, verify_claim, verify_claims_concurrently
 
 console = Console()
 
@@ -386,6 +386,15 @@ def _print_verification_result(result):
                 f"  [red]recorded {len(result.contradiction_candidate_ids)} contradiction(s) "
                 f"for review — see list-resolution-candidates --type claim_contradiction[/red]"
             )
+        if result.timings:
+            console.print("  [dim]timing breakdown:[/dim]")
+            total = result.timings.get("total", 0.0)
+            for key, seconds in sorted(result.timings.items(), key=lambda kv: -kv[1]):
+                if key == "total":
+                    continue
+                pct = f"{100 * seconds / total:.0f}%" if total else "n/a"
+                console.print(f"    {key:<16} {seconds:>7.2f}s  ({pct})")
+            console.print(f"    {'total':<16} {total:>7.2f}s")
 
 
 async def cmd_verify_claim(args):
@@ -429,10 +438,51 @@ async def cmd_verify_source(args):
         return
 
     console.print(f"Verifying {len(eligible)} claim(s) from {match.get('title') or match['id']}...")
-    for claim in eligible:
+
+    async def on_result(claim, status, result):
         console.print(f"\n[bold]{claim['canonical_text']}[/bold]")
-        result = await verify_claim(kb_db, config, claim["id"], force=args.force)
-        _print_verification_result(result)
+        if status == "failed":
+            console.print(f"[red]failed: {result}[/red]")
+        else:
+            _print_verification_result(result)
+
+    await verify_claims_concurrently(kb_db, config, eligible, force=args.force, on_result=on_result)
+
+
+async def cmd_verify_unverified(args):
+    """KB-wide sweep, not scoped to one source — this is what the nightly
+    schedule runs: just because a source made a claim doesn't mean it's true,
+    so every claim worth verifying gets checked against independent sources
+    (KB-internal first, live web search if that's thin) without anyone
+    having to click into it individually. Same eligibility rule as
+    verify-source (importance threshold, not already attempted unless
+    --force), just across the whole KB instead of one source's claims."""
+    config, kb_db, _ = _kb_setup(args)
+    await kb_db.init()
+
+    seen = {"n": 0}
+
+    def on_result(claim, status, result):
+        seen["n"] += 1
+        console.print(f"\n[{seen['n']}] [bold]{claim['canonical_text']}[/bold]")
+        if status == "failed":
+            console.print(f"[red]failed: {result}[/red]")
+        else:
+            _print_verification_result(result)
+
+    summary = await run_verification_sweep(
+        kb_db, config, trigger=args.trigger, threshold=args.threshold,
+        limit=args.limit, force=args.force, on_result=on_result,
+    )
+    if summary["eligible_count"] == 0:
+        console.print(f"[dim]No unverified claims at or above importance {summary['threshold']}.[/dim]")
+        return
+
+    counts = summary["counts"]
+    console.print(
+        f"\n[bold]Done.[/bold] supported={counts['supported']} contradicted={counts['contradicted']} "
+        f"mixed={counts['mixed']} unverified={counts['unverified']} skipped={counts['skipped']} failed={counts['failed']}"
+    )
 
 
 async def _resolve_topic(kb_db, topic_id_prefix: str) -> dict | None:
@@ -694,6 +744,19 @@ def main():
     p_verify_source.add_argument("--threshold", type=float, default=None, help="Overrides kb.verification_importance_threshold")
     p_verify_source.add_argument("--force", action="store_true")
     p_verify_source.set_defaults(func=cmd_verify_source)
+
+    p_verify_unverified = subparsers.add_parser(
+        "verify-unverified",
+        help="Verify every unverified claim in the whole KB above the importance threshold (not scoped to one source) -- intended for a nightly schedule",
+    )
+    p_verify_unverified.add_argument("--threshold", type=float, default=None, help="Overrides kb.verification_importance_threshold")
+    p_verify_unverified.add_argument("--limit", type=int, default=None, help="Cap how many claims to process in one run")
+    p_verify_unverified.add_argument("--force", action="store_true")
+    p_verify_unverified.add_argument(
+        "--trigger", default="manual", choices=["manual", "cron", "web"],
+        help="Recorded on the verification_runs row so the status page can show what kicked off the run",
+    )
+    p_verify_unverified.set_defaults(func=cmd_verify_unverified)
 
     p_create_topic = subparsers.add_parser("create-topic", help="Create a topic")
     p_create_topic.add_argument("name")

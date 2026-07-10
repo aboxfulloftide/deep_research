@@ -24,6 +24,23 @@ claim against independent sources (budgeted: KB search first, web fallback only 
 thin) → attach claims to topics (explicit or auto-suggested) → generate a timeline
 report per topic.
 
+**Verification's web-fallback extracts scoped chunks, not whole pages:** when
+verify_claim scrapes a new page, it ranks that page's chunks by embedding similarity to
+the claim being checked and runs extraction only on the top
+`verification_max_chunks_per_page` (default 3), not the whole artifact
+(`deep_research/kb/extraction.py`'s `run_extraction(..., chunk_ids=...)`). Found and
+fixed after a real verification run extracted a full page ("Strategy Study: The Apple
+Growth Study") and dumped 1072 tangential claims into the KB just to check one Apple
+fact — full-page extraction during verification was the same expensive, indiscriminate
+pass used for deliberate source ingestion, disproportionate to "does this page support
+or contradict this one claim." A chunk-scoped extraction run gets a signature that can
+never satisfy (or be satisfied by) a full-page extraction's reuse cache, so it can't be
+mistaken later for "this artifact was already fully extracted." Side benefit beyond
+avoiding claim bloat: cut measured single-claim verification wall time roughly in half
+(a comparable claim went from 78-172s full-page to 39s scoped) since LLM extraction —
+already the dominant cost at 86-91% of wall time — now scales with a handful of chunks
+instead of a whole document.
+
 **Storage:** PostgreSQL (`deep_research/kb/db.py`) for the KB — JSONB columns with a
 registered asyncpg codec, `TIMESTAMPTZ` throughout, native full-text search
 (`tsvector`/`websearch_to_tsquery`), and `pgvector` for embedding-based semantic search
@@ -43,23 +60,59 @@ full-text and semantic search via Reciprocal Rank Fusion.
 **Local models:** llama.cpp (`llama-server`, OpenAI-compatible `/v1/*` plus native
 `/slots`/`/props`) runs extraction, verification, and report generation; Ollama runs
 embeddings (`nomic-embed-text`). Both can hold models on the same GPU — see
-`HARDWARE.md` for VRAM tradeoffs. The interactive chat agent is switchable between
-either backend (`deep_research/model_backends.py`; `--backend` CLI flag or a toggle
-in the web UI next to the model picker) — it isn't tied to one the way the KB
-pipeline's per-role model assignment is.
+`HARDWARE.md` for VRAM tradeoffs. `llama-server` runs with `--parallel 2 --ctx-size
+8192` (raised from `--parallel 1 --ctx-size 4096`) — measured, verified real ~2x
+concurrent throughput on the existing single 16 GB card with only ~600 MB extra VRAM;
+see HARDWARE.md's "Verification bottleneck measurement" section for the full
+timing breakdown (LLM extraction of freshly-scraped pages is 86-91% of a claim
+verification's wall time — GPU-bound, not I/O-bound) and for the exact restart
+command, since the process has no systemd unit and is launched manually. The
+interactive chat agent is switchable between either backend
+(`deep_research/model_backends.py`; `--backend` CLI flag or a toggle in the web UI
+next to the model picker) — it isn't tied to one the way the KB pipeline's per-role
+model assignment is.
 
-**Interfaces:** `cli/kb.py` (`deep-research-kb ...`) covers everything end-to-end; the
-web app (`web/app.py` + `web/kb_routes.py` + the Vue frontend) covers Research, History,
-Topics (timeline/suggestions/report), and the resolution Review queue.
+**Interfaces:** `cli/kb.py` (`deep-research-kb ...`) and the web app (`web/app.py` +
+`web/kb_routes.py` + the Vue frontend) now have full parity — ingest (URL/YouTube/file
+upload), chunk/extract/verify a source, browse/verify individual claims, raw chunk
+search, embedding backfill, Topics (timeline/suggestions/report), and the resolution
+Review queue (with bulk accept/reject) are all reachable from the web UI, not just the
+CLI. The Sources and Source Detail pages show a "Key Points" list (claims backed by that
+source, most important first). Nothing requires dropping to the CLI anymore except the
+nightly cron invocation itself.
 
-**Testing:** `tests/` has a pytest suite (45 tests) covering resolution, merge, and
+**Automatic claim verification:** claims aren't taken on faith just because a source
+asserted them. `cli/kb.py verify-unverified` (and `deep_research/kb/verification.py`'s
+`run_verification_sweep`, shared by CLI and web) sweeps every claim in the KB at/above
+the importance threshold and checks it against independent sources — KB-internal first,
+live web fallback if that's thin. A cron job (`crontab -l`) runs this nightly at 23:00,
+bounded by `timeout 8h` (no `--limit`, so it runs until it finishes or ~7am, whichever
+comes first) — installed because the local GPU is shared with the interactive chat
+agent and there's currently only one card (a second is coming; until then, this is also
+why embeddings still run on Ollama rather than switching to a second llama.cpp
+instance). A `verification_runs` table tracks every sweep (nightly, manual CLI, or the
+web's "Verify All Now" button) — one row per run, updated per-claim as it goes
+(`current_claim_text` is set *before* `verify_claim` is called, not after, since a
+single claim's web-fallback check can take minutes) — surfaced on the web's
+"Verification" status page: live progress of the current run plus history of past ones.
+`run_verification_sweep` refuses to start a second sweep while one is already "running"
+(real concurrency risk found in practice: the nightly cron fired while an orphaned
+manual-trigger run — from a killed dev server — was still marked running), except when
+the existing "running" row is older than the cron job's own 8h timeout, in which case
+it's treated as abandoned (crashed/killed process) rather than blocking forever.
+
+**Testing:** `tests/` has a pytest suite (64 tests) covering resolution, merge, and
 verification/report resilience logic, using a dedicated `deep_research_kb_test`
 database (truncated between tests) so it never touches real data — see
 `tests/conftest.py`. Everything else is still verified manually/Playwright per change,
 not covered by the suite.
 
 **Not yet built / explicitly deferred:** Ollama isn't containerized in
-`docker-compose.yml` (relies on a host systemd service).
+`docker-compose.yml` (relies on a host systemd service). `llama-server` similarly has no
+systemd unit — it's a manually-launched process by choice (user declined a systemd
+service when offered). Embeddings stay on Ollama rather than moving to llama.cpp until
+a second GPU is available, to avoid contending with the interactive chat agent's model
+on the single current card.
 
 ## Current Goal
 
@@ -1398,6 +1451,105 @@ claim/evidence schema has stabilized.
    `/claims` both went from 500 to 200, and a fresh Playwright run confirmed the page
    actually renders the full timeline (not just a non-500 response) with zero console
    errors.
+
+   **Follow-up: bulk review (select all / adjust / act).** User request: reviewing
+   candidates one at a time was slow; wanted a check-all-then-adjust workflow. Added
+   per-row checkboxes, a "Select all"/"Select none" toggle (label flips based on
+   whether every currently-loaded row is selected), and "Accept selected (N)"/"Reject
+   selected (N)" buttons that only appear once something's selected. Selection is
+   scoped to the current tab's loaded candidates and clears on tab switch. Bulk accept
+   asks for a native confirmation first (bulk reject doesn't, consistent with reject
+   already being framed as a safe no-op everywhere else on this page); processes
+   sequentially against `POST .../review` per id, then reports an aggregate outcome
+   (e.g. "Accepted 12: 10 merged, 2 already resolved"). Verified against synthetic
+   candidates (not real pending ones, to avoid disturbing the user's actual queue):
+   select-all correctly selects every loaded row; deselecting a subset correctly drops
+   both the count and the select-all checkbox's checked state; bulk-rejecting the
+   remaining selection leaves the deselected rows untouched and removes exactly the
+   selected ones. Synthetic entities and candidates cleaned up afterward.
+
+   **Follow-up: full CLI/web parity.** User request: "everything that can be done via
+   CLI needs to be able to be done via the web" — until now, ingestion, chunking,
+   extraction, verification, general claim/source browsing, chunk search, and embedding
+   backfill were CLI-only (`cli/kb.py`), with the web UI covering only topics and the
+   resolution queue. Added the remaining surface as new `web/kb_routes.py` routes,
+   deliberately calling the exact same underlying functions the CLI commands do (no
+   parallel logic to drift out of sync):
+   - `POST /sources/ingest-url`, `/ingest-youtube`, `/ingest-file` (multipart upload —
+     added `python-multipart` as a dependency). File uploads are saved to a stable
+     `~/.local/share/deep_research/kb_uploads/<original filename>` directory rather
+     than a random temp path, since `ingest_file`'s source identity is the file path
+     (a step-2 decision) — a random temp path would make every web upload of "the same"
+     file look like a brand new, unrelated source instead of a new version.
+   - `GET /sources/{id}` (versions + fetch attempts), `POST /sources/{id}/chunk`,
+     `/extract` (mirrors the CLI's combined extract → resolve_and_promote →
+     check_claims_against_topics forward-check exactly), `/verify` (mirrors
+     verify-source's batch-verify-by-importance-threshold behavior).
+   - `GET /claims` (general, unscoped list — distinct from the existing topic-scoped
+     one), `POST /claims/{id}/verify`, `GET /search` (raw FTS/semantic chunk search,
+     distinct from `kb_search`, the agent tool that blends both automatically),
+     `POST /embeddings/backfill`.
+   - New `SourcesView.vue` (list, an Add Source panel with URL/YouTube/File tabs, a
+     Search Content panel) + `SourceDetailView.vue` (versions/fetch-attempts tables,
+     Chunk/Extract/Verify actions with inline results) + `ClaimsView.vue` (general
+     claim list with a text filter, expand-to-load evidence, per-claim verify, and a
+     "make preferred" action per evidence source) + nav entries.
+   - Verified end-to-end against the real KB via Playwright, driving the actual browser
+     rather than just hitting routes directly: ingested a real URL, chunked it,
+     extracted it (7 real claims/entities from a real page), verified a claim, searched
+     chunked content, expanded a claim's evidence, and uploaded a real file — all
+     through the UI, zero console errors throughout. All CLI parity commands were
+     checked against their actual implementations first (exact signatures, dataclass
+     fields, response shapes) rather than guessed.
+   - Found and fixed a real bug while verifying verify-claim with Ollama stopped (not
+     an artificial test — Ollama happened to be down): `_rank_candidates_by_similarity`
+     in `verification.py` had a live `embed_texts` fallback call with no error handling,
+     unlike every other embedding call site in the codebase (`embed_new_claims`,
+     `build_artifact_for_version`), which are all best-effort. An unreachable embedding
+     backend raised an uncaught `httpx.ConnectError` all the way out of `verify_claim`,
+     discarding the whole verification attempt — inconsistent with decision 24's
+     "keep partial results, never abort" philosophy that the rest of the verification
+     module already follows. Fixed by degrading to "no internal candidates ranked this
+     round" (an empty list, letting `verify_claim` fall through to the web-fallback
+     phase) instead of crashing. Added a regression test injecting the same failure
+     directly. A second, unrelated bug was caught in my own Playwright test script (not
+     the app): clicking `button:has-text("Search")` matched the wrong button because
+     `:has-text()` does substring matching and "Search **content**" also contains
+     "Search" — fixed the test by pressing Enter in the search input instead.
+   - All sources/claims/artifacts created during this verification pass (real
+     ingestion of example.com, two IANA pages, and a test file — plus, notably, extra
+     pages that verify-claim's own web-fallback phase pulled in on its own while
+     verifying a domain-related claim, exactly as decision 23 hybrid retrieval intends)
+     were cleaned up via a cascade delete (claim_evidence → claims →
+     extraction_runs/observations → artifacts/chunks → source_versions → sources),
+     leaving entity rows alone as harmless orphans rather than risk deleting entities a
+     real, unrelated claim might also reference. **The first cleanup pass was
+     incomplete**: it filtered sources by canonical URI containing "example.com" or
+     "iana.org", which missed a source the web-fallback phase had also pulled in from a
+     different domain entirely (a "neverstudio.de" tutorial page, ingested because it
+     happened to come up in a websearch for a domain-related claim and itself contained
+     IANA/ICANN example text) — caught when the user noticed ICANN-related claims on
+     the Claims page and asked why. Re-swept by listing every source ordered by
+     `created_at` instead of pattern-matching URLs, which also surfaced three unrelated
+     `test_doc.md/pdf/docx` sources left over from build-order step 2's original
+     file-ingestion testing, long before this session's work — cleaned up all five.
+     Lesson: identifying "what to clean up" by guessing likely URL patterns is fragile;
+     checking actual creation timestamps against the real testing timeline is the
+     reliable way to find everything a test run touched, including indirect side
+     effects like web-fallback ingestion.
+
+   **Follow-up: Key Points on the source detail page.** User request: seeing what was
+   actually extracted from a source, not just its versions/fetch-attempts metadata.
+   Added `list_claims_for_source` (one JOIN query, `claim_evidence` → `claims`, ordered
+   by `importance_score` descending — the "main points" a person would want first) and
+   a `GET /sources/{id}/claims` route, surfaced as a persistent "Key Points" section on
+   `SourceDetailView.vue` (status badges, refreshes automatically after Extract or
+   Verify). Also used the new method to replace `verify_source_route`'s N+1 query
+   (list every claim in the KB, then `list_claim_evidence` per claim, then filter by
+   source — the same pattern already fixed once for the resolution-candidates list)
+   with the single JOIN, changing nothing about its behavior. Verified against a real
+   source with 20 already-extracted claims — correct count, correct order, zero
+   console errors.
 
 Important notes:
 

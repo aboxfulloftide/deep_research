@@ -440,6 +440,36 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_reports_topic ON reports(topic_id, created_at DESC);
+
+-- Tracks each run of the KB-wide claim verification sweep (nightly cron,
+-- manual CLI, or web-triggered) so a status page can show run history and
+-- live progress. completed_at IS NULL while a run is in progress.
+CREATE TABLE IF NOT EXISTS verification_runs (
+    id TEXT PRIMARY KEY,
+    trigger TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    claims_total INTEGER NOT NULL DEFAULT 0,
+    claims_processed INTEGER NOT NULL DEFAULT 0,
+    current_claim_text TEXT,
+    -- Claims now verify concurrently (verification_concurrency), so more than
+    -- one can be in flight at once -- current_claim_text is unused going
+    -- forward (kept for backward compat with any rows written before this),
+    -- superseded by this JSONB array of whatever's currently being checked.
+    current_claim_texts JSONB NOT NULL DEFAULT '[]'::jsonb,
+    supported_count INTEGER NOT NULL DEFAULT 0,
+    contradicted_count INTEGER NOT NULL DEFAULT 0,
+    mixed_count INTEGER NOT NULL DEFAULT 0,
+    unverified_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT
+);
+
+ALTER TABLE verification_runs ADD COLUMN IF NOT EXISTS current_claim_texts JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_verification_runs_started ON verification_runs(started_at DESC);
 """
 
 SOURCE_TYPES = [
@@ -1121,6 +1151,23 @@ class KBDatabase:
             )
         return [dict(r) for r in rows]
 
+    async def list_claims_for_source(self, source_id: str, limit: int = 200) -> list[dict]:
+        """Every claim backed by at least one piece of evidence from this
+        source, ordered by importance_score (highest first) -- the "main
+        points" a reviewer would want to see first on a source's page.
+        One JOIN query instead of the N+1 pattern (list every claim, then
+        list_claim_evidence per claim, then filter) that both the CLI's
+        verify-source and this method's first draft used."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT c.* FROM claims c "
+                "JOIN claim_evidence ce ON ce.claim_id = c.id "
+                "WHERE ce.source_id = $1 AND c.merged_into_claim_id IS NULL "
+                "ORDER BY c.importance_score DESC NULLS LAST LIMIT $2",
+                source_id, limit,
+            )
+        return [dict(r) for r in rows]
+
     async def set_claim_embedding(self, claim_id: str, embedding: list[float]) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE claims SET embedding = $1 WHERE id = $2", embedding, claim_id)
@@ -1325,6 +1372,26 @@ class KBDatabase:
                 "FROM claim_evidence ce "
                 "JOIN sources s ON s.id = ce.source_id "
                 "WHERE ce.claim_id = $1 ORDER BY ce.created_at",
+                claim_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_claim_contradictions(self, claim_id: str) -> list[dict]:
+        """The other claim(s) this claim was flagged against during
+        verification, plus that resolution_candidates row's review status --
+        lets a claim's detail view show *why* it's contradicted (and whether
+        that's still an open question or already reviewed), not just that it
+        is. Reuses resolution_candidates (the review queue) rather than
+        verification_notes so this works for every contradicted claim, not
+        only ones verified after supporting/contradicting ids started being
+        recorded there."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT rc.id AS candidate_id, rc.status AS candidate_status, rc.score, rc.reason, "
+                "CASE WHEN rc.left_claim_id = $1 THEN rc.right_claim_id ELSE rc.left_claim_id END AS other_claim_id "
+                "FROM resolution_candidates rc "
+                "WHERE rc.candidate_type = 'claim_contradiction' AND (rc.left_claim_id = $1 OR rc.right_claim_id = $1) "
+                "ORDER BY rc.created_at DESC",
                 claim_id,
             )
         return [dict(r) for r in rows]
@@ -1849,3 +1916,60 @@ class KBDatabase:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(query, *params)
         return dict(row) if row else None
+
+    # --- Verification runs (nightly/manual claim verification sweeps) ---
+
+    async def create_verification_run(self, trigger: str, claims_total: int) -> dict:
+        run_id = _new_id()
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO verification_runs (id, trigger, status, started_at, claims_total) "
+                "VALUES ($1, $2, 'running', $3, $4) RETURNING *",
+                run_id, trigger, now, claims_total,
+            )
+        return dict(row)
+
+    async def set_verification_run_in_flight(self, run_id: str, claim_texts: list[str]) -> None:
+        """Claims verify concurrently (verification_concurrency), so more than
+        one can be in flight at once -- called whenever the in-flight set
+        changes (a claim starts or finishes) with the full current set, so
+        the status page shows everything actually being checked right now."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE verification_runs SET current_claim_texts = $2 WHERE id = $1",
+                run_id, claim_texts,
+            )
+
+    async def record_verification_run_result(self, run_id: str, status_count_field: str) -> None:
+        """Called after a claim finishes: bumps claims_processed and the
+        counter for its resulting status (e.g. 'supported_count')."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE verification_runs SET claims_processed = claims_processed + 1, "
+                f"{status_count_field} = {status_count_field} + 1 WHERE id = $1",
+                run_id,
+            )
+
+    async def complete_verification_run(self, run_id: str, error_message: str | None = None) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE verification_runs SET status = $2, completed_at = $3, "
+                "current_claim_texts = '[]'::jsonb, error_message = $4 WHERE id = $1",
+                run_id, "failed" if error_message else "completed", _now(), error_message,
+            )
+
+    async def get_current_verification_run(self) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM verification_runs WHERE completed_at IS NULL "
+                "ORDER BY started_at DESC LIMIT 1"
+            )
+        return dict(row) if row else None
+
+    async def list_verification_runs(self, limit: int = 30) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM verification_runs ORDER BY started_at DESC LIMIT $1", limit,
+            )
+        return [dict(r) for r in rows]

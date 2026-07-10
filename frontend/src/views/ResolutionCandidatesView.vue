@@ -17,6 +17,8 @@ const candidates = ref([])
 const loading = ref(true)
 const reviewingId = ref(null)
 const lastOutcome = ref(null)
+const selectedIds = ref(new Set())
+const bulkProcessing = ref(false)
 
 // Guards against out-of-order responses: switching tabs quickly can let an
 // earlier, slower request (e.g. "All", which fetches far more rows) resolve
@@ -30,6 +32,7 @@ onMounted(load)
 async function load() {
   const thisRequest = ++requestSeq
   loading.value = true
+  selectedIds.value = new Set()
   const type = TYPES.find(t => t.key === activeType.value)?.apiType
   const result = await api.fetchResolutionCandidates(type)
   if (thisRequest !== requestSeq) return
@@ -40,6 +43,23 @@ async function load() {
 function switchType(key) {
   activeType.value = key
   load()
+}
+
+const allSelected = computed(() =>
+  candidates.value.length > 0 && candidates.value.every(c => selectedIds.value.has(c.id))
+)
+
+function toggleSelectAll() {
+  selectedIds.value = allSelected.value
+    ? new Set()
+    : new Set(candidates.value.map(c => c.id))
+}
+
+function toggleSelect(id) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedIds.value = next
 }
 
 function describeOutcome(result) {
@@ -67,6 +87,48 @@ async function review(candidate, decision) {
     candidates.value = candidates.value.filter(c => c.id !== candidate.id)
   } finally {
     reviewingId.value = null
+  }
+}
+
+function summarizeBulkOutcome(decision, ids, outcomes) {
+  if (decision === 'rejected') {
+    return `Rejected ${ids.length} candidate(s).`
+  }
+  const parts = []
+  if (outcomes.merged) parts.push(`${outcomes.merged} merged`)
+  if (outcomes.no_op_already_merged) parts.push(`${outcomes.no_op_already_merged} already resolved`)
+  if (outcomes.contradiction_recorded) parts.push(`${outcomes.contradiction_recorded} contradiction(s) recorded`)
+  if (outcomes.failed) parts.push(`${outcomes.failed} failed`)
+  return `Accepted ${ids.length}: ${parts.join(', ')}.`
+}
+
+async function bulkReview(decision) {
+  const ids = [...selectedIds.value]
+  if (ids.length === 0 || bulkProcessing.value) return
+  if (decision === 'accepted') {
+    const ok = window.confirm(
+      `Accept ${ids.length} candidate(s)? Duplicates will be merged and contradictions recorded — see ` +
+      `"What does Accept actually do?" above for exactly what that means. This can't be bulk-undone.`
+    )
+    if (!ok) return
+  }
+
+  bulkProcessing.value = true
+  const outcomes = {}
+  try {
+    for (const id of ids) {
+      try {
+        const result = await api.reviewResolutionCandidate(id, decision)
+        outcomes[result.action] = (outcomes[result.action] || 0) + 1
+      } catch (e) {
+        outcomes.failed = (outcomes.failed || 0) + 1
+      }
+    }
+    candidates.value = candidates.value.filter(c => !selectedIds.value.has(c.id))
+    selectedIds.value = new Set()
+    lastOutcome.value = summarizeBulkOutcome(decision, ids, outcomes)
+  } finally {
+    bulkProcessing.value = false
   }
 }
 
@@ -164,14 +226,48 @@ const methodExplanations = {
       <p class="text-sm">No pending candidates in this category.</p>
     </div>
 
-    <div v-else class="space-y-3">
+    <template v-else>
+      <div class="flex items-center gap-3 mb-3 text-sm">
+        <label class="flex items-center gap-1.5 cursor-pointer select-none text-gray-600 dark:text-gray-300">
+          <input type="checkbox" :checked="allSelected" @change="toggleSelectAll" class="accent-blue-600" />
+          {{ allSelected ? 'Select none' : 'Select all' }}
+        </label>
+        <span v-if="selectedIds.size" class="text-gray-400 dark:text-gray-500">{{ selectedIds.size }} selected</span>
+        <div v-if="selectedIds.size" class="flex items-center gap-2 ml-auto">
+          <button
+            @click="bulkReview('accepted')"
+            :disabled="bulkProcessing"
+            class="px-3 py-1.5 rounded-md bg-green-600 hover:bg-green-700 text-white text-xs disabled:opacity-50"
+          >
+            {{ bulkProcessing ? 'Working…' : `Accept selected (${selectedIds.size})` }}
+          </button>
+          <button
+            @click="bulkReview('rejected')"
+            :disabled="bulkProcessing"
+            class="px-3 py-1.5 rounded-md bg-red-500 hover:bg-red-600 text-white text-xs disabled:opacity-50"
+          >
+            {{ bulkProcessing ? 'Working…' : `Reject selected (${selectedIds.size})` }}
+          </button>
+        </div>
+      </div>
+
+      <div class="space-y-3">
       <div
         v-for="c in candidates"
         :key="c.id"
-        class="px-4 py-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg"
+        class="px-4 py-3 bg-white dark:bg-gray-800 border rounded-lg"
+        :class="selectedIds.has(c.id)
+          ? 'border-blue-400 dark:border-blue-600 ring-1 ring-blue-200 dark:ring-blue-900'
+          : 'border-gray-200 dark:border-gray-700'"
       >
         <div class="flex items-center justify-between gap-2 mb-2">
           <div class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              :checked="selectedIds.has(c.id)"
+              @change="toggleSelect(c.id)"
+              class="accent-blue-600"
+            />
             <span
               class="px-1.5 py-0.5 text-[10px] rounded uppercase font-medium"
               :class="typeBadgeColors[c.candidate_type]"
@@ -230,6 +326,7 @@ const methodExplanations = {
         </div>
         <p v-if="c.reason" class="text-xs text-gray-400 dark:text-gray-500 mt-1">{{ c.reason }}</p>
       </div>
-    </div>
+      </div>
+    </template>
   </div>
 </template>

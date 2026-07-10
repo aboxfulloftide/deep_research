@@ -7,21 +7,33 @@ the web layer as they already are in storage (SQLite sessions vs. Postgres
 KB). init_kb() is called from app.py's lifespan to share one KBDatabase pool.
 """
 
-from fastapi import APIRouter, HTTPException
+import tempfile
+from dataclasses import asdict
+from pathlib import Path
+
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from pgvector import Vector
 from pydantic import BaseModel
 
 from deep_research.config import Config
+from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.embeddings import backfill_embeddings, embed_texts
+from deep_research.kb.extraction import run_extraction
+from deep_research.kb.ingest import ingest_file, ingest_web_page, ingest_youtube_video
 from deep_research.kb.merge import review_and_execute
 from deep_research.kb.reports import generate_topic_report
+from deep_research.kb.resolution import resolve_and_promote
+from deep_research.kb.storage import SnapshotStore
 from deep_research.kb.timeline import get_topic_timeline
-from deep_research.kb.topics import generate_topic_suggestions
+from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
+from deep_research.kb.verification import run_verification_sweep, verify_claim, verify_claims_concurrently
 
 router = APIRouter(prefix="/api/kb")
 
 config: Config | None = None
 kb_db: KBDatabase | None = None
+snapshot_store: SnapshotStore | None = None
 
 
 async def init_kb(cfg: Config):
@@ -29,11 +41,12 @@ async def init_kb(cfg: Config):
     configured. A missing KB means /api/kb/* routes fail per-request instead
     of the whole app failing to boot, and the research agent's kb_search
     tool/prioritize_kb toggle are simply unavailable rather than fatal."""
-    global config, kb_db
+    global config, kb_db, snapshot_store
     config = cfg
     try:
         kb_db = KBDatabase(cfg.kb.postgres_dsn)
         await kb_db.init()
+        snapshot_store = SnapshotStore(cfg.kb_snapshot_dir)
     except Exception as e:
         print(f"Local knowledge base unavailable ({e}); /api/kb/* routes and kb_search will not work.")
         kb_db = None
@@ -75,6 +88,38 @@ class AttachClaimRequest(BaseModel):
 
 class PreferredSourceRequest(BaseModel):
     source_id: str
+
+
+class IngestUrlRequest(BaseModel):
+    url: str
+    trust_tier: str | None = None
+
+
+class IngestYoutubeRequest(BaseModel):
+    url: str
+    trust_tier: str | None = None
+
+
+class ChunkSourceRequest(BaseModel):
+    chunk_size: int = 1200
+
+
+class ExtractSourceRequest(BaseModel):
+    force: bool = False
+
+
+class VerifySourceRequest(BaseModel):
+    threshold: float | None = None
+    force: bool = False
+
+
+class VerifyClaimRequest(BaseModel):
+    force: bool = False
+
+
+class TriggerVerificationRunRequest(BaseModel):
+    threshold: float | None = None
+    force: bool = False
 
 
 def _serialize(obj):
@@ -216,13 +261,60 @@ async def create_report(topic_id: str):
     }
 
 
+def _enrich_related_claim(other_id: str, claims_by_id: dict, evidence_by_claim: dict) -> dict | None:
+    other = claims_by_id.get(other_id)
+    if other is None:
+        return None
+    sources = [
+        {"source_id": e["source_id"], "source_title": e["source_title"], "canonical_uri": e["canonical_uri"]}
+        for e in evidence_by_claim.get(other_id, [])
+    ]
+    # de-dupe -- a claim can have multiple evidence rows from the same source
+    seen_source_ids = set()
+    unique_sources = []
+    for s in sources:
+        if s["source_id"] in seen_source_ids:
+            continue
+        seen_source_ids.add(s["source_id"])
+        unique_sources.append(s)
+    return {"id": other["id"], "canonical_text": other["canonical_text"], "sources": unique_sources}
+
+
 @router.get("/claims/{claim_id}")
 async def get_claim(claim_id: str):
     claim = await kb_db.get_claim(claim_id)
     if claim is None:
         raise HTTPException(404, "Claim not found")
     evidence = await kb_db.list_claim_evidence(claim_id)
-    return {"claim": _serialize(claim), "evidence": _serialize(evidence)}
+
+    contradictions = await kb_db.get_claim_contradictions(claim_id)
+    supporting_ids = ((claim.get("verification_notes") or {}).get("supporting_claim_ids")) or []
+    related_ids = list({c["other_claim_id"] for c in contradictions} | set(supporting_ids))
+    claims_by_id = await kb_db.get_claims_bulk(related_ids)
+    evidence_by_claim = await kb_db.get_claims_evidence_bulk(related_ids)
+
+    contradicting_claims = []
+    for c in contradictions:
+        enriched = _enrich_related_claim(c["other_claim_id"], claims_by_id, evidence_by_claim)
+        if enriched:
+            contradicting_claims.append({
+                **enriched,
+                "candidate_id": c["candidate_id"],
+                "candidate_status": c["candidate_status"],
+                "reason": c["reason"],
+                "score": c["score"],
+            })
+
+    supporting_claims = [
+        c for c in (_enrich_related_claim(i, claims_by_id, evidence_by_claim) for i in supporting_ids) if c
+    ]
+
+    return {
+        "claim": _serialize(claim),
+        "evidence": _serialize(evidence),
+        "supporting_claims": _serialize(supporting_claims),
+        "contradicting_claims": _serialize(contradicting_claims),
+    }
 
 
 @router.put("/claims/{claim_id}/preferred-source")
@@ -321,3 +413,199 @@ async def search_sources(q: str = "", limit: int = 50):
     else:
         sources = sources[:limit]
     return {"sources": _serialize(sources)}
+
+
+@router.post("/sources/ingest-url")
+async def ingest_url_route(req: IngestUrlRequest):
+    result = await ingest_web_page(req.url, config, kb_db, snapshot_store, trust_tier_code=req.trust_tier)
+    return {"result": asdict(result)}
+
+
+@router.post("/sources/ingest-youtube")
+async def ingest_youtube_route(req: IngestYoutubeRequest):
+    result = await ingest_youtube_video(req.url, kb_db, snapshot_store, trust_tier_code=req.trust_tier)
+    return {"result": asdict(result)}
+
+
+@router.post("/sources/ingest-file")
+async def ingest_file_route(file: UploadFile = File(...), trust_tier: str | None = Form(None)):
+    """Web uploads are saved under a stable uploads directory keyed by the
+    original filename (not a random temp path) so ingest_file's file-path-
+    based source identity (decision from step 2: identity is the path, not
+    the content hash) behaves sensibly on re-upload — uploading "the same"
+    file again is treated as a new version of the same source, matching the
+    CLI's ingest-file semantics for a stable local path."""
+    uploads_dir = Path("~/.local/share/deep_research/kb_uploads").expanduser()
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    dest = uploads_dir / file.filename
+    dest.write_bytes(await file.read())
+    result = await ingest_file(dest, kb_db, snapshot_store, trust_tier_code=trust_tier)
+    return {"result": asdict(result)}
+
+
+async def _resolve_source_or_404(source_id: str) -> dict:
+    source = await kb_db.get_source(source_id)
+    if source is None:
+        sources = await kb_db.list_sources(limit=5000)
+        source = next((s for s in sources if s["id"].startswith(source_id)), None)
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    return source
+
+
+@router.get("/sources/{source_id}")
+async def get_source_detail(source_id: str):
+    source = await _resolve_source_or_404(source_id)
+    versions = await kb_db.list_versions(source["id"])
+    fetch_attempts = await kb_db.list_fetch_attempts(source["id"])
+    return {
+        "source": _serialize(source),
+        "versions": _serialize(versions),
+        "fetch_attempts": _serialize(fetch_attempts),
+    }
+
+
+@router.post("/sources/{source_id}/chunk")
+async def chunk_source_route(source_id: str, req: ChunkSourceRequest):
+    source = await _resolve_source_or_404(source_id)
+    version = await kb_db.get_latest_version(source["id"])
+    if version is None:
+        raise HTTPException(400, "No ingested version found for this source")
+    result = await build_artifact_for_version(
+        kb_db, snapshot_store, source, version, config=config, chunk_size=req.chunk_size,
+    )
+    return {"result": asdict(result)}
+
+
+@router.post("/sources/{source_id}/extract")
+async def extract_source_route(source_id: str, req: ExtractSourceRequest):
+    """Mirrors cli/kb.py's extract-source exactly: extract, then resolve +
+    promote, then forward-check the new claims against every existing topic
+    (decision 27) — one call from the UI's perspective, same as the CLI."""
+    source = await _resolve_source_or_404(source_id)
+    version = await kb_db.get_latest_version(source["id"])
+    if version is None:
+        raise HTTPException(400, "No ingested version found for this source")
+    artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
+    if not artifacts:
+        raise HTTPException(400, "No chunked artifact found — chunk this source first")
+
+    extraction_result = await run_extraction(kb_db, config, artifacts[0]["id"], force=req.force)
+    response = {"extraction": asdict(extraction_result)}
+    if extraction_result.status in ("extracted", "partial"):
+        promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
+        response["promotion"] = asdict(promotion)
+        topic_results = await check_claims_against_topics(kb_db, promotion.new_claim_ids)
+        suggestions = []
+        for topic_id, result in topic_results.items():
+            topic = await kb_db.get_topic(topic_id)
+            suggestions.append({
+                "topic_id": topic_id,
+                "topic_name": topic["name"] if topic else None,
+                "claims_suggested": result.claims_suggested,
+                "sources_suggested": result.sources_suggested,
+            })
+        response["topic_suggestions"] = suggestions
+    return response
+
+
+@router.get("/sources/{source_id}/claims")
+async def get_source_claims(source_id: str):
+    """The "main points" extracted from this source -- every claim backed by
+    at least one piece of evidence from it, most important first."""
+    source = await _resolve_source_or_404(source_id)
+    claims = await kb_db.list_claims_for_source(source["id"])
+    return {"claims": _serialize(claims)}
+
+
+@router.post("/sources/{source_id}/verify")
+async def verify_source_route(source_id: str, req: VerifySourceRequest):
+    """Mirrors cli/kb.py's verify-source: verifies every claim backed by this
+    source that's at/above the importance threshold and not yet verified,
+    concurrently (config.kb.verification_concurrency) rather than one at a
+    time -- one claim's failure no longer aborts the whole batch either,
+    since verify_claims_concurrently reports it as a 'failed' result instead
+    of raising."""
+    source = await _resolve_source_or_404(source_id)
+    source_claims = await kb_db.list_claims_for_source(source["id"], limit=5000)
+
+    threshold = req.threshold if req.threshold is not None else config.kb.verification_importance_threshold
+    eligible = [
+        c for c in source_claims
+        if (c["importance_score"] or 0) >= threshold
+        and (c["verification_attempted_at"] is None or req.force)
+    ]
+
+    outcomes = await verify_claims_concurrently(kb_db, config, eligible, force=req.force)
+    results = []
+    for claim, status, result in outcomes:
+        if isinstance(result, Exception):
+            results.append({"canonical_text": claim["canonical_text"], "status": "failed", "error": str(result)})
+        else:
+            results.append({"canonical_text": claim["canonical_text"], **asdict(result)})
+    return {"verified_count": len(results), "results": results}
+
+
+@router.get("/claims")
+async def list_all_claims(limit: int = 100):
+    claims = await kb_db.list_claims(limit=limit)
+    return {"claims": _serialize(claims)}
+
+
+@router.post("/claims/{claim_id}/verify")
+async def verify_claim_route(claim_id: str, req: VerifyClaimRequest):
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(404, "Claim not found")
+    result = await verify_claim(kb_db, config, claim_id, force=req.force)
+    return {"result": asdict(result)}
+
+
+@router.get("/search")
+async def search_chunks_route(q: str, semantic: bool = False, limit: int = 20):
+    """Raw full-text/semantic search over chunked content -- mirrors
+    cli/kb.py's `search` command (distinct from kb_search, the agent tool
+    that blends both automatically)."""
+    if semantic:
+        vectors = await embed_texts([q], config.kb.embedding_base_url, config.kb.embedding_model)
+        results = await kb_db.search_chunks_semantic(vectors[0], limit=limit)
+    else:
+        results = await kb_db.search_chunks(q, limit=limit)
+    return {"results": _serialize(results)}
+
+
+@router.post("/embeddings/backfill")
+async def backfill_embeddings_route():
+    result = await backfill_embeddings(kb_db, config)
+    return {"result": asdict(result)}
+
+
+# --- Verification runs (nightly cron / manual-trigger status page) ---
+
+@router.get("/verification-runs")
+async def list_verification_runs_route(limit: int = 30):
+    runs = await kb_db.list_verification_runs(limit=limit)
+    return {"runs": _serialize(runs)}
+
+
+@router.get("/verification-runs/current")
+async def get_current_verification_run_route():
+    run = await kb_db.get_current_verification_run()
+    return {"run": _serialize(run)}
+
+
+async def _verification_sweep_task(threshold: float | None, force: bool):
+    await run_verification_sweep(kb_db, config, trigger="web", threshold=threshold, force=force)
+
+
+@router.post("/verification-runs/trigger")
+async def trigger_verification_run_route(req: TriggerVerificationRunRequest, background_tasks: BackgroundTasks):
+    """Lets a user kick off the same KB-wide sweep the nightly cron job runs,
+    without needing the CLI. Only one sweep at a time -- verify_claim makes
+    real LLM calls against the single local GPU, so stacking sweeps would
+    just contend with itself for no benefit."""
+    current = await kb_db.get_current_verification_run()
+    if current is not None:
+        raise HTTPException(409, "A verification run is already in progress")
+    background_tasks.add_task(_verification_sweep_task, req.threshold, req.force)
+    return {"status": "started"}
