@@ -167,6 +167,20 @@ export function useApi() {
     return resp.json()
   }
 
+  async function triggerTopicVerification(id) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/verify`, { method: 'POST' })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to start verification')
+    }
+    return resp.json()
+  }
+
+  async function fetchTopicProcessingStatus(id) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/processing`)
+    return resp.json()
+  }
+
   async function fetchReport(id) {
     const resp = await fetch(`${API_BASE}/kb/topics/${id}/report`)
     return resp.json()
@@ -212,6 +226,11 @@ export function useApi() {
     return resp.json()
   }
 
+  async function fetchSourceProcessingStatus(id) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/processing`)
+    return resp.json()
+  }
+
   async function ingestUrl(url, trustTier = null) {
     const resp = await fetch(`${API_BASE}/kb/sources/ingest-url`, {
       method: 'POST',
@@ -230,11 +249,11 @@ export function useApi() {
     return resp.json()
   }
 
-  async function ingestConversation(text, title = null, trustTier = null) {
+  async function ingestConversation(text, title = null, trustTier = null, topicName = null) {
     const resp = await fetch(`${API_BASE}/kb/sources/ingest-conversation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, title, trust_tier: trustTier }),
+      body: JSON.stringify({ text, title, trust_tier: trustTier, topic_name: topicName }),
     })
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}))
@@ -317,6 +336,15 @@ export function useApi() {
     return resp.json()
   }
 
+  async function setClaimVerificationOverride(claimId, override) {
+    const resp = await fetch(`${API_BASE}/kb/claims/${claimId}/verification-override`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ override }),
+    })
+    return resp.json()
+  }
+
   async function searchChunks(q, semantic = false, limit = 20) {
     const params = new URLSearchParams({ q, semantic, limit })
     const resp = await fetch(`${API_BASE}/kb/search?${params}`)
@@ -352,11 +380,12 @@ export function useApi() {
     fetchModels, fetchSessions, fetchSession, deleteSession, streamResearch,
     fetchTopics, createTopic, fetchTopic, fetchTimeline, fetchTopicClaims,
     fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,
-    backfillTopic, fetchReport, generateReport,
+    backfillTopic, triggerTopicVerification, fetchTopicProcessingStatus, fetchReport, generateReport,
     fetchResolutionCandidates, reviewResolutionCandidate,
-    fetchSources, fetchSource, fetchSourceClaims, ingestUrl, ingestYoutube, ingestFile, ingestConversation,
+    fetchSources, fetchSource, fetchSourceClaims, fetchSourceProcessingStatus,
+    ingestUrl, ingestYoutube, ingestFile, ingestConversation,
     chunkSource, extractSource, verifySource, backfillEmbeddings,
-    fetchClaims, fetchClaim, verifyClaim, setPreferredSource, searchChunks,
+    fetchClaims, fetchClaim, verifyClaim, setPreferredSource, setClaimVerificationOverride, searchChunks,
     fetchVerificationRuns, fetchCurrentVerificationRun, triggerVerificationRun,
   }
 }

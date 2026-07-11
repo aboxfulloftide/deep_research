@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 from deep_research.config import Config, LLMConfig
 from deep_research.kb.artifacts import build_artifact_for_version
+from deep_research.kb.canonical import is_social_media_domain
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import cosine, embed_texts
 from deep_research.kb.extraction import detect_model, run_extraction
@@ -108,6 +109,44 @@ async def _classify_relationship(llm: LLMClient, claim_text: str, other_text: st
     resp = await llm.chat(messages)
     content = resp["choices"][0]["message"]["content"] or ""
     return _parse_json_object(content)
+
+
+SEARCH_QUERY_SUGGESTION_PROMPT = """/no_think
+You are choosing a web search query to help verify a factual claim. One or
+more searches already ran using a prior query and did not turn up enough
+independent evidence to confirm or refute the claim.
+
+Suggest ONE different web search query more likely to surface independent
+corroborating or contradicting sources than the queries already tried --
+for example naming the specific number/entity/date/organization involved
+instead of searching the whole sentence verbatim, dropping filler words, or
+trying alternate terminology a source might actually use.
+
+Return ONLY a JSON object: {"query": "..."}
+"""
+
+
+async def _suggest_search_query(llm: LLMClient, claim_text: str, tried_queries: list[str]) -> str:
+    """Used from the second web-search attempt onward (within one verify_claim
+    run, or on a retry of a previously-inconclusive claim, see
+    UNVERIFIED_RETRY_COOLDOWN_HOURS) -- repeating the exact same query the
+    literal claim text makes almost never turns up anything new, since a
+    search engine returns the same top results for the same string. Falls
+    back to the raw claim text (the original, always-safe default) on any
+    parse failure or an empty suggestion."""
+    tried = "\n".join(f"- {q}" for q in tried_queries)
+    messages = [
+        {"role": "system", "content": SEARCH_QUERY_SUGGESTION_PROMPT},
+        {
+            "role": "user",
+            "content": f"Claim: {claim_text}\n\nQueries already tried (do not repeat these):\n{tried}\n\nSuggest a query.",
+        },
+    ]
+    resp = await llm.chat(messages)
+    content = resp["choices"][0]["message"]["content"] or ""
+    parsed = _parse_json_object(content)
+    query = parsed.get("query")
+    return query.strip() if isinstance(query, str) and query.strip() else claim_text
 
 
 async def _rank_candidates_by_similarity(
@@ -269,6 +308,15 @@ async def _examine_candidates(
         examined_source_ids.update(new_sources)
         budget.record_source_examined(phase)
 
+        other_sources = [s for s in [await kb_db.get_source(sid) for sid in other_source_ids] if s is not None]
+        if other_sources and all(is_social_media_domain(s["canonical_uri"]) for s in other_sources):
+            # Reddit/Instagram/Facebook are unvetted user-generated content --
+            # fine to read, but a claim whose *only* evidence is one of these
+            # can never settle a verification by itself. Still counts against
+            # the source-examined budget above (we did look at it), but never
+            # worth an LLM comparison call.
+            continue
+
         try:
             result = await _classify_relationship(llm, claim["canonical_text"], other_claim["canonical_text"])
         except Exception:
@@ -293,6 +341,41 @@ async def _examine_candidates(
                 contradiction_ids.append(other_claim["id"])
 
 
+async def _resolve_new_verification_claims(
+    kb_db: KBDatabase, new_claim_ids: list[str], kept_ids: set[str], topics: list[dict], source_id: str,
+) -> None:
+    """Extracting a scraped page's top chunks can promote several new
+    claims, but only the one an LLM comparison pass actually classified as
+    supports/contradicts (kept_ids) is worth keeping -- the rest are
+    tangential facts from the same page that were never established as
+    relevant to anything, and get deleted outright. The keeper (and the
+    source it came from -- attach_source_to_topic sweeps in every claim
+    that source still has evidence for, which by this point is just the
+    keeper) gets attached to whatever topic(s) the claim being verified
+    already belongs to, so both are visible in context on the Sources page
+    too, not just floating unexplained. The keeper claim is also excluded
+    from auto-verification by default so it doesn't itself spawn another
+    generation of checks.
+
+    Without this, verifying claim A pulls in claims B and C from other pages
+    just to compare against A; if B and C then also meet the importance
+    threshold, the next sweep verifies *them* too, pulling in D, E, F, G...
+    -- unbounded compounding growth with no way to ever finish, discovered
+    from a real KB where a single night's cron run left 1500+ such claims,
+    almost none of them ever established as relevant to anything, all
+    floating with no topic and all eligible to keep the chain going."""
+    for new_claim_id in new_claim_ids:
+        if new_claim_id not in kept_ids:
+            await kb_db.delete_claim_cascade(new_claim_id)
+
+    kept_this_source = [c for c in new_claim_ids if c in kept_ids]
+    if kept_this_source:
+        for new_claim_id in kept_this_source:
+            await kb_db.set_claim_verification_override(new_claim_id, "exclude")
+        for topic in topics:
+            await kb_db.attach_source_to_topic(topic["id"], source_id, link_reason="verification_evidence")
+
+
 async def verify_claim(
     kb_db: KBDatabase, config: Config, claim_id: str, force: bool = False,
 ) -> VerificationResult:
@@ -309,6 +392,17 @@ async def verify_claim(
     supporting_ids: list[str] = []
     timings: dict[str, float] = {}
     verify_start = time.monotonic()
+    # Seeded from a prior inconclusive attempt's notes (see
+    # UNVERIFIED_RETRY_COOLDOWN_HOURS) so a retry's first search already knows
+    # to ask the LLM for something other than the literal claim text, instead
+    # of wasting its first search slot repeating a query that already failed
+    # to settle this claim once.
+    tried_queries: list[str] = list((claim.get("verification_notes") or {}).get("web_search_queries") or [])
+    # So any claim discovered as supporting/contradicting evidence during the
+    # web-fallback below can be attached to the same topic(s) as the claim
+    # being verified, instead of floating with no visible context for why it
+    # exists (see _quarantine_new_verification_claims).
+    own_topics = await kb_db.get_topics_for_claim(claim_id)
 
     extraction_base_url = config.kb.extraction_llm_base_url
     with _timed(timings, "detect_model"):
@@ -332,9 +426,19 @@ async def verify_claim(
         snapshot_store = SnapshotStore(config.kb_snapshot_dir)
         while not budget.should_stop() and budget.searches_remaining():
             budget.web_searches_used += 1
+            if tried_queries:
+                # Not the first search attempted against this claim (this run
+                # or a prior one) -- repeating the same query verbatim just
+                # gets the same top results back, so ask the LLM for a
+                # meaningfully different angle instead.
+                with _timed(timings, "llm_classify"):
+                    query = await _suggest_search_query(llm, claim["canonical_text"], tried_queries)
+            else:
+                query = claim["canonical_text"]
+            tried_queries.append(query)
             try:
                 with _timed(timings, "web_search"):
-                    results = await web_search(claim["canonical_text"], config)
+                    results = await web_search(query, config)
             except Exception:
                 break
             if not results:
@@ -376,7 +480,7 @@ async def verify_claim(
                     if extraction_result.observation_count == 0:
                         continue
                     with _timed(timings, "resolve_promote"):
-                        await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
+                        promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
 
                     with _timed(timings, "db_other"):
                         new_source_claims = await kb_db.get_claims_independent_of(
@@ -384,17 +488,36 @@ async def verify_claim(
                         )
                     with _timed(timings, "embedding_rank"):
                         new_ranked = await _rank_candidates_by_similarity(config, claim, new_source_claims)
+                    supports_before, contradicts_before = len(supporting_ids), len(contradiction_ids)
                     with _timed(timings, "llm_classify"):
                         await _examine_candidates(
                             kb_db, config, llm, claim, new_ranked, budget, examined_source_ids, contradiction_ids,
                             supporting_ids, phase="external",
                         )
+                    if promotion.new_claim_ids:
+                        kept_ids = set(supporting_ids[supports_before:]) | set(contradiction_ids[contradicts_before:])
+                        with _timed(timings, "resolve_promote"):
+                            await _resolve_new_verification_claims(
+                                kb_db, promotion.new_claim_ids, kept_ids, own_topics, ingest_result.source_id,
+                            )
                 except Exception:
                     # One bad web-fallback source (unparseable page, extraction
                     # LLM hiccup) shouldn't abort the whole verification and
                     # lose everything found so far -- treat it like any other
                     # unusable source and move on to the next search result.
                     continue
+                finally:
+                    # A page scraped/chunked/extracted purely to check this
+                    # claim that ended up contributing no surviving claim at
+                    # all (empty page, nothing extractable, or the one claim
+                    # it did produce wasn't the prover/disprover) is just as
+                    # much dead weight as the discarded claims themselves --
+                    # runs regardless of which exit path above was taken
+                    # (early continue, exception, or falling all the way
+                    # through), since all of them can leave zero evidence.
+                    with _timed(timings, "db_other"):
+                        if not await kb_db.source_has_claim_evidence(ingest_result.source_id):
+                            await kb_db.delete_source_cascade(ingest_result.source_id)
     finally:
         await llm.close()
 
@@ -409,6 +532,7 @@ async def verify_claim(
         "supporting_claim_ids": supporting_ids,
         "contradicting_claim_ids": contradiction_ids,
         "timings": timings,
+        "web_search_queries": tried_queries,
     }
     await kb_db.update_claim_verification(claim_id, status, notes)
 
@@ -424,6 +548,72 @@ STALE_RUN_THRESHOLD_HOURS = 9  # cron's own timeout is 8h; a "running" row older
 # than that survived past its own timeout, which only happens if the process
 # that owned it was killed (crash, reboot, manual kill) without a chance to
 # mark itself complete -- treat it as abandoned rather than blocking forever.
+
+UNVERIFIED_RETRY_COOLDOWN_HOURS = 72  # A first pass that ends "unverified"
+# (budget exhausted, no clear signal) is inconclusive, not a verdict -- unlike
+# supported/contradicted/mixed, it should get another look eventually rather
+# than being silently abandoned forever the moment verification_attempted_at
+# is set. The cooldown exists so the nightly sweep doesn't re-spend a GPU
+# search+extract pass on the same still-thin-coverage claim every single
+# night; _suggest_search_query gives the retry an actual shot at finding
+# something the first pass's query didn't.
+
+
+def _unverified_retry_due(claim: dict) -> bool:
+    if claim.get("status") != "unverified":
+        return False
+    attempted_at = claim.get("verification_attempted_at")
+    if attempted_at is None:
+        return False
+    return datetime.now(timezone.utc) - attempted_at >= timedelta(hours=UNVERIFIED_RETRY_COOLDOWN_HOURS)
+
+
+def is_claim_eligible_for_verification(claim: dict, threshold: float, force: bool = False) -> bool:
+    """Single source of truth for "should this claim be auto-verified,"
+    used by the nightly sweep, verify-source, and the paste-a-conversation
+    flow alike -- not every extracted statement is worth checking, and a
+    human can override the automatic importance-vs-threshold call either
+    way via claims.verification_override (see claim_check_status).
+
+    A claim already attempted is normally done for good -- except a claim
+    that came back "unverified" (inconclusive, not a settled verdict), which
+    becomes eligible again once _unverified_retry_due's cooldown has passed,
+    exactly as if it were never attempted. A deprecated claim (the losing
+    side of a claim merge, see kb.merge) is never eligible at all -- it's
+    just a pointer to the real, canonical claim now, not a live fact worth
+    spending a verification pass on."""
+    if claim.get("status") == "deprecated":
+        return False
+    if not force and claim.get("verification_attempted_at") is not None and not _unverified_retry_due(claim):
+        return False
+    override = claim.get("verification_override")
+    if override == "exclude":
+        return False
+    if override == "include":
+        return True
+    return (claim.get("importance_score") or 0) >= threshold
+
+
+def claim_check_status(claim: dict, threshold: float) -> str:
+    """Explains *why* a not-yet-verified claim will or won't be
+    auto-checked, for display (e.g. the paste-a-conversation breakdown) --
+    distinct from is_claim_eligible_for_verification's plain bool, since the
+    UI needs to say e.g. "excluded (manually)" vs "skipped (low
+    importance)" rather than just yes/no. Must mirror
+    is_claim_eligible_for_verification's rules exactly, or the UI shows a
+    "will check" promise the nightly sweep won't actually keep."""
+    if claim.get("status") == "deprecated":
+        return "deprecated"
+    override = claim.get("verification_override")
+    if override == "exclude":
+        return "manual_exclude"
+    if claim.get("verification_attempted_at") is not None and not _unverified_retry_due(claim):
+        return "checked" if claim.get("status") != "unverified" else "checked_pending_retry"
+    if override == "include":
+        return "manual_include"
+    if (claim.get("importance_score") or 0) >= threshold:
+        return "auto_check"
+    return "auto_skip"
 
 
 async def verify_claims_concurrently(
@@ -502,10 +692,7 @@ async def run_verification_sweep(
 
     all_claims = await kb_db.list_claims(limit=10000)
     eff_threshold = threshold if threshold is not None else config.kb.verification_importance_threshold
-    eligible = [
-        c for c in all_claims
-        if (c["importance_score"] or 0) >= eff_threshold and (c["verification_attempted_at"] is None or force)
-    ]
+    eligible = [c for c in all_claims if is_claim_eligible_for_verification(c, eff_threshold, force=force)]
     if limit is not None:
         eligible = eligible[:limit]
 

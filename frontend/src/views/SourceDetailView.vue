@@ -1,7 +1,7 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { Scissors, Sparkles, ShieldCheck } from 'lucide-vue-next'
+import { Scissors, Sparkles, ShieldCheck, Loader2 } from 'lucide-vue-next'
 import { useApi } from '../composables/useApi.js'
 
 const route = useRoute()
@@ -13,6 +13,7 @@ const versions = ref([])
 const fetchAttempts = ref([])
 const keyPoints = ref([])
 const loading = ref(true)
+const backgroundProcessing = ref(false)
 
 const chunking = ref(false)
 const chunkResult = ref(null)
@@ -24,7 +25,17 @@ const verifyForce = ref(false)
 const verifyThreshold = ref('')
 const verifyResult = ref(null)
 
-onMounted(load)
+let processingPollHandle = null
+
+onMounted(async () => {
+  await load()
+  processingPollHandle = setInterval(checkProcessingStatus, 3000)
+  checkProcessingStatus()
+})
+
+onUnmounted(() => {
+  if (processingPollHandle) clearInterval(processingPollHandle)
+})
 
 async function load() {
   loading.value = true
@@ -39,6 +50,18 @@ async function load() {
 async function loadKeyPoints() {
   const data = await api.fetchSourceClaims(sourceId.value)
   keyPoints.value = data.claims || []
+}
+
+async function checkProcessingStatus() {
+  const wasProcessing = backgroundProcessing.value
+  const data = await api.fetchSourceProcessingStatus(sourceId.value)
+  backgroundProcessing.value = !!data.processing
+  // Just finished (e.g. a pasted conversation's chunk/extract/verify
+  // background task) -- refresh so the new claims/versions actually show up
+  // without the user having to manually reload the page.
+  if (wasProcessing && !backgroundProcessing.value) {
+    await load()
+  }
 }
 
 const keyPointStatusColors = {
@@ -109,6 +132,15 @@ const statusColors = {
       <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">
         id: {{ source.id }} · trust: {{ source.trust_tier_code || '(none)' }}
       </p>
+    </div>
+
+    <div
+      v-if="backgroundProcessing"
+      class="flex items-center gap-2 mb-4 px-3 py-2 text-sm rounded-md bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300"
+    >
+      <Loader2 class="w-4 h-4 animate-spin shrink-0" />
+      Processing in the background (chunking, extracting, and verifying claims) — this can take a few minutes.
+      Feel free to navigate away; it keeps running on the server and this page will refresh automatically when it's done.
     </div>
 
     <!-- Actions -->

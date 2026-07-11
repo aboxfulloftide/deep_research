@@ -64,6 +64,19 @@ def canonical_key_for_url(url: str) -> str:
     return f"web:{normalize_url(url)}"
 
 
+_SOCIAL_MEDIA_DOMAINS = {"reddit.com", "instagram.com", "facebook.com"}
+
+
+def is_social_media_domain(url: str) -> bool:
+    """Reddit/Instagram/Facebook (and subdomains) are unvetted
+    user-generated content -- fine to read for context (a post might point
+    at a real source, or happen to also be corroborated by one), but a
+    verification's supports/contradicts determination should never rest
+    solely on one of these; see _examine_candidates in verification.py."""
+    host = (urlsplit(url).hostname or "").lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in _SOCIAL_MEDIA_DOMAINS)
+
+
 def youtube_video_id_from_url(url_or_id: str) -> str | None:
     """Extract an 11-char YouTube video ID from any common URL shape, or pass
     through a bare video ID."""

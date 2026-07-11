@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Globe, Plus, Search, Youtube, FileUp, Layers, MessageSquare } from 'lucide-vue-next'
+import { Globe, Plus, Search, Youtube, FileUp, Layers } from 'lucide-vue-next'
 import { useApi } from '../composables/useApi.js'
 
 const router = useRouter()
@@ -16,12 +16,9 @@ const addTab = ref('url')
 const urlInput = ref('')
 const youtubeInput = ref('')
 const fileInput = ref(null)
-const conversationInput = ref('')
-const conversationTitle = ref('')
 const trustTier = ref('')
 const submitting = ref(false)
 const lastIngestResult = ref(null)
-const conversationResult = ref(null)
 
 const showSearch = ref(false)
 const searchQuery = ref('')
@@ -51,9 +48,6 @@ function openSource(source) {
 }
 
 async function submitIngest() {
-  if (addTab.value === 'conversation') {
-    return submitConversation()
-  }
   submitting.value = true
   lastIngestResult.value = null
   try {
@@ -78,32 +72,6 @@ async function submitIngest() {
   } finally {
     submitting.value = false
   }
-}
-
-async function submitConversation() {
-  if (!conversationInput.value.trim()) return
-  submitting.value = true
-  conversationResult.value = null
-  try {
-    const data = await api.ingestConversation(
-      conversationInput.value.trim(), conversationTitle.value.trim() || null, trustTier.value || null,
-    )
-    conversationResult.value = data
-    conversationInput.value = ''
-    conversationTitle.value = ''
-    await loadSources()
-  } catch (e) {
-    conversationResult.value = { error: e.message }
-  } finally {
-    submitting.value = false
-  }
-}
-
-const claimStatusColors = {
-  unverified: 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300',
-  supported: 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300',
-  contradicted: 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300',
-  mixed: 'bg-yellow-100 dark:bg-yellow-900/40 text-yellow-700 dark:text-yellow-300',
 }
 
 function onFileChange(e) {
@@ -220,7 +188,7 @@ function formatDate(iso) {
     >
       <div class="flex items-center gap-1 border-b border-gray-200 dark:border-gray-700">
         <button
-          v-for="tab in [{ key: 'url', label: 'URL', icon: Globe }, { key: 'youtube', label: 'YouTube', icon: Youtube }, { key: 'file', label: 'File', icon: FileUp }, { key: 'conversation', label: 'Paste Text', icon: MessageSquare }]"
+          v-for="tab in [{ key: 'url', label: 'URL', icon: Globe }, { key: 'youtube', label: 'YouTube', icon: Youtube }, { key: 'file', label: 'File', icon: FileUp }]"
           :key="tab.key"
           @click="addTab = tab.key"
           class="flex items-center gap-1.5 px-3 py-2 text-sm border-b-2 transition-colors"
@@ -254,20 +222,6 @@ function formatDate(iso) {
         accept=".pdf,.md,.txt,.html,.docx"
         class="w-full text-sm text-gray-700 dark:text-gray-300"
       />
-      <template v-if="addTab === 'conversation'">
-        <input
-          v-model="conversationTitle"
-          type="text"
-          placeholder="Title (optional)"
-          class="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white"
-        />
-        <textarea
-          v-model="conversationInput"
-          rows="8"
-          placeholder="Paste a conversation here (e.g. 'User: ...' / 'Assistant: ...' turns). Claims made by any speaker will be extracted and fact-checked."
-          class="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white font-mono"
-        ></textarea>
-      </template>
 
       <div class="flex items-center gap-3">
         <select
@@ -281,14 +235,12 @@ function formatDate(iso) {
           :disabled="submitting"
           class="px-3 py-1.5 text-sm rounded-md bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
         >
-          {{ submitting
-            ? (addTab === 'conversation' ? 'Extracting & verifying...' : 'Ingesting...')
-            : (addTab === 'conversation' ? 'Ingest, Extract & Verify' : 'Ingest') }}
+          {{ submitting ? 'Ingesting...' : 'Ingest' }}
         </button>
       </div>
 
       <div
-        v-if="addTab !== 'conversation' && lastIngestResult"
+        v-if="lastIngestResult"
         class="px-3 py-2 text-sm rounded-md"
         :class="lastIngestResult.status === 'failed'
           ? 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300'
@@ -297,34 +249,6 @@ function formatDate(iso) {
         <template v-if="lastIngestResult.status === 'failed'">Failed: {{ lastIngestResult.error }}</template>
         <template v-else-if="lastIngestResult.status === 'unchanged'">No change — content is identical to the latest version.</template>
         <template v-else>Ingested a new version (source {{ lastIngestResult.source_created ? 'created' : 'existing' }}).</template>
-      </div>
-
-      <div v-if="addTab === 'conversation' && conversationResult" class="space-y-2">
-        <p v-if="conversationResult.error" class="px-3 py-2 text-sm rounded-md bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300">
-          Failed: {{ conversationResult.error }}
-        </p>
-        <template v-else>
-          <p class="text-sm text-gray-500 dark:text-gray-400">
-            {{ conversationResult.claim_count }} claim(s) found, {{ conversationResult.verified_count }} verified just now.
-            <a href="#" @click.prevent="router.push({ name: 'source', params: { id: conversationResult.source_id } })" class="text-blue-600 dark:text-blue-400 hover:underline">
-              View source
-            </a>
-          </p>
-          <div
-            v-for="c in conversationResult.claims"
-            :key="c.id"
-            class="flex items-start gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-md text-sm"
-          >
-            <span class="px-1.5 py-0.5 text-[10px] rounded uppercase font-medium shrink-0" :class="claimStatusColors[c.status] || claimStatusColors.unverified">
-              {{ c.status }}
-            </span>
-            <div class="min-w-0">
-              <p class="text-gray-900 dark:text-white">{{ c.canonical_text }}</p>
-              <p v-if="c.speakers?.length" class="text-xs text-gray-400 dark:text-gray-500">said by: {{ c.speakers.join(', ') }}</p>
-            </div>
-          </div>
-          <p v-if="conversationResult.claims.length === 0" class="text-sm text-gray-400 dark:text-gray-500">No claims worth checking were found in this text.</p>
-        </template>
       </div>
     </div>
 
@@ -344,6 +268,17 @@ function formatDate(iso) {
         <div class="min-w-0">
           <p class="text-sm font-medium text-gray-900 dark:text-white truncate">{{ source.title || source.canonical_uri }}</p>
           <p class="text-xs text-gray-500 dark:text-gray-400 truncate">{{ source.canonical_uri }}</p>
+          <p class="text-xs mt-0.5">
+            <span v-if="source.topic_names?.length" class="text-blue-600 dark:text-blue-400">
+              {{ source.topic_names.join(', ') }}
+            </span>
+            <span
+              class="ml-1.5"
+              :class="source.claim_count > 0 ? 'text-gray-400 dark:text-gray-500' : 'text-yellow-600 dark:text-yellow-400'"
+            >
+              {{ source.claim_count > 0 ? `${source.claim_count} claim(s)` : 'no surviving claims' }}
+            </span>
+          </p>
         </div>
         <div class="flex items-center gap-2 shrink-0 ml-3 text-xs text-gray-400 dark:text-gray-500">
           <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 uppercase">{{ source.source_type_code }}</span>

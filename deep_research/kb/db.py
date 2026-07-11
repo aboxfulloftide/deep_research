@@ -237,6 +237,12 @@ CREATE TABLE IF NOT EXISTS claims (
     importance_score DOUBLE PRECISION,
     verification_attempted_at TIMESTAMPTZ,
     verification_notes JSONB,
+    -- Not every extracted statement is worth checking (build order note:
+    -- "not everything said needs to be checked") -- NULL means "decide
+    -- automatically from importance_score vs the threshold", 'include'/
+    -- 'exclude' is a human overriding that automatic decision either way,
+    -- e.g. because the system's importance call was wrong for this one.
+    verification_override TEXT,
     is_user_reviewed BOOLEAN NOT NULL DEFAULT FALSE,
     reviewed_at TIMESTAMPTZ,
     reviewed_by TEXT,
@@ -251,6 +257,7 @@ CREATE TABLE IF NOT EXISTS claims (
 
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_notes JSONB;
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS merged_into_claim_id TEXT REFERENCES claims(id);
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_override TEXT;
 CREATE INDEX IF NOT EXISTS idx_claims_merged_into ON claims(merged_into_claim_id);
 
 -- Step 8: same embedding column as artifact_chunks, same nullable-until-embedded
@@ -388,9 +395,17 @@ CREATE TABLE IF NOT EXISTS topics (
     name TEXT NOT NULL,
     description TEXT,
     status TEXT NOT NULL DEFAULT 'active',
+    -- 'general' | 'conversation' -- a pasted conversation is a topic first
+    -- (the thing you actually care about: its claims, checked or not), not
+    -- a browsable source -- the "conversation" source underneath it is
+    -- just the pipeline's raw material, not something meant to be browsed
+    -- alongside web pages/PDFs/etc. on the Sources page.
+    topic_type TEXT NOT NULL DEFAULT 'general',
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+
+ALTER TABLE topics ADD COLUMN IF NOT EXISTS topic_type TEXT NOT NULL DEFAULT 'general';
 
 -- link_status carries both the explicit-attachment mechanism AND the
 -- suggest-then-review workflow decision 27 calls for, in the same table
@@ -773,12 +788,23 @@ class KBDatabase:
     # -- listing / display ------------------------------------------------
 
     async def list_sources(self, limit: int = 50) -> list[dict]:
+        """claim_count and topic_names answer "what is this tied to and why
+        is it listed" -- a source with claim_count=0 contributed nothing
+        (dead weight from a verification web-fallback that never found
+        anything worth keeping; see delete_source_cascade), and topic_names
+        shows which topic(s), if any, it's actually part of."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT s.*, st.code AS source_type_code, tt.code AS trust_tier_code "
+                "SELECT s.*, st.code AS source_type_code, tt.code AS trust_tier_code, "
+                "COUNT(DISTINCT ce.claim_id) AS claim_count, "
+                "COALESCE(array_agg(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL), '{}') AS topic_names "
                 "FROM sources s "
                 "JOIN source_types st ON st.id = s.source_type_id "
                 "LEFT JOIN trust_tiers tt ON tt.id = s.trust_tier_id "
+                "LEFT JOIN claim_evidence ce ON ce.source_id = s.id "
+                "LEFT JOIN topic_source_links tsl ON tsl.source_id = s.id AND tsl.link_status = 'attached' "
+                "LEFT JOIN topics t ON t.id = tsl.topic_id "
+                "GROUP BY s.id, st.code, tt.code "
                 "ORDER BY s.updated_at DESC LIMIT $1",
                 limit,
             )
@@ -1145,10 +1171,24 @@ class KBDatabase:
         return {r["id"]: dict(r) for r in rows}
 
     async def list_claims(self, limit: int = 100, include_merged: bool = False) -> list[dict]:
-        merged_clause = "" if include_merged else "WHERE merged_into_claim_id IS NULL"
+        """topics answers "is this tied to anything, and why is it listed"
+        on the general Claims page -- a claim discovered purely as
+        verification evidence for another claim is easy to mistake for an
+        unexplained orphan if you can't see which topic (if any) actually
+        claimed it. Includes the id (not just the name) so the UI can link
+        straight to it."""
+        merged_clause = "" if include_merged else "WHERE c.merged_into_claim_id IS NULL"
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                f"SELECT * FROM claims {merged_clause} ORDER BY updated_at DESC LIMIT $1", limit,
+                f"SELECT c.*, "
+                f"COALESCE(jsonb_agg(DISTINCT jsonb_build_object('id', t.id, 'name', t.name)) "
+                f"FILTER (WHERE t.id IS NOT NULL), '[]'::jsonb) AS topics "
+                f"FROM claims c "
+                f"LEFT JOIN claim_topics ct ON ct.claim_id = c.id AND ct.link_status = 'attached' "
+                f"LEFT JOIN topics t ON t.id = ct.topic_id "
+                f"{merged_clause} "
+                f"GROUP BY c.id ORDER BY c.updated_at DESC LIMIT $1",
+                limit,
             )
         return [dict(r) for r in rows]
 
@@ -1317,6 +1357,83 @@ class KBDatabase:
                 status, now, verification_notes, now, claim_id,
             )
         return dict(row)
+
+    async def set_claim_verification_override(self, claim_id: str, override: str | None) -> dict:
+        """override is 'include' (always check, regardless of importance),
+        'exclude' (never auto-check), or None (fall back to the automatic
+        importance-vs-threshold decision) -- see is_claim_eligible_for_verification."""
+        if override not in (None, "include", "exclude"):
+            raise ValueError(f"invalid verification_override: {override!r}")
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE claims SET verification_override = $1, updated_at = $2 WHERE id = $3 RETURNING *",
+                override, now, claim_id,
+            )
+        return dict(row)
+
+    async def delete_claim_cascade(self, claim_id: str) -> None:
+        """Hard-deletes a claim and everything that references it (evidence,
+        metrics, topic links, resolution candidates) -- used right after
+        verification for a newly-discovered claim that turned out not to be
+        the one that actually proved/disproved the target. Extraction can
+        promote several claims from one scraped page, but only the claim an
+        LLM comparison pass actually classified as supports/contradicts is
+        worth keeping; the rest are tangential facts from the same page that
+        would otherwise sit in the KB forever with no reason to exist.
+        Leaves the underlying source/chunks/artifacts alone -- only the
+        claim itself (and things that exist purely to reference it) goes."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE extracted_observations SET candidate_claim_id = NULL WHERE candidate_claim_id = $1",
+                    claim_id,
+                )
+                await conn.execute("DELETE FROM metrics WHERE claim_id = $1", claim_id)
+                await conn.execute("DELETE FROM claim_topics WHERE claim_id = $1", claim_id)
+                await conn.execute(
+                    "DELETE FROM resolution_candidates WHERE left_claim_id = $1 OR right_claim_id = $1", claim_id,
+                )
+                await conn.execute("DELETE FROM claim_evidence WHERE claim_id = $1", claim_id)
+                await conn.execute("UPDATE claims SET merged_into_claim_id = NULL WHERE merged_into_claim_id = $1", claim_id)
+                await conn.execute("DELETE FROM claims WHERE id = $1", claim_id)
+
+    async def source_has_claim_evidence(self, source_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchval("SELECT 1 FROM claim_evidence WHERE source_id = $1 LIMIT 1", source_id)
+        return row is not None
+
+    async def delete_source_cascade(self, source_id: str) -> None:
+        """Hard-deletes a source and everything under it (versions,
+        artifacts, chunks, extraction runs/observations, fetch attempts,
+        topic links) -- only call once source_has_claim_evidence is False.
+        Mirrors delete_claim_cascade's reasoning one level up: a page
+        scraped purely to check one claim, that ended up contributing no
+        surviving claim at all, shouldn't sit in the KB forever as dead
+        weight just because it was looked at once during verification."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                version_ids = [r["id"] for r in await conn.fetch(
+                    "SELECT id FROM source_versions WHERE source_id = $1", source_id,
+                )]
+                artifact_ids = [r["id"] for r in await conn.fetch(
+                    "SELECT id FROM artifacts WHERE source_version_id = ANY($1::text[])", version_ids,
+                )]
+                extraction_run_ids = [r["id"] for r in await conn.fetch(
+                    "SELECT id FROM extraction_runs WHERE artifact_id = ANY($1::text[])", artifact_ids,
+                )]
+
+                await conn.execute("UPDATE claims SET preferred_source_id = NULL WHERE preferred_source_id = $1", source_id)
+                await conn.execute(
+                    "DELETE FROM extracted_observations WHERE extraction_run_id = ANY($1::text[])", extraction_run_ids,
+                )
+                await conn.execute("DELETE FROM extraction_runs WHERE id = ANY($1::text[])", extraction_run_ids)
+                await conn.execute("DELETE FROM topic_source_links WHERE source_id = $1", source_id)
+                await conn.execute("DELETE FROM source_fetch_attempts WHERE source_id = $1", source_id)
+                await conn.execute("DELETE FROM artifact_chunks WHERE artifact_id = ANY($1::text[])", artifact_ids)
+                await conn.execute("DELETE FROM artifacts WHERE id = ANY($1::text[])", artifact_ids)
+                await conn.execute("DELETE FROM source_versions WHERE id = ANY($1::text[])", version_ids)
+                await conn.execute("DELETE FROM sources WHERE id = $1", source_id)
 
     async def add_claim_evidence(
         self, claim_id: str, artifact_chunk_id: str, source_id: str, source_version_id: str,
@@ -1660,17 +1777,42 @@ class KBDatabase:
 
     # -- topics (build order step 7) --------------------------------------
 
-    async def create_topic(self, name: str, description: str | None = None, slug: str | None = None) -> dict:
+    async def create_topic(
+        self, name: str, description: str | None = None, slug: str | None = None, topic_type: str = "general",
+    ) -> dict:
         topic_id = _new_id()
         now = _now()
         slug = slug or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "INSERT INTO topics (id, slug, name, description, status, created_at, updated_at) "
-                "VALUES ($1, $2, $3, $4, 'active', $5, $6) RETURNING *",
-                topic_id, slug, name, description, now, now,
+                "INSERT INTO topics (id, slug, name, description, status, topic_type, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, 'active', $5, $6, $7) RETURNING *",
+                topic_id, slug, name, description, topic_type, now, now,
             )
         return dict(row)
+
+    async def get_or_create_topic(
+        self, name: str, description: str | None = None, topic_type: str = "general",
+    ) -> tuple[dict, bool]:
+        """Reuses an existing topic with the same derived slug instead of
+        hitting the slug UNIQUE constraint -- lets callers (e.g. pasting
+        several related conversations) group them under one topic just by
+        giving the same name, without needing to look up an existing topic
+        id first. Opportunistically upgrades a reused 'general' topic to
+        'conversation' if that's what this call wants tagged -- pasting a
+        conversation into a topic that already exists should still mark it,
+        rather than silently leaving the flag off."""
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchrow("SELECT * FROM topics WHERE slug = $1", slug)
+            if existing is not None:
+                if topic_type == "conversation" and existing["topic_type"] == "general":
+                    existing = await conn.fetchrow(
+                        "UPDATE topics SET topic_type = 'conversation', updated_at = $1 WHERE id = $2 RETURNING *",
+                        _now(), existing["id"],
+                    )
+                return dict(existing), False
+        return await self.create_topic(name, description, slug=slug, topic_type=topic_type), True
 
     async def get_topic(self, topic_id: str) -> dict | None:
         async with self.pool.acquire() as conn:
@@ -1801,6 +1943,20 @@ class KBDatabase:
         query += " ORDER BY c.updated_at DESC"
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(query, *params)
+        return [dict(r) for r in rows]
+
+    async def get_topics_for_claim(self, claim_id: str, link_status: str = "attached") -> list[dict]:
+        """Reverse of list_topic_claims -- which topic(s) a claim already
+        belongs to. Used so a claim discovered as supporting/contradicting
+        evidence while verifying a topic's claim can be attached to that
+        same topic, instead of floating in the KB with no visible context
+        for why it exists."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT t.* FROM topics t JOIN claim_topics ct ON ct.topic_id = t.id "
+                "WHERE ct.claim_id = $1 AND ct.link_status = $2",
+                claim_id, link_status,
+            )
         return [dict(r) for r in rows]
 
     async def list_topic_sources(self, topic_id: str, link_status: str | None = "attached") -> list[dict]:

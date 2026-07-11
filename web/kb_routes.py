@@ -27,7 +27,13 @@ from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
 from deep_research.kb.timeline import get_topic_timeline
 from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
-from deep_research.kb.verification import run_verification_sweep, verify_claim, verify_claims_concurrently
+from deep_research.kb.verification import (
+    claim_check_status,
+    is_claim_eligible_for_verification,
+    run_verification_sweep,
+    verify_claim,
+    verify_claims_concurrently,
+)
 
 router = APIRouter(prefix="/api/kb")
 
@@ -90,6 +96,10 @@ class PreferredSourceRequest(BaseModel):
     source_id: str
 
 
+class VerificationOverrideRequest(BaseModel):
+    override: str | None = None  # 'include' | 'exclude' | None
+
+
 class IngestUrlRequest(BaseModel):
     url: str
     trust_tier: str | None = None
@@ -105,6 +115,7 @@ class IngestConversationRequest(BaseModel):
     title: str | None = None
     trust_tier: str | None = None
     threshold: float | None = None
+    topic_name: str | None = None
 
 
 class ChunkSourceRequest(BaseModel):
@@ -148,6 +159,15 @@ def _serialize(obj):
     if isinstance(obj, Vector):
         return None
     return obj
+
+
+def _with_check_status(claims: list[dict]) -> list[dict]:
+    """Attaches check_status ('auto_check' | 'auto_skip' | 'manual_include' |
+    'manual_exclude') to each claim -- the "will this be auto-verified, and
+    why" breakdown, for the paste-a-conversation flow and any other claims
+    list that wants to show/toggle it."""
+    threshold = config.kb.verification_importance_threshold
+    return [{**c, "check_status": claim_check_status(c, threshold)} for c in claims]
 
 
 @router.get("/topics")
@@ -197,7 +217,7 @@ async def get_timeline(topic_id: str):
 async def list_claims(topic_id: str, status: str = "attached"):
     topic = await _get_topic_or_404(topic_id)
     claims = await kb_db.list_topic_claims(topic["id"], link_status=status)
-    return {"claims": _serialize(claims)}
+    return {"claims": _serialize(_with_check_status(claims))}
 
 
 @router.get("/topics/{topic_id}/sources")
@@ -333,6 +353,24 @@ async def set_preferred_source(claim_id: str, req: PreferredSourceRequest):
     return {"claim": _serialize(updated)}
 
 
+@router.put("/claims/{claim_id}/verification-override")
+async def set_claim_verification_override(claim_id: str, req: VerificationOverrideRequest):
+    """Flag/deflag a claim for auto-verification -- not every extracted
+    statement needs a claim check, and this lets a human correct the
+    system's importance-based guess either way (force-include something it
+    skipped, or force-exclude something it flagged that isn't worth
+    checking)."""
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(404, "Claim not found")
+    if req.override not in (None, "include", "exclude"):
+        raise HTTPException(400, "override must be 'include', 'exclude', or null")
+    updated = await kb_db.set_claim_verification_override(claim_id, req.override)
+    return {"claim": _serialize({**updated, "check_status": claim_check_status(
+        updated, config.kb.verification_importance_threshold,
+    )})}
+
+
 def _evidence_summary(rows: list[dict]) -> list[dict]:
     """Trims claim_evidence rows down to what a reviewer actually needs to
     judge a claim_duplicate/claim_contradiction candidate: which source it
@@ -409,8 +447,14 @@ async def review_candidate(candidate_id: str, req: ReviewCandidateRequest):
 
 
 @router.get("/sources")
-async def search_sources(q: str = "", limit: int = 50):
+async def search_sources(q: str = "", limit: int = 50, include_conversations: bool = False):
+    """A pasted conversation's underlying 'conversation' source is pipeline
+    plumbing (it needs a source to hang chunks/extraction/evidence off of),
+    not something meant to be browsed here -- the topic it's attached to is
+    the actual thing to look at, so these are hidden by default."""
     sources = await kb_db.list_sources(limit=500)
+    if not include_conversations:
+        sources = [s for s in sources if s.get("source_type_code") != "conversation"]
     if q:
         q_lower = q.lower()
         sources = [
@@ -450,14 +494,68 @@ async def ingest_file_route(file: UploadFile = File(...), trust_tier: str | None
     return {"result": asdict(result)}
 
 
+_processing_source_ids: set[str] = set()
+
+
+async def _process_conversation_source(source_id: str, threshold: float | None, topic_id: str | None) -> None:
+    """Runs chunk -> extract -> resolve/promote -> verify in the background
+    after a conversation's fast synchronous ingest step returns, so the web
+    request doesn't block for however long verification takes (minutes, per
+    HARDWARE.md's timing measurements) -- the client gets the source_id back
+    immediately and can navigate to the Source Detail page right away, which
+    polls /processing to show that work is still happening. Runs to
+    completion regardless of whether the client is still around to see it;
+    an in-memory set (not a DB row) is enough tracking since this is a
+    single-worker dev server, not a durably-scheduled job like the nightly
+    verification sweep."""
+    _processing_source_ids.add(source_id)
+    try:
+        source = await kb_db.get_source(source_id)
+        version = await kb_db.get_latest_version(source_id)
+        chunk_result = await build_artifact_for_version(kb_db, snapshot_store, source, version, config=config)
+        if chunk_result.chunk_count == 0:
+            return
+
+        artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
+        extraction_result = await run_extraction(kb_db, config, artifacts[0]["id"])
+        if extraction_result.observation_count == 0:
+            return
+
+        promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
+        await check_claims_against_topics(kb_db, promotion.new_claim_ids)
+        if topic_id is not None:
+            # attach_source_to_topic was already called once at ingest time
+            # (before any claims existed, just to link the topic<->source);
+            # calling it again now sweeps the claims resolve_and_promote just
+            # created into the topic as 'attached', not merely 'suggested' --
+            # the whole point of grouping a pasted conversation under a topic
+            # is to see its claims there without a manual review step.
+            await kb_db.attach_source_to_topic(topic_id, source_id, link_reason="conversation_paste")
+
+        claims = await kb_db.list_claims_for_source(source_id, limit=500)
+        eff_threshold = threshold if threshold is not None else config.kb.verification_importance_threshold
+        eligible = [c for c in claims if is_claim_eligible_for_verification(c, eff_threshold)]
+        await verify_claims_concurrently(kb_db, config, eligible)
+    finally:
+        _processing_source_ids.discard(source_id)
+
+
 @router.post("/sources/ingest-conversation")
-async def ingest_conversation_route(req: IngestConversationRequest):
+async def ingest_conversation_route(req: IngestConversationRequest, background_tasks: BackgroundTasks):
     """Paste a chat conversation, get claims extracted (tagged with who said
-    them, via the conversation-turn chunker's section_label) and verified
-    against independent sources -- ingest, chunk, extract, and verify all in
-    one call, rather than the multi-step flow other source types use, since
-    the point of pasting a conversation is usually "just tell me what's true
-    in this," not building up a long-lived source incrementally."""
+    them) and verified against independent sources, grouped under a topic so
+    there's context beyond a flat claims list -- a pasted conversation is
+    always attached to a topic (named after req.topic_name, or the source's
+    own title if not given), reusing an existing topic with the same name if
+    one exists so multiple related pastes can be grouped together. Only the
+    ingest step (writing the text as a source) happens synchronously --
+    chunk/extract/verify can take minutes, so they run as a background task
+    instead of blocking the request; the client gets source_id/topic_id back
+    immediately and should navigate to the Topic Detail page, which shows
+    live progress via GET .../processing rather than leaving the Sources
+    page looking frozen with no way to tell whether it's working or whether
+    leaving would lose the result (it doesn't -- this keeps running
+    server-side either way)."""
     ingest_result = await ingest_pasted_text(
         req.text, kb_db, snapshot_store, title=req.title, trust_tier_code=req.trust_tier,
     )
@@ -465,49 +563,51 @@ async def ingest_conversation_route(req: IngestConversationRequest):
         raise HTTPException(400, ingest_result.error or "Ingestion failed")
 
     source = await kb_db.get_source(ingest_result.source_id)
-    version = await kb_db.get_source_version(ingest_result.version_id)
+    topic_name = req.topic_name or source["title"] or "Pasted conversation"
+    topic, _ = await kb_db.get_or_create_topic(topic_name, topic_type="conversation")
+    await kb_db.attach_source_to_topic(topic["id"], ingest_result.source_id, link_reason="conversation_paste")
 
-    chunk_result = await build_artifact_for_version(kb_db, snapshot_store, source, version, config=config)
-    if chunk_result.chunk_count == 0:
-        return {"source_id": source["id"], "claim_count": 0, "verified_count": 0, "claims": [],
-                "message": "No text found to extract claims from."}
+    background_tasks.add_task(
+        _process_conversation_source, ingest_result.source_id, req.threshold, topic["id"],
+    )
+    return {"source_id": ingest_result.source_id, "topic_id": topic["id"], "status": "processing"}
 
-    artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
-    extraction_result = await run_extraction(kb_db, config, artifacts[0]["id"])
 
-    if extraction_result.observation_count > 0:
-        promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
-        await check_claims_against_topics(kb_db, promotion.new_claim_ids)
+@router.get("/sources/{source_id}/processing")
+async def get_source_processing_status(source_id: str):
+    return {"processing": source_id in _processing_source_ids}
 
-    claims = await kb_db.list_claims_for_source(source["id"], limit=500)
-    speakers = await kb_db.get_claim_speakers_for_source(source["id"])
 
-    threshold = req.threshold if req.threshold is not None else config.kb.verification_importance_threshold
-    eligible = [
-        c for c in claims
-        if (c["importance_score"] or 0) >= threshold and c["verification_attempted_at"] is None
-    ]
-    outcomes = await verify_claims_concurrently(kb_db, config, eligible)
-    outcomes_by_id = {claim["id"]: (status, result) for claim, status, result in outcomes}
+_processing_topic_ids: set[str] = set()
 
-    claim_results = []
-    for c in claims:
-        status, result = outcomes_by_id.get(c["id"], (c["status"], None))
-        claim_results.append({
-            "id": c["id"],
-            "canonical_text": c["canonical_text"],
-            "speakers": speakers.get(c["id"], []),
-            "status": status,
-            "importance_score": c["importance_score"],
-            "verified": c["id"] in outcomes_by_id,
-        })
 
-    return {
-        "source_id": source["id"],
-        "claim_count": len(claims),
-        "verified_count": len(outcomes),
-        "claims": claim_results,
-    }
+async def _process_topic_verification(topic_id: str, threshold: float | None) -> None:
+    """Verifies whatever's currently eligible among a topic's attached
+    claims -- the manual trigger for claims a human just flagged (or
+    unflagged) via verification_override, so they don't have to wait for the
+    nightly sweep to pick it up."""
+    _processing_topic_ids.add(topic_id)
+    try:
+        claims = await kb_db.list_topic_claims(topic_id, link_status="attached")
+        eff_threshold = threshold if threshold is not None else config.kb.verification_importance_threshold
+        eligible = [c for c in claims if is_claim_eligible_for_verification(c, eff_threshold)]
+        await verify_claims_concurrently(kb_db, config, eligible)
+    finally:
+        _processing_topic_ids.discard(topic_id)
+
+
+@router.post("/topics/{topic_id}/verify")
+async def trigger_topic_verification(topic_id: str, background_tasks: BackgroundTasks):
+    topic = await _get_topic_or_404(topic_id)
+    if topic["id"] in _processing_topic_ids:
+        raise HTTPException(409, "Already verifying this topic's claims")
+    background_tasks.add_task(_process_topic_verification, topic["id"], None)
+    return {"status": "processing"}
+
+
+@router.get("/topics/{topic_id}/processing")
+async def get_topic_processing_status(topic_id: str):
+    return {"processing": topic_id in _processing_topic_ids}
 
 
 async def _resolve_source_or_404(source_id: str) -> dict:
@@ -582,7 +682,7 @@ async def get_source_claims(source_id: str):
     at least one piece of evidence from it, most important first."""
     source = await _resolve_source_or_404(source_id)
     claims = await kb_db.list_claims_for_source(source["id"])
-    return {"claims": _serialize(claims)}
+    return {"claims": _serialize(_with_check_status(claims))}
 
 
 @router.post("/sources/{source_id}/verify")
@@ -597,11 +697,7 @@ async def verify_source_route(source_id: str, req: VerifySourceRequest):
     source_claims = await kb_db.list_claims_for_source(source["id"], limit=5000)
 
     threshold = req.threshold if req.threshold is not None else config.kb.verification_importance_threshold
-    eligible = [
-        c for c in source_claims
-        if (c["importance_score"] or 0) >= threshold
-        and (c["verification_attempted_at"] is None or req.force)
-    ]
+    eligible = [c for c in source_claims if is_claim_eligible_for_verification(c, threshold, force=req.force)]
 
     outcomes = await verify_claims_concurrently(kb_db, config, eligible, force=req.force)
     results = []
@@ -616,7 +712,7 @@ async def verify_source_route(source_id: str, req: VerifySourceRequest):
 @router.get("/claims")
 async def list_all_claims(limit: int = 100):
     claims = await kb_db.list_claims(limit=limit)
-    return {"claims": _serialize(claims)}
+    return {"claims": _serialize(_with_check_status(claims))}
 
 
 @router.post("/claims/{claim_id}/verify")

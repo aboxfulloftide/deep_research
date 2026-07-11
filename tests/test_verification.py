@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from deep_research.kb import verification as v
 
 
@@ -78,6 +80,128 @@ def test_budget_final_status_unverified_by_default():
     assert budget.final_status() == "unverified"
 
 
+# -- eligibility / check_status: settled vs. inconclusive claims -------------
+# A settled verdict (supported/contradicted/mixed) is never auto-rechecked.
+# An "unverified" (inconclusive) first pass is a different case -- it gets a
+# second look automatically once UNVERIFIED_RETRY_COOLDOWN_HOURS has passed,
+# rather than being abandoned forever the moment verification_attempted_at is
+# set. claim_check_status must always agree with is_claim_eligible_for_verification
+# (see the docstring on claim_check_status) -- these tests check both in step.
+
+def _claim(**overrides) -> dict:
+    base = {
+        "status": "unverified",
+        "importance_score": 0.9,
+        "verification_attempted_at": None,
+        "verification_override": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_never_attempted_claim_above_threshold_is_eligible():
+    claim = _claim()
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is True
+    assert v.claim_check_status(claim, threshold=0.8) == "auto_check"
+
+
+def test_never_attempted_claim_below_threshold_is_not_eligible():
+    claim = _claim(importance_score=0.5)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is False
+    assert v.claim_check_status(claim, threshold=0.8) == "auto_skip"
+
+
+def test_settled_claim_never_auto_rechecked_even_long_after_attempt():
+    old = datetime.now(timezone.utc) - timedelta(days=365)
+    claim = _claim(status="supported", verification_attempted_at=old)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is False
+    assert v.claim_check_status(claim, threshold=0.8) == "checked"
+
+
+def test_contradicted_and_mixed_claims_are_also_settled():
+    old = datetime.now(timezone.utc) - timedelta(days=365)
+    for status in ("contradicted", "mixed"):
+        claim = _claim(status=status, verification_attempted_at=old)
+        assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is False
+        assert v.claim_check_status(claim, threshold=0.8) == "checked"
+
+
+def test_unverified_claim_within_cooldown_is_not_yet_eligible():
+    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    claim = _claim(status="unverified", verification_attempted_at=recent)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is False
+    assert v.claim_check_status(claim, threshold=0.8) == "checked_pending_retry"
+
+
+def test_unverified_claim_past_cooldown_is_eligible_again():
+    old = datetime.now(timezone.utc) - timedelta(hours=v.UNVERIFIED_RETRY_COOLDOWN_HOURS + 1)
+    claim = _claim(status="unverified", verification_attempted_at=old)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is True
+    assert v.claim_check_status(claim, threshold=0.8) == "auto_check"
+
+
+def test_unverified_claim_past_cooldown_but_below_threshold_is_auto_skip():
+    old = datetime.now(timezone.utc) - timedelta(hours=v.UNVERIFIED_RETRY_COOLDOWN_HOURS + 1)
+    claim = _claim(status="unverified", verification_attempted_at=old, importance_score=0.5)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is False
+    assert v.claim_check_status(claim, threshold=0.8) == "auto_skip"
+
+
+def test_manual_exclude_always_wins_regardless_of_attempt_state():
+    claim = _claim(status="supported", verification_attempted_at=datetime.now(timezone.utc), verification_override="exclude")
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is False
+    assert v.claim_check_status(claim, threshold=0.8) == "manual_exclude"
+
+
+def test_force_bypasses_the_attempted_and_cooldown_gate():
+    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    claim = _claim(status="unverified", verification_attempted_at=recent)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8, force=True) is True
+
+
+def test_deprecated_claim_is_never_eligible_even_if_never_attempted():
+    # The losing side of a claim merge -- just a pointer to the real claim
+    # now, not a live fact worth a verification pass, regardless of
+    # importance score or whether it was ever individually checked.
+    claim = _claim(status="deprecated", verification_attempted_at=None, importance_score=0.99)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8) is False
+    assert v.claim_check_status(claim, threshold=0.8) == "deprecated"
+
+
+def test_deprecated_claim_is_never_eligible_even_with_force():
+    claim = _claim(status="deprecated", verification_attempted_at=None, importance_score=0.99)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.8, force=True) is False
+
+
+# -- _suggest_search_query: repeating a failed query wastes the retry --------
+
+async def test_suggest_search_query_uses_llm_suggestion():
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": '{"query": "specific alternate query"}'}}]}
+
+    result = await v._suggest_search_query(FakeLLM(), "Some claim text.", ["Some claim text."])
+    assert result == "specific alternate query"
+
+
+async def test_suggest_search_query_falls_back_to_claim_text_on_garbage_response():
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": "not json"}}]}
+
+    result = await v._suggest_search_query(FakeLLM(), "Some claim text.", ["Some claim text."])
+    assert result == "Some claim text."
+
+
+async def test_suggest_search_query_falls_back_to_claim_text_on_empty_query():
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": '{"query": ""}'}}]}
+
+    result = await v._suggest_search_query(FakeLLM(), "Some claim text.", ["Some claim text."])
+    assert result == "Some claim text."
+
+
 # -- _examine_candidates resilience (hardening pass) -------------------------
 # A transient failure classifying one candidate must not abort examination of
 # the rest, and must not propagate out of _examine_candidates at all -- this
@@ -119,6 +243,50 @@ async def test_examine_candidates_survives_one_failing_comparison(kb_db, monkeyp
 
     assert call_count["n"] == 2  # both candidates were attempted despite the first raising
     assert budget.sources_examined == 2  # progress wasn't lost after the failure
+
+
+# -- social-media-only sources can't settle a verification -------------------
+# Reddit/Instagram/Facebook are unvetted user-generated content -- fine to
+# read, but if that's the *only* evidence a candidate claim has, it must
+# never single-handedly mark the target claim supported/contradicted.
+
+async def test_examine_candidates_skips_llm_call_for_social_media_only_source(kb_db, monkeypatch):
+    target, _ = await kb_db.get_or_create_claim("fact", "Target claim for social-media test.")
+    reddit_claim, _ = await kb_db.get_or_create_claim("fact", "A claim only backed by a Reddit post.")
+    real_claim, _ = await kb_db.get_or_create_claim("fact", "A claim backed by a real news source.")
+
+    reddit_source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="https://www.reddit.com/r/test/comments/abc", canonical_key="reddit-abc",
+    )
+    real_source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="https://www.example-news.example/article", canonical_key="real-article",
+    )
+    reddit_version, _ = await kb_db.add_source_version(reddit_source["id"], content_hash="h1", snapshot_path="/tmp/r", http_status=200, mime_type="text/html")
+    real_version, _ = await kb_db.add_source_version(real_source["id"], content_hash="h2", snapshot_path="/tmp/n", http_status=200, mime_type="text/html")
+    reddit_artifact, _ = await kb_db.upsert_artifact(artifact_id="art-reddit", source_version_id=reddit_version["id"], artifact_type="clean_text", storage_path="/tmp/r.txt", content_hash="h1", chunk_params_hash="p1")
+    real_artifact, _ = await kb_db.upsert_artifact(artifact_id="art-real", source_version_id=real_version["id"], artifact_type="clean_text", storage_path="/tmp/n.txt", content_hash="h2", chunk_params_hash="p1")
+    reddit_chunk = await kb_db.add_chunk(reddit_artifact["id"], 0, "reddit chunk", "chash-r")
+    real_chunk = await kb_db.add_chunk(real_artifact["id"], 0, "real chunk", "chash-n")
+    await kb_db.add_claim_evidence(claim_id=reddit_claim["id"], artifact_chunk_id=reddit_chunk["id"], source_id=reddit_source["id"], source_version_id=reddit_version["id"])
+    await kb_db.add_claim_evidence(claim_id=real_claim["id"], artifact_chunk_id=real_chunk["id"], source_id=real_source["id"], source_version_id=real_version["id"])
+
+    classified = []
+
+    async def fake_classify(llm, a, b):
+        classified.append(b)
+        return {"relationship": "supports", "confidence": 0.9, "reasoning": "test"}
+
+    monkeypatch.setattr(v, "_classify_relationship", fake_classify)
+
+    budget = v._Budget(max_sources=10, max_searches=1)
+    ranked = [(reddit_claim, 0.9), (real_claim, 0.8)]
+
+    await v._examine_candidates(kb_db, None, None, target, ranked, budget, set(), [], supporting_ids=[])
+
+    assert real_claim["canonical_text"] in classified
+    assert reddit_claim["canonical_text"] not in classified  # never sent to the LLM at all
+    assert budget.supports == 1  # only the real source's support counted
+    assert budget.sources_examined == 2  # the reddit source still cost budget -- it was looked at
 
 
 async def test_rank_candidates_degrades_gracefully_when_embedding_backend_down(kb_db, monkeypatch):
@@ -181,3 +349,102 @@ async def test_run_verification_sweep_treats_old_running_run_as_abandoned(kb_db)
     assert stale_row["status"] == "failed"
     assert "Abandoned" in stale_row["error_message"]
     assert summary["eligible_count"] == 0
+
+
+# -- keep-or-delete claims discovered during web-fallback verification ------
+# The bug this guards against: extracting a scraped page's top chunks can
+# promote several new claims, but only the one an LLM comparison pass
+# actually classifies as supports/contradicts is worth keeping. Without
+# discarding the rest, verifying claim A pulls in claims B/C/D from other
+# pages, and if any of them also meet the importance threshold, the next
+# sweep verifies *them* too -- unbounded compounding growth with no way to
+# ever finish. Found in practice: a real KB had 1500+ such claims after one
+# night, almost none of them ever established as relevant to anything, all
+# floating with no topic and all eligible to keep the chain going.
+
+async def _make_source_with_evidenced_claim(kb_db, claim_id, canonical_uri):
+    source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri=canonical_uri, canonical_key=canonical_uri,
+    )
+    version, _ = await kb_db.add_source_version(
+        source["id"], content_hash="h1", snapshot_path="/tmp/x", http_status=200, mime_type="text/html",
+    )
+    artifact, _ = await kb_db.upsert_artifact(
+        artifact_id=f"art-{canonical_uri}", source_version_id=version["id"], artifact_type="clean_text",
+        storage_path="/tmp/x.txt", content_hash="h1", chunk_params_hash="p1",
+    )
+    chunk = await kb_db.add_chunk(artifact["id"], 0, "text", "chash")
+    await kb_db.add_claim_evidence(
+        claim_id=claim_id, artifact_chunk_id=chunk["id"], source_id=source["id"], source_version_id=version["id"],
+    )
+    return source
+
+
+async def test_resolve_new_verification_claims_keeps_and_tags_the_proving_claim(kb_db):
+    topic = await kb_db.create_topic("Data Centers")
+    kept, _ = await kb_db.get_or_create_claim("fact", "Groundwater supply could soon come under pressure.")
+    discarded, _ = await kb_db.get_or_create_claim("fact", "Tangential fact from the same scraped page.")
+    source = await _make_source_with_evidenced_claim(kb_db, kept["id"], "http://kept-claim-source.example")
+
+    await v._resolve_new_verification_claims(
+        kb_db, [kept["id"], discarded["id"]], kept_ids={kept["id"]}, topics=[topic], source_id=source["id"],
+    )
+
+    kept_after = await kb_db.get_claim(kept["id"])
+    assert kept_after["verification_override"] == "exclude"
+    assert v.claim_check_status(kept_after, threshold=0.8) == "manual_exclude"
+    linked_topics = await kb_db.get_topics_for_claim(kept["id"])
+    assert [t["id"] for t in linked_topics] == [topic["id"]]
+
+    # the source itself is tied to the topic too, not just the claim -- so
+    # it shows up in context on the Sources page instead of floating
+    # unexplained.
+    source_topics = await kb_db.list_topic_sources(topic["id"])
+    assert [s["id"] for s in source_topics] == [source["id"]]
+
+
+async def test_resolve_new_verification_claims_deletes_the_non_proving_claims(kb_db):
+    kept, _ = await kb_db.get_or_create_claim("fact", "The proving claim.")
+    discarded, _ = await kb_db.get_or_create_claim("fact", "A tangential fact never established as relevant.")
+    source = await _make_source_with_evidenced_claim(kb_db, kept["id"], "http://another-kept-claim-source.example")
+
+    await v._resolve_new_verification_claims(
+        kb_db, [kept["id"], discarded["id"]], kept_ids={kept["id"]}, topics=[], source_id=source["id"],
+    )
+
+    assert await kb_db.get_claim(kept["id"]) is not None
+    assert await kb_db.get_claim(discarded["id"]) is None
+
+
+# -- deleting sources that contributed nothing -------------------------------
+# A page scraped/chunked/extracted purely to check one claim can end up with
+# no surviving claim at all (empty page, nothing extractable, or the one
+# claim it produced wasn't the prover/disprover) -- just as much dead weight
+# as the discarded claims, and left unaddressed it accumulates the same way
+# (187 sources found in a real KB, 166 with zero surviving claim_evidence).
+
+async def test_source_has_claim_evidence_false_for_untouched_source(kb_db):
+    source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="http://contributed-nothing.example", canonical_key="nothing",
+    )
+    assert await kb_db.source_has_claim_evidence(source["id"]) is False
+
+
+async def test_delete_source_cascade_removes_source_and_its_artifacts(kb_db):
+    source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="http://to-delete.example", canonical_key="to-delete",
+    )
+    version, _ = await kb_db.add_source_version(
+        source["id"], content_hash="h1", snapshot_path="/tmp/to-delete", http_status=200, mime_type="text/html",
+    )
+    artifact, _ = await kb_db.upsert_artifact(
+        artifact_id="art-to-delete", source_version_id=version["id"], artifact_type="clean_text",
+        storage_path="/tmp/to-delete.txt", content_hash="h1", chunk_params_hash="p1",
+    )
+    chunk = await kb_db.add_chunk(artifact["id"], 0, "some text", "chash-1")
+
+    assert await kb_db.source_has_claim_evidence(source["id"]) is False
+    await kb_db.delete_source_cascade(source["id"])
+
+    assert await kb_db.get_source(source["id"]) is None
+    assert await kb_db.list_chunks(artifact["id"]) == []

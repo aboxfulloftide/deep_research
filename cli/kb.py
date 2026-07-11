@@ -18,7 +18,12 @@ from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
 from deep_research.kb.timeline import get_topic_timeline
 from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
-from deep_research.kb.verification import run_verification_sweep, verify_claim, verify_claims_concurrently
+from deep_research.kb.verification import (
+    is_claim_eligible_for_verification,
+    run_verification_sweep,
+    verify_claim,
+    verify_claims_concurrently,
+)
 
 console = Console()
 
@@ -429,10 +434,7 @@ async def cmd_verify_source(args):
             evidence_by_claim[c["id"]] = c
 
     threshold = args.threshold if args.threshold is not None else config.kb.verification_importance_threshold
-    eligible = [
-        c for c in evidence_by_claim.values()
-        if (c["importance_score"] or 0) >= threshold and c["verification_attempted_at"] is None
-    ]
+    eligible = [c for c in evidence_by_claim.values() if is_claim_eligible_for_verification(c, threshold)]
     if not eligible:
         console.print(f"[dim]No unverified claims from this source at or above importance {threshold}.[/dim]")
         return
