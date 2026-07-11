@@ -7,19 +7,28 @@ Two separate concerns, deliberately kept apart:
   on exact normalized-name/text match (enforced by DB UNIQUE constraints in
   get_or_create_entity/get_or_create_event/get_or_create_claim). This always
   happens, synchronously, as part of promoting an observation.
-- candidate generation (fuzzy/embedding, never auto-merge): guarded fuzzy
-  matching for entities, embedding cosine similarity for claims. Both only
-  ever write to resolution_candidates for human review.
+- candidate generation (fuzzy/embedding): guarded fuzzy matching for
+  entities, embedding cosine similarity for claims. Ambiguous cases write to
+  resolution_candidates for human review, same as always -- but two classes
+  of entity candidate are now confident enough to skip the queue entirely:
+  pure spacing/hyphenation variants (_is_spacing_variant), and pairs the
+  local LLM classifies as "same"/"different" above a high confidence bar
+  (_classify_entity_duplicate). Both still fall back to human review on any
+  ambiguity, parse failure, or request error.
 """
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
-from deep_research.config import Config
+from deep_research.config import Config, LLMConfig
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import embed_texts
+from deep_research.kb.extraction import detect_model
+from deep_research.kb.merge import merge_entities
+from deep_research.llm import LLMClient
 
 MIN_FUZZY_ENTITY_NAME_LENGTH = 4
 FUZZY_ENTITY_TRIGRAM_THRESHOLD = 0.82
@@ -36,6 +45,53 @@ FUZZY_SUBSTRING_MIN_LENGTH_RATIO = 0.5
 # the exact-match tier, so fuzzy matching on dates only ever produces noise
 # ("June 22, 2026" scoring 0.917 against "June 29, 2026" by trigram overlap).
 NO_FUZZY_MATCH_ENTITY_TYPES = {"date"}
+
+ENTITY_COMPARISON_SYSTEM_PROMPT = """/no_think
+You are comparing two entity names extracted from different sources to determine whether they refer to the same real-world entity.
+
+Classify the relationship as exactly one of:
+- "same": the two names refer to the same real-world entity (allowing for spelling variants, nicknames, abbreviations, punctuation/spacing differences, or a more/less formal form of the same name)
+- "different": the two names refer to different real-world entities, even if the names look superficially similar (different people, different organizations, different versions/instances, different time periods, opposite or unrelated concepts)
+
+Entity type is given for context: two names of a different real-world type (e.g. an organization vs. a person) are "different" even if the strings are similar.
+
+Return ONLY a JSON object: {"relationship": "same"|"different", "confidence": 0.0-1.0, "reasoning": "one short sentence"}
+"""
+
+# Confidence bar above which the LLM's verdict is trusted enough to skip
+# human review entirely (auto-merge on "same", or silently drop the
+# candidate on "different"). Below this bar -- or on a parse failure /
+# request exception -- fall through to the existing safe default of queuing
+# the pair in resolution_candidates for a person to decide.
+ENTITY_LLM_CONFIDENCE_THRESHOLD = 0.75
+
+
+def _parse_entity_classification(content: str) -> dict:
+    content = content.strip()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", content)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    # Safe default: never auto-merge (or auto-drop) on a response we
+    # couldn't parse -- fall through to human review instead.
+    return {"relationship": "different", "confidence": 0.0, "reasoning": "could not parse model output"}
+
+
+async def _classify_entity_duplicate(llm: LLMClient, name_a: str, name_b: str, entity_type: str) -> dict:
+    messages = [
+        {"role": "system", "content": ENTITY_COMPARISON_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Entity type: {entity_type}\nName A: {name_a}\nName B: {name_b}\n\nClassify."},
+    ]
+    resp = await llm.chat(messages)
+    content = resp["choices"][0]["message"]["content"] or ""
+    return _parse_entity_classification(content)
+
 
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")  # decimal point only consumed if followed by a digit
 
@@ -88,6 +144,19 @@ def _is_trivial_qualifier(shorter: str, longer: str) -> bool:
     return longer_words[1:] == shorter_words or longer_words[:-1] == shorter_words
 
 
+def _is_spacing_variant(norm_a: str, norm_b: str) -> bool:
+    """True if the two normalized names are identical once whitespace is
+    also removed -- 'jp morgan' vs 'jpmorgan', 'data centers' vs
+    'datacenters', 'saline datacenter' vs 'saline data center'. Unlike every
+    other fuzzy rule here, this is confident enough to auto-merge without
+    human review (see _generate_entity_candidates): two real-world names
+    that are byte-identical modulo spacing are effectively certain to be
+    the same entity, not a coincidental near-miss -- found as the single
+    biggest source of resolution-queue noise in practice (14 of 343 open
+    entity_duplicate candidates were pure spacing/hyphen variants like this)."""
+    return norm_a.replace(" ", "") == norm_b.replace(" ", "")
+
+
 def _entity_similarity(norm_a: str, norm_b: str, entity_type: str) -> tuple[float, str] | None:
     """Guarded fuzzy match for entities: a minimum name length gate before any
     fuzzy method runs at all. The spike found unguarded substring matching
@@ -99,6 +168,19 @@ def _entity_similarity(norm_a: str, norm_b: str, entity_type: str) -> tuple[floa
     if norm_a == norm_b:
         return None  # exact match; handled by get_or_create_entity, not here
     if entity_type in NO_FUZZY_MATCH_ENTITY_TYPES:
+        return None
+    numbers_a, numbers_b = _extract_numbers(norm_a), _extract_numbers(norm_b)
+    if (numbers_a or numbers_b) and numbers_a != numbers_b:
+        # A name containing a number is essentially that number -- "late
+        # 1990s" vs "late 1920s", "Section 1(6A.19)" vs "Section 1(6A.18)",
+        # "Colossus 1" vs "Colossus 2" all score 0.90+ on pure character
+        # trigram overlap despite being unambiguously different things.
+        # Any numeric mismatch is disqualifying here, full stop -- unlike
+        # generate_claim_resolution_candidates' number check (which only
+        # suppresses when the sets are completely disjoint, appropriate for
+        # full sentences that can cite several incidental numbers), entity
+        # names are short labels where even a partial mismatch (one number
+        # shared, one differing) means "not the same".
         return None
     if len(norm_a) < MIN_FUZZY_ENTITY_NAME_LENGTH or len(norm_b) < MIN_FUZZY_ENTITY_NAME_LENGTH:
         return None
@@ -116,7 +198,7 @@ def _entity_similarity(norm_a: str, norm_b: str, entity_type: str) -> tuple[floa
     return None
 
 
-async def _generate_entity_candidates(kb_db: KBDatabase, entity_row: dict) -> int:
+async def _generate_entity_candidates(kb_db: KBDatabase, entity_row: dict, llm: LLMClient | None = None) -> int:
     if entity_row["entity_type"] in NO_FUZZY_MATCH_ENTITY_TYPES:
         return 0
     others = await kb_db.list_entities(entity_type=entity_row["entity_type"], limit=2000)
@@ -124,10 +206,41 @@ async def _generate_entity_candidates(kb_db: KBDatabase, entity_row: dict) -> in
     for other in others:
         if other["id"] == entity_row["id"]:
             continue
+        if _is_spacing_variant(entity_row["normalized_name"], other["normalized_name"]):
+            # Confident enough to skip the review queue entirely -- merge_entities
+            # resolves either id to its ultimate winner internally, so this is
+            # safe to call even if a prior iteration already merged entity_row
+            # into something else.
+            await merge_entities(kb_db, entity_row["id"], other["id"])
+            continue
         sim = _entity_similarity(entity_row["normalized_name"], other["normalized_name"], entity_row["entity_type"])
         if sim is None:
             continue
         score, method = sim
+
+        if llm is not None:
+            # Pure string similarity can't tell "spelling variant of the same
+            # thing" apart from "different thing that happens to share many
+            # characters" (e.g. "countries"/"counties" scores higher by
+            # trigram overlap than many genuine duplicates) -- ask the local
+            # LLM to make the actual semantic call. Anything ambiguous, or
+            # any parse/request failure, falls through to the existing human
+            # review queue rather than guessing.
+            try:
+                verdict = await _classify_entity_duplicate(
+                    llm, entity_row["name"], other["name"], entity_row["entity_type"],
+                )
+            except Exception:
+                verdict = {"relationship": "different", "confidence": 0.0}
+            relationship = verdict.get("relationship")
+            confidence = verdict.get("confidence") or 0.0
+            if confidence >= ENTITY_LLM_CONFIDENCE_THRESHOLD:
+                if relationship == "same":
+                    await merge_entities(kb_db, entity_row["id"], other["id"])
+                    continue
+                if relationship == "different":
+                    continue
+
         _, created = await kb_db.add_entity_resolution_candidate(
             entity_row["id"], other["id"], score, method,
             reason=f"fuzzy match: {entity_row['name']!r} / {other['name']!r}",
@@ -219,69 +332,76 @@ async def resolve_and_promote(
     result = PromotionResult()
     new_claim_ids: list[str] = []
 
-    for obs in observations:
-        # raw_payload is jsonb — asyncpg's registered codec already decodes it
-        # to a dict, no json.loads needed (unlike the SQLite TEXT column this
-        # replaced).
-        payload = obs["raw_payload"]
+    extraction_base_url = config.kb.extraction_llm_base_url
+    extraction_model = config.kb.extraction_llm_model or await detect_model(extraction_base_url)
+    llm = LLMClient(Config(llm=LLMConfig(base_url=extraction_base_url, model=extraction_model, api_key="not-needed")))
 
-        chunk = await kb_db.get_artifact_chunk(obs["artifact_chunk_id"])
-        artifact = await kb_db.get_artifact(chunk["artifact_id"])
-        version = await kb_db.get_source_version(artifact["source_version_id"])
-        source = await kb_db.get_source(version["source_id"])
+    try:
+        for obs in observations:
+            # raw_payload is jsonb — asyncpg's registered codec already decodes it
+            # to a dict, no json.loads needed (unlike the SQLite TEXT column this
+            # replaced).
+            payload = obs["raw_payload"]
 
-        event_id = None
-        event_payload = payload.get("event")
-        if isinstance(event_payload, dict) and event_payload.get("title"):
-            event_row, _ = await kb_db.get_or_create_event(
-                title=event_payload["title"], start_at=event_payload.get("date"),
-                date_precision=event_payload.get("date_precision"),
+            chunk = await kb_db.get_artifact_chunk(obs["artifact_chunk_id"])
+            artifact = await kb_db.get_artifact(chunk["artifact_id"])
+            version = await kb_db.get_source_version(artifact["source_version_id"])
+            source = await kb_db.get_source(version["source_id"])
+
+            event_id = None
+            event_payload = payload.get("event")
+            if isinstance(event_payload, dict) and event_payload.get("title"):
+                event_row, _ = await kb_db.get_or_create_event(
+                    title=event_payload["title"], start_at=event_payload.get("date"),
+                    date_precision=event_payload.get("date_precision"),
+                )
+                event_id = event_row["id"]
+
+            for ent in payload.get("entities") or []:
+                if not isinstance(ent, dict) or not ent.get("name"):
+                    continue
+                entity_row, created = await kb_db.get_or_create_entity(
+                    ent.get("type") or "concept", ent["name"],
+                )
+                if created:
+                    result.new_entity_count += 1
+                    result.entity_candidate_count += await _generate_entity_candidates(kb_db, entity_row, llm)
+
+            claim_row, claim_created = await kb_db.get_or_create_claim(
+                claim_type=payload.get("claim_type") or "fact",
+                canonical_text=obs["raw_text"],
+                event_id=event_id,
+                confidence=obs["confidence"],
+                importance_score=obs["importance_score"],
             )
-            event_id = event_row["id"]
+            if claim_created:
+                new_claim_ids.append(claim_row["id"])
 
-        for ent in payload.get("entities") or []:
-            if not isinstance(ent, dict) or not ent.get("name"):
-                continue
-            entity_row, created = await kb_db.get_or_create_entity(
-                ent.get("type") or "concept", ent["name"],
-            )
-            if created:
-                result.new_entity_count += 1
-                result.entity_candidate_count += await _generate_entity_candidates(kb_db, entity_row)
-
-        claim_row, claim_created = await kb_db.get_or_create_claim(
-            claim_type=payload.get("claim_type") or "fact",
-            canonical_text=obs["raw_text"],
-            event_id=event_id,
-            confidence=obs["confidence"],
-            importance_score=obs["importance_score"],
-        )
-        if claim_created:
-            new_claim_ids.append(claim_row["id"])
-
-        quote = payload.get("supporting_quote") or ""
-        await kb_db.add_claim_evidence(
-            claim_id=claim_row["id"], artifact_chunk_id=chunk["id"],
-            source_id=source["id"], source_version_id=version["id"],
-            evidence_type="support", excerpt_text=quote,
-            excerpt_hash=hashlib.sha256(quote.encode()).hexdigest() if quote else None,
-            extraction_run_id=extraction_run_id, extracted_observation_id=obs["id"],
-            char_start=obs["char_start"], char_end=obs["char_end"],
-            confidence=obs["confidence"],
-        )
-
-        for m in payload.get("metrics") or []:
-            if not isinstance(m, dict) or not m.get("name") or m.get("value") is None:
-                continue
-            value_numeric, value_text = _parse_metric_value(m.get("value"))
-            await kb_db.add_metric(
-                metric_name=m["name"], claim_id=claim_row["id"],
-                value_numeric=value_numeric, value_text=value_text,
-                unit=m.get("unit"), currency_code=m.get("currency"),
+            quote = payload.get("supporting_quote") or ""
+            await kb_db.add_claim_evidence(
+                claim_id=claim_row["id"], artifact_chunk_id=chunk["id"],
+                source_id=source["id"], source_version_id=version["id"],
+                evidence_type="support", excerpt_text=quote,
+                excerpt_hash=hashlib.sha256(quote.encode()).hexdigest() if quote else None,
+                extraction_run_id=extraction_run_id, extracted_observation_id=obs["id"],
+                char_start=obs["char_start"], char_end=obs["char_end"],
+                confidence=obs["confidence"],
             )
 
-        await kb_db.mark_observation_promoted(obs["id"], claim_row["id"])
-        result.promoted_count += 1
+            for m in payload.get("metrics") or []:
+                if not isinstance(m, dict) or not m.get("name") or m.get("value") is None:
+                    continue
+                value_numeric, value_text = _parse_metric_value(m.get("value"))
+                await kb_db.add_metric(
+                    metric_name=m["name"], claim_id=claim_row["id"],
+                    value_numeric=value_numeric, value_text=value_text,
+                    unit=m.get("unit"), currency_code=m.get("currency"),
+                )
+
+            await kb_db.mark_observation_promoted(obs["id"], claim_row["id"])
+            result.promoted_count += 1
+    finally:
+        await llm.close()
 
     result.new_claim_count = len(new_claim_ids)
     result.new_claim_ids = new_claim_ids
