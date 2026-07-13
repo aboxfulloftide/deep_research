@@ -35,6 +35,7 @@ dev = [
 [project.scripts]
 deep-research = "cli.main:main"
 deep-research-kb = "cli.kb:main"
+deep-research-eval = "cli.eval:main"
 
 [tool.setuptools.packages.find]
 include = ["deep_research*", "cli*", "web*"]
