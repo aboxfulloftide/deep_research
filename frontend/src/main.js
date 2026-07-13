@@ -11,6 +11,7 @@ import SourcesView from './views/SourcesView.vue'
 import SourceDetailView from './views/SourceDetailView.vue'
 import ClaimsView from './views/ClaimsView.vue'
 import VerificationStatusView from './views/VerificationStatusView.vue'
+import SearchUsageView from './views/SearchUsageView.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -25,6 +26,7 @@ const router = createRouter({
     { path: '/sources/:id', name: 'source', component: SourceDetailView },
     { path: '/claims', name: 'claims', component: ClaimsView },
     { path: '/verification-status', name: 'verification-status', component: VerificationStatusView },
+    { path: '/search-usage', name: 'search-usage', component: SearchUsageView },
   ],
 })
 

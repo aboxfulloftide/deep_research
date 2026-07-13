@@ -22,6 +22,9 @@ const verifying = ref(false)
 const verifyForce = ref(false)
 const reviewingCandidateId = ref(null)
 const togglingCheck = ref(false)
+const contextDraft = ref(props.claim.verification_context || '')
+const savingContext = ref(false)
+const editingContext = ref(false)
 
 const statusColors = {
   unverified: 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300',
@@ -85,6 +88,17 @@ async function runVerify() {
 async function makePreferred(sourceId) {
   await api.setPreferredSource(localClaim.value.id, sourceId)
   detail.value = await api.fetchClaim(localClaim.value.id)
+}
+
+async function saveContext() {
+  savingContext.value = true
+  try {
+    const data = await api.setClaimVerificationContext(localClaim.value.id, contextDraft.value.trim() || null)
+    localClaim.value = { ...localClaim.value, ...data.claim }
+    editingContext.value = false
+  } finally {
+    savingContext.value = false
+  }
 }
 
 async function reviewContradiction(rc, decision) {
@@ -183,6 +197,49 @@ async function resetCheckOverride() {
     <div v-if="expanded" class="px-4 pb-3 border-t border-gray-100 dark:border-gray-700 pt-3">
       <div v-if="!detail" class="text-xs text-gray-400 dark:text-gray-500">Loading evidence...</div>
       <template v-else>
+        <div class="mb-3">
+          <div v-if="!editingContext" class="flex items-start gap-2">
+            <p v-if="localClaim.verification_context" class="text-xs text-gray-600 dark:text-gray-300 italic flex-1">
+              Verification context: {{ localClaim.verification_context }}
+            </p>
+            <p v-else class="text-xs text-gray-400 dark:text-gray-500 flex-1">
+              No added verification context.
+            </p>
+            <button
+              @click="editingContext = true"
+              class="text-xs text-blue-600 dark:text-blue-400 hover:underline shrink-0"
+            >
+              {{ localClaim.verification_context ? 'edit' : 'add context' }}
+            </button>
+          </div>
+          <div v-else class="space-y-1.5">
+            <textarea
+              v-model="contextDraft"
+              rows="2"
+              placeholder="Expand what verification should actually look for -- e.g. 'compare specifically against datacenter electricity usage'"
+              class="w-full text-xs px-2 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white"
+            />
+            <div class="flex items-center gap-2">
+              <button
+                @click="saveContext"
+                :disabled="savingContext"
+                class="px-2 py-1 text-xs rounded-md bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
+              >
+                {{ savingContext ? 'Saving...' : 'Save' }}
+              </button>
+              <button
+                @click="contextDraft = localClaim.verification_context || ''; editingContext = false"
+                class="text-xs text-gray-400 dark:text-gray-500 hover:underline"
+              >
+                cancel
+              </button>
+            </div>
+            <p class="text-[10px] text-gray-400 dark:text-gray-500">
+              Saving doesn't re-check the claim by itself -- use Force re-verify below to apply it.
+            </p>
+          </div>
+        </div>
+
         <div class="flex items-center gap-2 mb-3">
           <button
             @click="runVerify"

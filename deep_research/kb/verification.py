@@ -52,6 +52,8 @@ Classify the relationship as exactly one of:
 
 Do the arithmetic/unit conversion yourself if needed before deciding — do not assume different-looking numbers contradict without checking whether they are equivalent.
 
+If additional context is given, it is a human's note about what specifically to look for -- weigh whether the second claim actually addresses that angle, not just whether it's topically similar to the first claim.
+
 Return ONLY a JSON object: {"relationship": "supports"|"contradicts"|"unrelated", "confidence": 0.0-1.0, "reasoning": "one short sentence"}
 """
 
@@ -101,10 +103,14 @@ def _parse_json_object(content: str) -> dict:
     return {"relationship": "unrelated", "confidence": 0.0, "reasoning": "could not parse model output"}
 
 
-async def _classify_relationship(llm: LLMClient, claim_text: str, other_text: str) -> dict:
+async def _classify_relationship(llm: LLMClient, claim_text: str, other_text: str, context: str | None = None) -> dict:
+    user_content = f"Claim A: {claim_text}\nClaim B: {other_text}"
+    if context:
+        user_content += f"\nAdditional context (what to specifically look for): {context}"
+    user_content += "\n\nClassify."
     messages = [
         {"role": "system", "content": COMPARISON_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Claim A: {claim_text}\nClaim B: {other_text}\n\nClassify."},
+        {"role": "user", "content": user_content},
     ]
     resp = await llm.chat(messages)
     content = resp["choices"][0]["message"]["content"] or ""
@@ -112,35 +118,49 @@ async def _classify_relationship(llm: LLMClient, claim_text: str, other_text: st
 
 
 SEARCH_QUERY_SUGGESTION_PROMPT = """/no_think
-You are choosing a web search query to help verify a factual claim. One or
-more searches already ran using a prior query and did not turn up enough
-independent evidence to confirm or refute the claim.
+You are choosing a web search query to help verify a factual claim.
 
-Suggest ONE different web search query more likely to surface independent
-corroborating or contradicting sources than the queries already tried --
-for example naming the specific number/entity/date/organization involved
-instead of searching the whole sentence verbatim, dropping filler words, or
-trying alternate terminology a source might actually use.
+Suggest ONE web search query likely to surface independent corroborating or
+contradicting sources -- for example naming the specific number/entity/date/
+organization involved instead of searching the whole sentence verbatim,
+dropping filler words, or trying alternate terminology a source might
+actually use.
+
+If additional context is given, it is a human's note about a specific angle
+to look for -- make sure the query actually targets that, not just the
+literal claim text. If prior queries are listed, suggest something
+meaningfully different from all of them, not a minor rephrasing of one.
 
 Return ONLY a JSON object: {"query": "..."}
 """
 
 
-async def _suggest_search_query(llm: LLMClient, claim_text: str, tried_queries: list[str]) -> str:
-    """Used from the second web-search attempt onward (within one verify_claim
-    run, or on a retry of a previously-inconclusive claim, see
-    UNVERIFIED_RETRY_COOLDOWN_HOURS) -- repeating the exact same query the
-    literal claim text makes almost never turns up anything new, since a
-    search engine returns the same top results for the same string. Falls
+async def _suggest_search_query(
+    llm: LLMClient, claim_text: str, tried_queries: list[str], context: str | None = None,
+) -> str:
+    """Used whenever a plain search of the literal claim text isn't good
+    enough on its own: from the second web-search attempt onward (within one
+    verify_claim run, or on a retry of a previously-inconclusive claim, see
+    UNVERIFIED_RETRY_COOLDOWN_HOURS) -- repeating the exact same query
+    almost never turns up anything new, since a search engine returns the
+    same top results for the same string -- and from the very first attempt
+    whenever the claim carries added verification_context, since the literal
+    claim text alone may not even mention the angle the context asks for
+    (e.g. claim "industrial buildings use more electricity than residential"
+    + context "compare against datacenter usage" -- a plain search of the
+    claim text would never surface a datacenter-specific comparison). Falls
     back to the raw claim text (the original, always-safe default) on any
     parse failure or an empty suggestion."""
-    tried = "\n".join(f"- {q}" for q in tried_queries)
+    parts = [f"Claim: {claim_text}"]
+    if context:
+        parts.append(f"Additional context (what to specifically look for): {context}")
+    if tried_queries:
+        tried = "\n".join(f"- {q}" for q in tried_queries)
+        parts.append(f"Queries already tried (do not repeat these):\n{tried}")
+    parts.append("Suggest a query.")
     messages = [
         {"role": "system", "content": SEARCH_QUERY_SUGGESTION_PROMPT},
-        {
-            "role": "user",
-            "content": f"Claim: {claim_text}\n\nQueries already tried (do not repeat these):\n{tried}\n\nSuggest a query.",
-        },
+        {"role": "user", "content": "\n\n".join(parts)},
     ]
     resp = await llm.chat(messages)
     content = resp["choices"][0]["message"]["content"] or ""
@@ -297,7 +317,9 @@ async def _examine_candidates(
     several candidate claims from the same source count as one). `phase`
     selects which half of the source budget this call draws from (internal
     KB search vs. web fallback), so one phase running out doesn't block the
-    other from being tried at all."""
+    other from being tried at all. claim["verification_context"], if set, is
+    forwarded to every comparison so the LLM weighs whether a candidate
+    actually addresses the angle a human flagged, not just topical overlap."""
     for other_claim, similarity in ranked_candidates:
         if budget.should_stop() or not budget.sources_remaining(phase):
             return
@@ -318,7 +340,9 @@ async def _examine_candidates(
             continue
 
         try:
-            result = await _classify_relationship(llm, claim["canonical_text"], other_claim["canonical_text"])
+            result = await _classify_relationship(
+                llm, claim["canonical_text"], other_claim["canonical_text"], claim.get("verification_context"),
+            )
         except Exception:
             # A transient LLM failure on this one comparison shouldn't abort
             # the whole verification and lose everything found so far —
@@ -398,6 +422,7 @@ async def verify_claim(
     # of wasting its first search slot repeating a query that already failed
     # to settle this claim once.
     tried_queries: list[str] = list((claim.get("verification_notes") or {}).get("web_search_queries") or [])
+    verification_context = claim.get("verification_context")
     # So any claim discovered as supporting/contradicting evidence during the
     # web-fallback below can be attached to the same topic(s) as the claim
     # being verified, instead of floating with no visible context for why it
@@ -426,13 +451,18 @@ async def verify_claim(
         snapshot_store = SnapshotStore(config.kb_snapshot_dir)
         while not budget.should_stop() and budget.searches_remaining():
             budget.web_searches_used += 1
-            if tried_queries:
-                # Not the first search attempted against this claim (this run
-                # or a prior one) -- repeating the same query verbatim just
-                # gets the same top results back, so ask the LLM for a
-                # meaningfully different angle instead.
+            if tried_queries or verification_context:
+                # Either not the first search attempted against this claim
+                # (this run or a prior one) -- repeating the same query
+                # verbatim just gets the same top results back -- or the
+                # claim carries added verification_context, whose whole
+                # point is that the literal claim text alone might not even
+                # mention the angle a human wants checked. Either way, ask
+                # the LLM for a query instead of using the raw claim text.
                 with _timed(timings, "llm_classify"):
-                    query = await _suggest_search_query(llm, claim["canonical_text"], tried_queries)
+                    query = await _suggest_search_query(
+                        llm, claim["canonical_text"], tried_queries, verification_context,
+                    )
             else:
                 query = claim["canonical_text"]
             tried_queries.append(query)

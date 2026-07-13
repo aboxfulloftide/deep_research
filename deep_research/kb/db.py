@@ -258,6 +258,13 @@ CREATE TABLE IF NOT EXISTS claims (
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_notes JSONB;
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS merged_into_claim_id TEXT REFERENCES claims(id);
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_override TEXT;
+-- A human-supplied note expanding what verification should actually look
+-- for, beyond the literal claim text (e.g. claim "industrial buildings use
+-- more electricity than residential" + context "compare specifically
+-- against datacenter usage") -- see verify_claim's use of it to steer
+-- _suggest_search_query and _classify_relationship. NULL means no added
+-- context, same default-off shape as verification_override.
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_context TEXT;
 CREATE INDEX IF NOT EXISTS idx_claims_merged_into ON claims(merged_into_claim_id);
 
 -- Step 8: same embedding column as artifact_chunks, same nullable-until-embedded
@@ -635,6 +642,18 @@ class KBDatabase:
                 "UPDATE sources SET title = $1, updated_at = $2 "
                 "WHERE id = $3 AND (title IS NULL OR title = '')",
                 title, _now(), source_id,
+            )
+
+    async def set_source_trust_tier(self, source_id: str, trust_tier_code: str) -> None:
+        """Unlike get_or_create_source's trust_tier_code (only ever applied
+        at creation), this can update an existing source -- used by the LLM
+        auto-classifier (deep_research/kb/trust.py) to fill in a tier after
+        ingest, once actual content/title is available to classify from."""
+        trust_tier_id = await self.get_trust_tier_id(trust_tier_code)
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE sources SET trust_tier_id = $1, updated_at = $2 WHERE id = $3",
+                trust_tier_id, _now(), source_id,
             )
 
     # -- fetch attempts -------------------------------------------------
@@ -1228,6 +1247,27 @@ class KBDatabase:
             result.setdefault(r["claim_id"], []).append(r["section_label"])
         return result
 
+    async def get_claims_by_chunk_ids(self, chunk_ids: list[str]) -> dict[str, list[dict]]:
+        """Which claim(s) have evidence anchored to each of these chunks --
+        used to show a conversation's checked claims inline with the turn
+        they were actually said in (see get_topic_conversation_transcript),
+        instead of a flat list disconnected from the back-and-forth."""
+        if not chunk_ids:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT ce.artifact_chunk_id, c.* "
+                "FROM claim_evidence ce JOIN claims c ON c.id = ce.claim_id "
+                "WHERE ce.artifact_chunk_id = ANY($1::text[])",
+                chunk_ids,
+            )
+        result: dict[str, list[dict]] = {}
+        for r in rows:
+            d = dict(r)
+            chunk_id = d.pop("artifact_chunk_id")
+            result.setdefault(chunk_id, []).append(d)
+        return result
+
     async def set_claim_embedding(self, claim_id: str, embedding: list[float]) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE claims SET embedding = $1 WHERE id = $2", embedding, claim_id)
@@ -1369,6 +1409,22 @@ class KBDatabase:
             row = await conn.fetchrow(
                 "UPDATE claims SET verification_override = $1, updated_at = $2 WHERE id = $3 RETURNING *",
                 override, now, claim_id,
+            )
+        return dict(row)
+
+    async def set_claim_verification_context(self, claim_id: str, context: str | None) -> dict:
+        """context is free text a human adds to steer what verify_claim
+        actually looks for beyond the literal claim text, or None to clear
+        it -- see verify_claim's use of claims.verification_context. Setting
+        it does not by itself trigger a recheck (same as
+        set_claim_verification_override); the caller decides separately
+        whether to force-reverify with the new context in effect."""
+        context = context.strip() if context else None
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE claims SET verification_context = $1, updated_at = $2 WHERE id = $3 RETURNING *",
+                context or None, now, claim_id,
             )
         return dict(row)
 

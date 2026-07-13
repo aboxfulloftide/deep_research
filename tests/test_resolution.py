@@ -203,19 +203,19 @@ async def test_generate_entity_candidates_auto_merges_spacing_variants(kb_db):
 
 # -- LLM vetting: same/different verdicts skip the review queue -------------
 
-def test_parse_entity_classification_handles_plain_json():
-    result = r._parse_entity_classification('{"relationship": "same", "confidence": 0.9, "reasoning": "ok"}')
+def test_parse_same_different_classification_handles_plain_json():
+    result = r._parse_same_different_classification('{"relationship": "same", "confidence": 0.9, "reasoning": "ok"}')
     assert result == {"relationship": "same", "confidence": 0.9, "reasoning": "ok"}
 
 
-def test_parse_entity_classification_extracts_json_from_surrounding_text():
+def test_parse_same_different_classification_extracts_json_from_surrounding_text():
     content = 'Sure, here you go:\n{"relationship": "different", "confidence": 0.8, "reasoning": "ok"}\nDone.'
-    result = r._parse_entity_classification(content)
+    result = r._parse_same_different_classification(content)
     assert result["relationship"] == "different"
 
 
-def test_parse_entity_classification_falls_back_safely_on_garbage():
-    result = r._parse_entity_classification("not json at all")
+def test_parse_same_different_classification_falls_back_safely_on_garbage():
+    result = r._parse_same_different_classification("not json at all")
     assert result == {"relationship": "different", "confidence": 0.0, "reasoning": "could not parse model output"}
 
 
@@ -358,6 +358,115 @@ async def test_generate_candidates_skips_claims_with_no_embedding(kb_db, monkeyp
     # generate_claim_resolution_candidates must skip (not crash on) a claim with no embedding.
     count = await r.generate_claim_resolution_candidates(kb_db, config, [claim_a["id"]])
     assert count == 0
+
+
+# -- claim-duplicate LLM vetting: same/different verdicts skip the queue -----
+# Mirrors the entity-duplicate vetting above -- the spike measured only 50%
+# precision at cosine 0.85 alone, worse than entities' false-positive rate,
+# so the same confident-same/confident-different/otherwise-queue pattern
+# applies here too (see generate_claim_resolution_candidates).
+
+async def _embed_and_index_near_duplicate_pair(kb_db, monkeypatch, text_a: str, text_b: str):
+    claim_a, _ = await kb_db.get_or_create_claim("fact", text_a)
+    claim_b, _ = await kb_db.get_or_create_claim("fact", text_b)
+
+    fake_vectors_in_order = [
+        [1.0, 0.0, 0.0] + [0.0] * 765,
+        [0.99, 0.01, 0.0] + [0.0] * 765,  # near-identical -> cosine ~1.0
+    ]
+
+    async def fake_embed_texts(texts, base_url, model, instruction_prefix="clustering: "):
+        return fake_vectors_in_order
+
+    monkeypatch.setattr(r, "embed_texts", fake_embed_texts)
+    config = _fake_config()
+    await r.embed_new_claims(kb_db, config, [claim_a["id"], claim_b["id"]])
+    return config, claim_a, claim_b
+
+
+async def test_generate_claim_candidates_merges_on_confident_llm_same_verdict(kb_db, monkeypatch):
+    config, claim_a, claim_b = await _embed_and_index_near_duplicate_pair(
+        kb_db, monkeypatch, "Unemployment fell to 3.9% in Q2 2025.", "Unemployment dropped to 3.9 percent in Q2 2025.",
+    )
+
+    async def fake_classify(llm, claim_text, other_text):
+        return {"relationship": "same", "confidence": 0.95, "reasoning": "test"}
+
+    monkeypatch.setattr(r, "_classify_claim_duplicate", fake_classify)
+
+    count = await r.generate_claim_resolution_candidates(kb_db, config, [claim_a["id"], claim_b["id"]], llm=object())
+
+    assert count == 0  # not queued -- merged directly
+    candidates = await kb_db.list_resolution_candidates(candidate_type="claim_duplicate", status="open")
+    assert candidates == []
+    a_after = await kb_db.get_claim(claim_a["id"])
+    b_after = await kb_db.get_claim(claim_b["id"])
+    assert (a_after["merged_into_claim_id"] is None) != (b_after["merged_into_claim_id"] is None)
+
+
+async def test_generate_claim_candidates_drops_on_confident_llm_different_verdict(kb_db, monkeypatch):
+    config, claim_a, claim_b = await _embed_and_index_near_duplicate_pair(
+        kb_db, monkeypatch, "Market correlation increased this quarter.", "A market correction is likely next quarter.",
+    )
+
+    async def fake_classify(llm, claim_text, other_text):
+        return {"relationship": "different", "confidence": 0.9, "reasoning": "test"}
+
+    monkeypatch.setattr(r, "_classify_claim_duplicate", fake_classify)
+
+    count = await r.generate_claim_resolution_candidates(kb_db, config, [claim_a["id"], claim_b["id"]], llm=object())
+
+    assert count == 0  # dropped silently, not merged and not queued
+    candidates = await kb_db.list_resolution_candidates(candidate_type="claim_duplicate", status="open")
+    assert candidates == []
+
+
+async def test_generate_claim_candidates_queues_for_review_on_low_confidence_llm_verdict(kb_db, monkeypatch):
+    config, claim_a, claim_b = await _embed_and_index_near_duplicate_pair(
+        kb_db, monkeypatch, "Central banks raised rates.", "Central bankers discussed raising rates.",
+    )
+
+    async def fake_classify(llm, claim_text, other_text):
+        return {"relationship": "same", "confidence": 0.4, "reasoning": "not sure"}
+
+    monkeypatch.setattr(r, "_classify_claim_duplicate", fake_classify)
+
+    count = await r.generate_claim_resolution_candidates(kb_db, config, [claim_a["id"], claim_b["id"]], llm=object())
+
+    assert count == 1  # falls through to the ordinary review queue
+    candidates = await kb_db.list_resolution_candidates(candidate_type="claim_duplicate", status="open")
+    assert len(candidates) == 1
+
+
+async def test_generate_claim_candidates_queues_for_review_when_llm_call_raises(kb_db, monkeypatch):
+    config, claim_a, claim_b = await _embed_and_index_near_duplicate_pair(
+        kb_db, monkeypatch, "Central banks raised rates.", "Central bankers discussed raising rates.",
+    )
+
+    async def raising_classify(llm, claim_text, other_text):
+        raise ConnectionError("simulated transient LLM failure")
+
+    monkeypatch.setattr(r, "_classify_claim_duplicate", raising_classify)
+
+    count = await r.generate_claim_resolution_candidates(kb_db, config, [claim_a["id"], claim_b["id"]], llm=object())
+
+    assert count == 1  # a broken LLM call must never block the safe fallback
+    candidates = await kb_db.list_resolution_candidates(candidate_type="claim_duplicate", status="open")
+    assert len(candidates) == 1
+
+
+async def test_generate_claim_candidates_without_llm_preserves_old_behavior(kb_db, monkeypatch):
+    # llm=None (the default) must behave exactly like before this feature --
+    # existing callers/tests that omit it are unaffected.
+    config, claim_a, claim_b = await _embed_and_index_near_duplicate_pair(
+        kb_db, monkeypatch, "Unemployment fell to 3.9% in Q2 2025.", "Unemployment dropped to 3.9 percent in Q2 2025.",
+    )
+
+    count = await r.generate_claim_resolution_candidates(kb_db, config, [claim_a["id"], claim_b["id"]])
+
+    assert count >= 1
+    candidates = await kb_db.list_resolution_candidates(candidate_type="claim_duplicate", status="open")
+    assert len(candidates) >= 1
 
 
 # -- _extract_numbers: pure function, no I/O ---------------------------------

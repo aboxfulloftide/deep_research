@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.table import Table
 
 from deep_research.config import load_config
+from deep_research.kb.ad_check import check_claims_for_ads
 from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import backfill_embeddings, embed_texts
@@ -18,6 +19,7 @@ from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
 from deep_research.kb.timeline import get_topic_timeline
 from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
+from deep_research.kb.trust import set_trust_tier_if_missing
 from deep_research.kb.verification import (
     is_claim_eligible_for_verification,
     run_verification_sweep,
@@ -60,6 +62,8 @@ async def cmd_ingest_url(args):
     config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
     result = await ingest_web_page(args.url, config, kb_db, snapshot_store, trust_tier_code=args.trust_tier)
+    if result.status != "failed" and result.source_id:
+        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     _print_result(result, args.url)
 
 
@@ -67,6 +71,8 @@ async def cmd_ingest_youtube(args):
     config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
     result = await ingest_youtube_video(args.url, kb_db, snapshot_store, trust_tier_code=args.trust_tier)
+    if result.status != "failed" and result.source_id:
+        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     _print_result(result, args.url)
 
 
@@ -74,6 +80,8 @@ async def cmd_ingest_file(args):
     config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
     result = await ingest_file(args.path, kb_db, snapshot_store, trust_tier_code=args.trust_tier)
+    if result.status != "failed" and result.source_id:
+        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     _print_result(result, args.path)
 
 
@@ -259,9 +267,13 @@ async def cmd_extract_source(args):
     console.print(f"  entity candidates: {promotion.entity_candidate_count}")
     console.print(f"  claim candidates:  {promotion.claim_candidate_count}")
 
+    ad_flagged = await check_claims_for_ads(kb_db, config, promotion.new_claim_ids)
+    if ad_flagged:
+        console.print(f"  ad/sponsor claims excluded from verification: {len(ad_flagged)}")
+
     # Forward-check (decision 27): new claims get checked against every
     # existing topic, not just topics created after this point.
-    topic_results = await check_claims_against_topics(kb_db, promotion.new_claim_ids)
+    topic_results = await check_claims_against_topics(kb_db, config, promotion.new_claim_ids)
     if topic_results:
         console.print("  topic suggestions:")
         for topic_id, result in topic_results.items():
@@ -434,7 +446,10 @@ async def cmd_verify_source(args):
             evidence_by_claim[c["id"]] = c
 
     threshold = args.threshold if args.threshold is not None else config.kb.verification_importance_threshold
-    eligible = [c for c in evidence_by_claim.values() if is_claim_eligible_for_verification(c, threshold)]
+    eligible = [
+        c for c in evidence_by_claim.values()
+        if is_claim_eligible_for_verification(c, threshold, force=args.force)
+    ]
     if not eligible:
         console.print(f"[dim]No unverified claims from this source at or above importance {threshold}.[/dim]")
         return
@@ -557,7 +572,7 @@ async def cmd_backfill_topic(args):
     if topic is None:
         console.print(f"[red]No topic found matching {args.topic_id!r}[/red]")
         return
-    result = await generate_topic_suggestions(kb_db, topic["id"])
+    result = await generate_topic_suggestions(kb_db, config, topic["id"])
     console.print(f"Backfilled suggestions for {topic['name']}:")
     console.print(f"  claims suggested:  {result.claims_suggested}")
     console.print(f"  sources suggested: {result.sources_suggested}")

@@ -14,6 +14,7 @@ const processingSourceId = computed(() => route.query.processingSource || null)
 
 const topic = ref(null)
 const timeline = ref([])
+const transcript = ref([])
 const attachedClaims = ref([])
 const suggestedClaims = ref([])
 const suggestedSources = ref([])
@@ -90,30 +91,21 @@ async function triggerVerifyNow() {
   }
 }
 
-let firstLoad = true
-
 async function loadAll() {
   loading.value = true
   const detail = await api.fetchTopic(topicId.value)
   topic.value = detail.topic
 
-  // A conversation topic's claims rarely have dated events, so defaulting to
-  // the Timeline tab would just show "no dated events yet" -- only applies
-  // on the very first load so switching tabs manually later isn't undone by
-  // a background-processing refresh.
-  if (firstLoad && topic.value.topic_type === 'conversation') {
-    activeTab.value = 'claims'
-  }
-  firstLoad = false
-
-  const [tl, ac, sc, ss, rep] = await Promise.all([
+  const [tl, tr, ac, sc, ss, rep] = await Promise.all([
     api.fetchTimeline(topic.value.id),
+    api.fetchConversationTranscript(topic.value.id),
     api.fetchTopicClaims(topic.value.id, 'attached'),
     api.fetchTopicClaims(topic.value.id, 'suggested'),
     api.fetchTopicSources(topic.value.id, 'suggested'),
     api.fetchReport(topic.value.id),
   ])
   timeline.value = tl.entries || []
+  transcript.value = tr.turns || []
   attachedClaims.value = ac.claims || []
   suggestedClaims.value = sc.claims || []
   suggestedSources.value = ss.sources || []
@@ -252,7 +244,25 @@ function renderMarkdown(text) {
 
     <!-- Timeline -->
     <div v-if="activeTab === 'timeline'">
-      <div v-if="timeline.length === 0" class="text-center py-12 text-gray-500 dark:text-gray-400">
+      <!-- A pasted conversation rarely has dated events, but its actual
+           back-and-forth is far more useful context than an empty dated
+           timeline -- show each turn with the claims checked from it right
+           underneath, instead of the generic event timeline below. -->
+      <div v-if="transcript.length > 0" class="space-y-3">
+        <div
+          v-for="turn in transcript"
+          :key="turn.chunk_id"
+          class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-3"
+        >
+          <p v-if="turn.speaker" class="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-1">{{ turn.speaker }}</p>
+          <p class="text-sm text-gray-900 dark:text-white whitespace-pre-wrap">{{ turn.text }}</p>
+          <div v-if="turn.claims.length" class="mt-2.5 pt-2.5 border-t border-gray-100 dark:border-gray-700 space-y-2">
+            <ClaimListItem v-for="claim in turn.claims" :key="claim.id" :claim="claim" />
+          </div>
+        </div>
+      </div>
+
+      <div v-else-if="timeline.length === 0" class="text-center py-12 text-gray-500 dark:text-gray-400">
         <Clock class="w-10 h-10 mx-auto mb-3 opacity-50" :stroke-width="1.5" />
         <p class="text-sm">No dated events yet. Attach sources and extract claims to populate the timeline.</p>
       </div>

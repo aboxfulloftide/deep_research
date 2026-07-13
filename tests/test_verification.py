@@ -173,6 +173,38 @@ def test_deprecated_claim_is_never_eligible_even_with_force():
     assert v.is_claim_eligible_for_verification(claim, threshold=0.8, force=True) is False
 
 
+# -- _classify_relationship: verification_context steers the comparison -----
+
+async def test_classify_relationship_includes_context_when_given():
+    seen = {}
+
+    class FakeLLM:
+        async def chat(self, messages):
+            seen["content"] = messages[1]["content"]
+            return {"choices": [{"message": {"content": '{"relationship": "supports", "confidence": 0.9, "reasoning": "ok"}'}}]}
+
+    await v._classify_relationship(
+        FakeLLM(), "Industrial buildings use more electricity than residential.",
+        "Datacenters use far more electricity per square foot than industrial buildings.",
+        context="compare specifically against datacenter usage",
+    )
+
+    assert "compare specifically against datacenter usage" in seen["content"]
+
+
+async def test_classify_relationship_omits_context_line_when_absent():
+    seen = {}
+
+    class FakeLLM:
+        async def chat(self, messages):
+            seen["content"] = messages[1]["content"]
+            return {"choices": [{"message": {"content": '{"relationship": "supports", "confidence": 0.9, "reasoning": "ok"}'}}]}
+
+    await v._classify_relationship(FakeLLM(), "Claim A text.", "Claim B text.")
+
+    assert "Additional context" not in seen["content"]
+
+
 # -- _suggest_search_query: repeating a failed query wastes the retry --------
 
 async def test_suggest_search_query_uses_llm_suggestion():
@@ -202,6 +234,36 @@ async def test_suggest_search_query_falls_back_to_claim_text_on_empty_query():
     assert result == "Some claim text."
 
 
+async def test_suggest_search_query_includes_context_in_the_prompt():
+    seen = {}
+
+    class FakeLLM:
+        async def chat(self, messages):
+            seen["content"] = messages[1]["content"]
+            return {"choices": [{"message": {"content": '{"query": "datacenter electricity usage vs industrial"}'}}]}
+
+    result = await v._suggest_search_query(
+        FakeLLM(), "Industrial buildings use more electricity than residential.", [],
+        context="compare specifically against datacenter usage",
+    )
+
+    assert result == "datacenter electricity usage vs industrial"
+    assert "compare specifically against datacenter usage" in seen["content"]
+
+
+async def test_suggest_search_query_uses_llm_even_on_first_attempt_when_context_given():
+    # Normally the very first search just uses the raw claim text (see
+    # verify_claim) -- this only tests that _suggest_search_query itself
+    # produces a sensible result when called with no tried_queries yet but
+    # context present, which verify_claim does specifically to cover that case.
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": '{"query": "context-aware query"}'}}]}
+
+    result = await v._suggest_search_query(FakeLLM(), "Some claim text.", [], context="a specific angle")
+    assert result == "context-aware query"
+
+
 # -- _examine_candidates resilience (hardening pass) -------------------------
 # A transient failure classifying one candidate must not abort examination of
 # the rest, and must not propagate out of _examine_candidates at all -- this
@@ -226,7 +288,7 @@ async def test_examine_candidates_survives_one_failing_comparison(kb_db, monkeyp
 
     call_count = {"n": 0}
 
-    async def flaky_classify(llm, a, b):
+    async def flaky_classify(llm, a, b, context=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise ConnectionError("simulated transient LLM failure")
@@ -272,7 +334,7 @@ async def test_examine_candidates_skips_llm_call_for_social_media_only_source(kb
 
     classified = []
 
-    async def fake_classify(llm, a, b):
+    async def fake_classify(llm, a, b, context=None):
         classified.append(b)
         return {"relationship": "supports", "confidence": 0.9, "reasoning": "test"}
 
@@ -448,3 +510,25 @@ async def test_delete_source_cascade_removes_source_and_its_artifacts(kb_db):
 
     assert await kb_db.get_source(source["id"]) is None
     assert await kb_db.list_chunks(artifact["id"]) == []
+
+
+# -- claims.verification_context: expands what verify_claim looks for --------
+
+async def test_set_claim_verification_context_sets_and_clears(kb_db):
+    claim, _ = await kb_db.get_or_create_claim("fact", "Industrial buildings use more electricity than residential.")
+
+    updated = await kb_db.set_claim_verification_context(claim["id"], "compare against datacenter usage")
+    assert updated["verification_context"] == "compare against datacenter usage"
+
+    cleared = await kb_db.set_claim_verification_context(claim["id"], None)
+    assert cleared["verification_context"] is None
+
+
+async def test_set_claim_verification_context_strips_and_treats_blank_as_clear(kb_db):
+    claim, _ = await kb_db.get_or_create_claim("fact", "Some claim.")
+
+    updated = await kb_db.set_claim_verification_context(claim["id"], "  padded context  ")
+    assert updated["verification_context"] == "padded context"
+
+    blanked = await kb_db.set_claim_verification_context(claim["id"], "   ")
+    assert blanked["verification_context"] is None

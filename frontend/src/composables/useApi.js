@@ -139,6 +139,11 @@ export function useApi() {
     return resp.json()
   }
 
+  async function fetchConversationTranscript(id) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${id}/conversation`)
+    return resp.json()
+  }
+
   async function fetchTopicSources(id, status = 'attached') {
     const resp = await fetch(`${API_BASE}/kb/topics/${id}/sources?status=${status}`)
     return resp.json()
@@ -345,6 +350,15 @@ export function useApi() {
     return resp.json()
   }
 
+  async function setClaimVerificationContext(claimId, context) {
+    const resp = await fetch(`${API_BASE}/kb/claims/${claimId}/verification-context`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context }),
+    })
+    return resp.json()
+  }
+
   async function searchChunks(q, semantic = false, limit = 20) {
     const params = new URLSearchParams({ q, semantic, limit })
     const resp = await fetch(`${API_BASE}/kb/search?${params}`)
@@ -376,16 +390,31 @@ export function useApi() {
     return resp.json()
   }
 
+  // --- Search provider usage ---
+
+  async function fetchSearchUsage() {
+    const resp = await fetch(`${API_BASE}/search-usage`)
+    return resp.json()
+  }
+
+  async function checkSearchProviders() {
+    const resp = await fetch(`${API_BASE}/search-usage/check`, { method: 'POST' })
+    return resp.json()
+  }
+
   return {
     fetchModels, fetchSessions, fetchSession, deleteSession, streamResearch,
     fetchTopics, createTopic, fetchTopic, fetchTimeline, fetchTopicClaims,
+    fetchConversationTranscript,
     fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,
     backfillTopic, triggerTopicVerification, fetchTopicProcessingStatus, fetchReport, generateReport,
     fetchResolutionCandidates, reviewResolutionCandidate,
     fetchSources, fetchSource, fetchSourceClaims, fetchSourceProcessingStatus,
     ingestUrl, ingestYoutube, ingestFile, ingestConversation,
     chunkSource, extractSource, verifySource, backfillEmbeddings,
-    fetchClaims, fetchClaim, verifyClaim, setPreferredSource, setClaimVerificationOverride, searchChunks,
+    fetchClaims, fetchClaim, verifyClaim, setPreferredSource, setClaimVerificationOverride,
+    setClaimVerificationContext, searchChunks,
     fetchVerificationRuns, fetchCurrentVerificationRun, triggerVerificationRun,
+    fetchSearchUsage, checkSearchProviders,
   }
 }

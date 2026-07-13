@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from deep_research.config import Config
 from deep_research.kb.artifacts import build_artifact_for_version
+from deep_research.kb.conversation import get_topic_conversation_transcript
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import backfill_embeddings, embed_texts
 from deep_research.kb.extraction import run_extraction
@@ -27,6 +28,7 @@ from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
 from deep_research.kb.timeline import get_topic_timeline
 from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
+from deep_research.kb.trust import set_trust_tier_if_missing
 from deep_research.kb.verification import (
     claim_check_status,
     is_claim_eligible_for_verification,
@@ -98,6 +100,10 @@ class PreferredSourceRequest(BaseModel):
 
 class VerificationOverrideRequest(BaseModel):
     override: str | None = None  # 'include' | 'exclude' | None
+
+
+class VerificationContextRequest(BaseModel):
+    context: str | None = None
 
 
 class IngestUrlRequest(BaseModel):
@@ -213,6 +219,22 @@ async def get_timeline(topic_id: str):
     }
 
 
+@router.get("/topics/{topic_id}/conversation")
+async def get_conversation_transcript(topic_id: str):
+    topic = await _get_topic_or_404(topic_id)
+    turns = await get_topic_conversation_transcript(kb_db, topic["id"])
+
+    # Claims embedded per-turn need check_status too (ClaimListItem's badge
+    # relies on it) -- annotate once across the deduplicated set rather than
+    # per-turn, since the same claim can be evidenced from more than one turn.
+    by_id = {c["id"]: c for turn in turns for c in turn["claims"]}
+    annotated_by_id = {c["id"]: c for c in _with_check_status(list(by_id.values()))}
+    for turn in turns:
+        turn["claims"] = [annotated_by_id[c["id"]] for c in turn["claims"]]
+
+    return {"turns": _serialize(turns)}
+
+
 @router.get("/topics/{topic_id}/claims")
 async def list_claims(topic_id: str, status: str = "attached"):
     topic = await _get_topic_or_404(topic_id)
@@ -264,7 +286,7 @@ async def review_claim(topic_id: str, claim_id: str, req: ReviewRequest):
 @router.post("/topics/{topic_id}/backfill")
 async def backfill(topic_id: str):
     topic = await _get_topic_or_404(topic_id)
-    result = await generate_topic_suggestions(kb_db, topic["id"])
+    result = await generate_topic_suggestions(kb_db, config, topic["id"])
     return {"claims_suggested": result.claims_suggested, "sources_suggested": result.sources_suggested}
 
 
@@ -371,6 +393,24 @@ async def set_claim_verification_override(claim_id: str, req: VerificationOverri
     )})}
 
 
+@router.put("/claims/{claim_id}/verification-context")
+async def set_claim_verification_context(claim_id: str, req: VerificationContextRequest):
+    """Lets a human expand what a claim's verification pass actually looks
+    for beyond the literal claim text (e.g. claim "industrial buildings use
+    more electricity than residential" + context "compare specifically
+    against datacenter usage") -- see verify_claim's use of
+    claims.verification_context. Setting it doesn't itself trigger a
+    recheck; force-reverify via the existing verify endpoint afterward to
+    have it take effect on a claim that was already checked."""
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(404, "Claim not found")
+    updated = await kb_db.set_claim_verification_context(claim_id, req.context)
+    return {"claim": _serialize({**updated, "check_status": claim_check_status(
+        updated, config.kb.verification_importance_threshold,
+    )})}
+
+
 def _evidence_summary(rows: list[dict]) -> list[dict]:
     """Trims claim_evidence rows down to what a reviewer actually needs to
     judge a claim_duplicate/claim_contradiction candidate: which source it
@@ -469,12 +509,16 @@ async def search_sources(q: str = "", limit: int = 50, include_conversations: bo
 @router.post("/sources/ingest-url")
 async def ingest_url_route(req: IngestUrlRequest):
     result = await ingest_web_page(req.url, config, kb_db, snapshot_store, trust_tier_code=req.trust_tier)
+    if result.status != "failed" and result.source_id:
+        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     return {"result": asdict(result)}
 
 
 @router.post("/sources/ingest-youtube")
 async def ingest_youtube_route(req: IngestYoutubeRequest):
     result = await ingest_youtube_video(req.url, kb_db, snapshot_store, trust_tier_code=req.trust_tier)
+    if result.status != "failed" and result.source_id:
+        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     return {"result": asdict(result)}
 
 
@@ -491,6 +535,8 @@ async def ingest_file_route(file: UploadFile = File(...), trust_tier: str | None
     dest = uploads_dir / file.filename
     dest.write_bytes(await file.read())
     result = await ingest_file(dest, kb_db, snapshot_store, trust_tier_code=trust_tier)
+    if result.status != "failed" and result.source_id:
+        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     return {"result": asdict(result)}
 
 
@@ -522,7 +568,7 @@ async def _process_conversation_source(source_id: str, threshold: float | None, 
             return
 
         promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
-        await check_claims_against_topics(kb_db, promotion.new_claim_ids)
+        await check_claims_against_topics(kb_db, config, promotion.new_claim_ids)
         if topic_id is not None:
             # attach_source_to_topic was already called once at ingest time
             # (before any claims existed, just to link the topic<->source);
@@ -662,7 +708,7 @@ async def extract_source_route(source_id: str, req: ExtractSourceRequest):
     if extraction_result.status in ("extracted", "partial"):
         promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
         response["promotion"] = asdict(promotion)
-        topic_results = await check_claims_against_topics(kb_db, promotion.new_claim_ids)
+        topic_results = await check_claims_against_topics(kb_db, config, promotion.new_claim_ids)
         suggestions = []
         for topic_id, result in topic_results.items():
             topic = await kb_db.get_topic(topic_id)

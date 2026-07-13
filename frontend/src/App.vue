@@ -1,5 +1,5 @@
 <script setup>
-import { Search, History, FolderClock, GitMerge, Database, Quote, ShieldCheck, Sun, Moon } from 'lucide-vue-next'
+import { Search, History, FolderClock, GitMerge, Database, Quote, ShieldCheck, Radio, Sun, Moon } from 'lucide-vue-next'
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 
@@ -91,6 +91,14 @@ function applyTheme() {
             >
               <ShieldCheck class="w-4 h-4" />
               Verification
+            </router-link>
+            <router-link
+              to="/search-usage"
+              class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+              active-class="bg-gray-100 dark:bg-gray-700"
+            >
+              <Radio class="w-4 h-4" />
+              Search Usage
             </router-link>
           </nav>
         </div>

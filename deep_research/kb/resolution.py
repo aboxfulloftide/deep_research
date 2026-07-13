@@ -27,7 +27,7 @@ from deep_research.config import Config, LLMConfig
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import embed_texts
 from deep_research.kb.extraction import detect_model
-from deep_research.kb.merge import merge_entities
+from deep_research.kb.merge import merge_claims, merge_entities
 from deep_research.llm import LLMClient
 
 MIN_FUZZY_ENTITY_NAME_LENGTH = 4
@@ -62,11 +62,18 @@ Return ONLY a JSON object: {"relationship": "same"|"different", "confidence": 0.
 # human review entirely (auto-merge on "same", or silently drop the
 # candidate on "different"). Below this bar -- or on a parse failure /
 # request exception -- fall through to the existing safe default of queuing
-# the pair in resolution_candidates for a person to decide.
+# the pair in resolution_candidates for a person to decide. Shared by both
+# entity-duplicate and claim-duplicate vetting below.
 ENTITY_LLM_CONFIDENCE_THRESHOLD = 0.75
+CLAIM_LLM_CONFIDENCE_THRESHOLD = 0.75
 
 
-def _parse_entity_classification(content: str) -> dict:
+def _parse_same_different_classification(content: str) -> dict:
+    """Shared JSON parser for both _classify_entity_duplicate and
+    _classify_claim_duplicate -- both prompts ask for the same
+    {"relationship": "same"|"different", "confidence": ..., "reasoning": ...}
+    shape, just about different kinds of pairs (entity names vs. claim
+    sentences)."""
     content = content.strip()
     try:
         return json.loads(content)
@@ -90,7 +97,30 @@ async def _classify_entity_duplicate(llm: LLMClient, name_a: str, name_b: str, e
     ]
     resp = await llm.chat(messages)
     content = resp["choices"][0]["message"]["content"] or ""
-    return _parse_entity_classification(content)
+    return _parse_same_different_classification(content)
+
+
+CLAIM_COMPARISON_SYSTEM_PROMPT = """/no_think
+You are comparing two factual claims extracted from different sources to determine whether they are the same specific fact, restated, or different facts.
+
+Classify the relationship as exactly one of:
+- "same": Claim B is a restatement of the exact same specific fact as Claim A (different wording, units, or approximations are fine, as long as they are consistent once you account for that)
+- "different": Claim B is about a different specific fact -- including a claim that actually conflicts with Claim A (a different number or outcome that cannot both be true), or a claim that is merely topically related but not actually the same specific fact
+
+Do the arithmetic/unit conversion yourself if needed before deciding -- do not assume different-looking numbers are different facts without checking whether they are equivalent, and do not call a genuine conflict "same" just because it's about the same topic.
+
+Return ONLY a JSON object: {"relationship": "same"|"different", "confidence": 0.0-1.0, "reasoning": "one short sentence"}
+"""
+
+
+async def _classify_claim_duplicate(llm: LLMClient, claim_text: str, other_text: str) -> dict:
+    messages = [
+        {"role": "system", "content": CLAIM_COMPARISON_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Claim A: {claim_text}\nClaim B: {other_text}\n\nClassify."},
+    ]
+    resp = await llm.chat(messages)
+    content = resp["choices"][0]["message"]["content"] or ""
+    return _parse_same_different_classification(content)
 
 
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")  # decimal point only consumed if followed by a digit
@@ -272,7 +302,7 @@ async def embed_new_claims(kb_db: KBDatabase, config: Config, new_claim_ids: lis
 
 
 async def generate_claim_resolution_candidates(
-    kb_db: KBDatabase, config: Config, new_claim_ids: list[str],
+    kb_db: KBDatabase, config: Config, new_claim_ids: list[str], llm: LLMClient | None = None,
 ) -> int:
     """Embedding-similarity candidate generation for claims — the tier decision
     25 requires because lexical matching measured zero true positives in the
@@ -280,13 +310,21 @@ async def generate_claim_resolution_candidates(
     HNSW nearest-neighbor index over persisted embeddings (embed_new_claims
     above), instead of re-embedding the whole KB on every single resolution
     run — the previous approach that became the actual bottleneck as the KB
-    grew. Matches above config.kb.claim_duplicate_threshold become
-    resolution_candidates (never auto-merged — the spike measured only 50%
-    precision even at 0.85). Matches whose numbers flatly disagree ("140 bank
-    failures in 2009" vs. "157 bank failures in 2010" — both true, not
-    duplicates) are suppressed entirely: structurally similar sentences score
-    high on embedding similarity regardless of the actual numbers inside them,
-    and this was measured as a real, recurring source of review-queue noise."""
+    grew. Matches whose numbers flatly disagree ("140 bank failures in 2009"
+    vs. "157 bank failures in 2010" — both true, not duplicates) are
+    suppressed entirely: structurally similar sentences score high on
+    embedding similarity regardless of the actual numbers inside them, and
+    this was measured as a real, recurring source of review-queue noise.
+
+    The spike measured only 50% precision at cosine 0.85 alone -- worse than
+    entity fuzzy-matching's false-positive rate, and for the same underlying
+    reason (structural/topical similarity isn't the same thing as "the same
+    fact"). When an LLM client is given, remaining candidates get the same
+    vetting entity-duplicates already get (see _classify_entity_duplicate):
+    a confident "same" merges directly instead of queuing, a confident
+    "different" is dropped as a similarity false positive, and anything
+    ambiguous (or a failed LLM call) falls through to the existing
+    resolution_candidates queue for a human to decide."""
     if not new_claim_ids:
         return 0
 
@@ -305,6 +343,21 @@ async def generate_claim_resolution_candidates(
             other_numbers = _extract_numbers(other["canonical_text"])
             if claim_numbers and other_numbers and claim_numbers.isdisjoint(other_numbers):
                 continue  # both claims cite numbers, but share none -- not the same fact
+
+            if llm is not None:
+                try:
+                    verdict = await _classify_claim_duplicate(llm, claim["canonical_text"], other["canonical_text"])
+                except Exception:
+                    verdict = {"relationship": "different", "confidence": 0.0}
+                relationship = verdict.get("relationship")
+                confidence = verdict.get("confidence") or 0.0
+                if confidence >= CLAIM_LLM_CONFIDENCE_THRESHOLD:
+                    if relationship == "same":
+                        await merge_claims(kb_db, claim_id, other["id"])
+                        continue
+                    if relationship == "different":
+                        continue
+
             _, created = await kb_db.add_claim_resolution_candidate(
                 claim_id, other["id"], other["similarity"], "embedding_cosine",
                 reason=f"cosine={other['similarity']:.3f}",
@@ -400,11 +453,12 @@ async def resolve_and_promote(
 
             await kb_db.mark_observation_promoted(obs["id"], claim_row["id"])
             result.promoted_count += 1
+
+        result.new_claim_count = len(new_claim_ids)
+        result.new_claim_ids = new_claim_ids
+        await embed_new_claims(kb_db, config, new_claim_ids)
+        result.claim_candidate_count = await generate_claim_resolution_candidates(kb_db, config, new_claim_ids, llm)
     finally:
         await llm.close()
 
-    result.new_claim_count = len(new_claim_ids)
-    result.new_claim_ids = new_claim_ids
-    await embed_new_claims(kb_db, config, new_claim_ids)
-    result.claim_candidate_count = await generate_claim_resolution_candidates(kb_db, config, new_claim_ids)
     return result
