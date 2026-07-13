@@ -17,7 +17,8 @@ from deep_research.db import Database
 from deep_research.llm import LLMClient
 from deep_research.model_backends import apply_backend, list_models as backend_list_models
 from deep_research.tools.scrape import scrape_page
-from deep_research.tools.search import web_search
+from deep_research.tools.search import check_providers_now, web_search
+from deep_research.tools.search_usage import get_usage_summary
 from web import kb_routes
 
 # Global state
@@ -85,6 +86,22 @@ async def list_models(backend: str | None = None):
         return {"models": models, "default": default, "backend": backend}
     except Exception as e:
         return {"models": [], "default": "", "backend": backend, "error": str(e)}
+
+
+@app.get("/api/search-usage")
+async def search_usage():
+    """Per-provider search call counts/status (duckduckgo via SearXNG scrape,
+    brave/tavily via their real APIs) -- how many calls, ok/empty/error
+    breakdown, and the most recent call's outcome per provider."""
+    return await get_usage_summary(config)
+
+
+@app.post("/api/search-usage/check")
+async def search_usage_check():
+    """Fires one live probe query at each provider right now and returns
+    whether it's actually responding -- the historical log above can be
+    stale if nothing's called a given provider in a while."""
+    return await check_providers_now(config)
 
 
 @app.get("/api/sessions")

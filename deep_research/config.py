@@ -24,6 +24,49 @@ class LLMConfig(BaseModel):
 
 class SearXNGConfig(BaseModel):
     url: str = "http://localhost:8888"
+    # Minimum gap enforced between consecutive SearXNG calls (see
+    # search.py's _throttle_searxng), even across concurrent verification
+    # tasks -- duckduckgo/mojeek/wikipedia have no documented rate limit but
+    # visibly start CAPTCHA'ing/429ing under rapid-fire bursts. This isn't a
+    # workaround for that (see the CAPTCHA-solving conversation) -- it's
+    # just not hitting them faster than they're willing to serve.
+    min_interval_seconds: float = 1.5
+
+
+class BraveConfig(BaseModel):
+    # SearXNG's built-in "brave" engine scrapes search.brave.com unauthenticated
+    # (no api key support) and gets rate-limited by Brave's anti-bot heuristics
+    # under sustained query volume. When that happens, web_search() falls back
+    # to Brave's real Search API using this key, instead of paying for the
+    # metered official API on every query up front.
+    api_key: str = ""
+
+
+class TavilyConfig(BaseModel):
+    # General-purpose fallback (not tied to one SearXNG engine like brave is)
+    # -- used when SearXNG's combined results are thin, regardless of which
+    # engine(s) failed (google cse, startpage, or a fully dead SearXNG). Both
+    # brave and tavily are metered at 1000 queries/month on the free tier, so
+    # this is only invoked when actually needed, not on every query.
+    api_key: str = ""
+
+
+class SerperConfig(BaseModel):
+    # Last-resort fallback, tried only if duckduckgo+brave+tavily are all
+    # still thin -- unlike brave/tavily's free tier, Serper's free allotment
+    # (2500 queries) is a one-time trial bucket, not a monthly recurring one,
+    # so it's deliberately kept out of the routine per-query chain to conserve
+    # it for when the other three genuinely can't find anything.
+    api_key: str = ""
+
+
+class WikipediaConfig(BaseModel):
+    # Wikimedia's REST search API is free/no-key, but its edge WAF 403s
+    # requests whose User-Agent doesn't follow their identification policy
+    # (https://foundation.wikimedia.org/wiki/Policy:User-Agent_policy --
+    # needs real contact info, not a generic client string). Kept out of
+    # source (an email is PII) the same way API keys are -- set via env var.
+    contact: str = ""
 
 
 class ScrapingConfig(BaseModel):
@@ -90,6 +133,10 @@ class KBConfig(BaseModel):
 class Config(BaseModel):
     llm: LLMConfig = LLMConfig()
     searxng: SearXNGConfig = SearXNGConfig()
+    brave: BraveConfig = BraveConfig()
+    tavily: TavilyConfig = TavilyConfig()
+    serper: SerperConfig = SerperConfig()
+    wikipedia: WikipediaConfig = WikipediaConfig()
     scraping: ScrapingConfig = ScrapingConfig()
     agent: AgentConfig = AgentConfig()
     db: DBConfig = DBConfig()
@@ -117,6 +164,11 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_LLM_LLAMA_CPP_BASE_URL": ("llm", "llama_cpp_base_url"),
         "DEEP_RESEARCH_LLM_LLAMA_CPP_API_KEY": ("llm", "llama_cpp_api_key"),
         "DEEP_RESEARCH_SEARXNG_URL": ("searxng", "url"),
+        "DEEP_RESEARCH_SEARXNG_MIN_INTERVAL_SECONDS": ("searxng", "min_interval_seconds"),
+        "DEEP_RESEARCH_BRAVE_API_KEY": ("brave", "api_key"),
+        "DEEP_RESEARCH_TAVILY_API_KEY": ("tavily", "api_key"),
+        "DEEP_RESEARCH_SERPER_API_KEY": ("serper", "api_key"),
+        "DEEP_RESEARCH_WIKIPEDIA_CONTACT": ("wikipedia", "contact"),
         "DEEP_RESEARCH_SCRAPING_TIMEOUT": ("scraping", "timeout"),
         "DEEP_RESEARCH_SCRAPING_MAX_CONTENT_LENGTH": ("scraping", "max_content_length"),
         "DEEP_RESEARCH_AGENT_MAX_STEPS": ("agent", "max_steps"),
