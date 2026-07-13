@@ -27,16 +27,25 @@ Stated directly by the user; every item below is in service of these:
 ## Definition: "idle time"
 
 Several items below run as background/speculative work "during idle time."
-Definition (user's, 2026-07-13): **the GPUs are not doing LLM work.** This
-box is the user's main LLM server — today it effectively only serves this
-project, but it will pick up other workloads over time, so "our job queue is
-empty" is *not* a sufficient idleness signal. Background work must check
-actual GPU/LLM activity before starting each job:
+Definition (user's, 2026-07-13): **the GPUs are not busy with anyone else's
+work.** This box is the user's main GPU/LLM server — today it effectively
+only serves this project, but it hosts and will host other GPU workloads
+too: llama-server, Ollama, ComfyUI (image generation, not even LLM work),
+and whatever comes later. Two consequences:
 
-- llama-server `/slots` (are any slots busy) and/or Ollama's running-model
-  state for the servers this project knows about;
-- an `nvidia-smi` utilization check as the backstop for LLM work this
-  project *didn't* start (the "other things" this server will do later).
+- "Our job queue is empty" is *not* a sufficient idleness signal.
+- Checking the servers this project knows about (llama-server `/slots`,
+  Ollama's running-model state) is *also* not sufficient — those are at
+  best a refinement for "is it specifically our own work."
+
+The authoritative gate is GPU-level and workload-agnostic: `nvidia-smi`
+(compute process list + utilization, sustained over a short window so a
+momentary dip between generation steps doesn't read as idle) — it catches
+llama-server, Ollama, ComfyUI, and anything else without this project
+needing to know each tool exists. This project's own inference server is
+the one exception the gate must allow for: a speculative job obviously
+needs the model server it's about to use, so "the only GPU consumer is our
+own (currently idle) llama-server/Ollama process" still counts as idle.
 
 Concretely: the background scheduler ranks speculative work (counter-claim
 search, playlist ingestion, retroactive ad sweep, topic discovery, report
