@@ -69,7 +69,7 @@ async def enqueue_manual_job(
 async def enqueue_playlist_poll(kb_db: KBDatabase, playlist_id: str) -> tuple[dict, bool]:
     """Queue low-priority discovery work; the worker's GPU-idle gate applies."""
     return await kb_db.enqueue_processing_job(
-        "playlist_poll", "playlist", playlist_id,
+        "playlist_poll", "playlist", subject_id=playlist_id,
         idempotency_key=f"playlist_poll:{playlist_id}", priority=-100, is_speculative=True,
     )
 

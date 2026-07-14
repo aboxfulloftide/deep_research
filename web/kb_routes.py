@@ -643,7 +643,7 @@ async def list_topic_discovery_proposals(status: str = "open"):
 @router.post("/topic-discovery-proposals/run")
 async def run_topic_discovery():
     job, _ = await kb_db.enqueue_processing_job(
-        "topic_discovery", "knowledge_base", "default", idempotency_key="topic_discovery:default",
+        "topic_discovery", "knowledge_base", subject_id="default", idempotency_key="topic_discovery:default",
         priority=-100, is_speculative=True,
     )
     return {"job": _serialize(job)}
