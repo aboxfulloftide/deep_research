@@ -51,6 +51,9 @@ async def _throttle_searxng(min_interval_seconds: float) -> None:
         _searxng_last_call_at = time.monotonic()
 
 
+BRAVE_RATE_LIMIT_RETRY_SECONDS = 1.1  # free tier allows 1 request/second
+
+
 async def _brave_api_search(query: str, api_key: str) -> list[SearchResult]:
     """Direct call to Brave's official Search API. SearXNG's own brave engine
     is disabled in searxng/settings.yml (it got rate limited under sustained
@@ -74,6 +77,62 @@ async def _brave_api_search(query: str, api_key: str) -> list[SearchResult]:
             snippet=_HTML_TAG_RE.sub("", item.get("description", "")),
         ))
     return results
+
+
+async def _brave_api_search_with_retry(query: str, api_key: str) -> list[SearchResult]:
+    """The free tier allows 1 request/second, so under
+    verification_concurrency=2 an occasional per-second 429 is expected and
+    not a reason to spend the paid fallback key -- retry once after a beat
+    before treating it as a real failure. Monthly-quota exhaustion also
+    presents as 429; that one fails the retry too and falls through to the
+    fallback key in _brave_search_layered."""
+    try:
+        return await _brave_api_search(query, api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code != 429:
+            raise
+    await asyncio.sleep(BRAVE_RATE_LIMIT_RETRY_SECONDS)
+    return await _brave_api_search(query, api_key)
+
+
+async def _brave_search_layered(query: str, config: Config) -> list[SearchResult]:
+    """Two Brave subscriptions, spent in order: the free-tier key
+    (config.brave.api_key, ~2000 queries/month, 1 req/s) first, and the paid
+    key (config.brave.fallback_api_key, 50 req/s, ~3000/month budgeted) only
+    when the free key actually *errors* -- quota exhausted, persistent 429,
+    subscription problem. A genuinely empty result set from the free key is
+    an answer, not a failure, and never triggers paid spend. Each key logs
+    under its own provider name ("brave" / "brave_fallback") so
+    /search-usage shows exactly when the paid key started carrying traffic."""
+    if config.brave.api_key:
+        t = timer()
+        try:
+            results = await _brave_api_search_with_retry(query, config.brave.api_key)
+            await log_search_call(
+                config, "brave", "api", "ok" if results else "empty",
+                result_count=len(results), elapsed_ms=t.elapsed_ms, query=query,
+            )
+            return results
+        except httpx.HTTPError as e:
+            await log_search_call(
+                config, "brave", "api", "error",
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+            )
+    if config.brave.fallback_api_key:
+        t = timer()
+        try:
+            results = await _brave_api_search(query, config.brave.fallback_api_key)
+            await log_search_call(
+                config, "brave_fallback", "api", "ok" if results else "empty",
+                result_count=len(results), elapsed_ms=t.elapsed_ms, query=query,
+            )
+            return results
+        except httpx.HTTPError as e:
+            await log_search_call(
+                config, "brave_fallback", "api", "error",
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+            )
+    return []
 
 
 async def _tavily_api_search(query: str, api_key: str) -> list[SearchResult]:
@@ -338,24 +397,11 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
         )
     results = _merge(results, wikidata_results)
 
-    if config.brave.api_key:
-        t = timer()
-        try:
-            brave_results = await _brave_api_search(query, config.brave.api_key)
-            await log_search_call(
-                config, "brave", "api", "ok" if brave_results else "empty",
-                result_count=len(brave_results), elapsed_ms=t.elapsed_ms, query=query,
-            )
-        except httpx.HTTPError as e:
-            # Quota exhausted or the API is unreachable -- fall through with
-            # whatever SearXNG's other engines already returned rather than
-            # losing the whole search over one engine's fallback failing.
-            brave_results = []
-            await log_search_call(
-                config, "brave", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
-            )
-        results = _merge(results, brave_results)
+    if config.brave.api_key or config.brave.fallback_api_key:
+        # Both keys erroring falls through with whatever the other providers
+        # already returned rather than losing the whole search -- each
+        # attempt is logged inside _brave_search_layered.
+        results = _merge(results, await _brave_search_layered(query, config))
 
     if sum(_is_relevant(result, terms) for result in results) < MIN_RESULTS_BEFORE_TAVILY_FALLBACK and config.tavily.api_key:
         t = timer()
@@ -444,17 +490,18 @@ async def check_providers_now(config: Config) -> dict:
         await log_search_call(config, "wikidata_api", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
         out["wikidata_api"] = {"responding": False, "result_count": 0, "error": str(e)}
 
-    if config.brave.api_key:
+    for provider, api_key in (("brave", config.brave.api_key), ("brave_fallback", config.brave.fallback_api_key)):
+        if not api_key:
+            out[provider] = {"responding": None, "result_count": 0, "error": "no api key configured"}
+            continue
         t = timer()
         try:
-            results = await _brave_api_search(probe, config.brave.api_key)
-            await log_search_call(config, "brave", "api", "ok" if results else "empty", result_count=len(results), elapsed_ms=t.elapsed_ms, query=probe)
-            out["brave"] = {"responding": len(results) > 0, "result_count": len(results), "error": None}
+            results = await _brave_api_search(probe, api_key)
+            await log_search_call(config, provider, "api", "ok" if results else "empty", result_count=len(results), elapsed_ms=t.elapsed_ms, query=probe)
+            out[provider] = {"responding": len(results) > 0, "result_count": len(results), "error": None}
         except httpx.HTTPError as e:
-            await log_search_call(config, "brave", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
-            out["brave"] = {"responding": False, "result_count": 0, "error": str(e)}
-    else:
-        out["brave"] = {"responding": None, "result_count": 0, "error": "no api key configured"}
+            await log_search_call(config, provider, "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
+            out[provider] = {"responding": False, "result_count": 0, "error": str(e)}
 
     if config.tavily.api_key:
         t = timer()

@@ -39,7 +39,15 @@ class BraveConfig(BaseModel):
     # under sustained query volume. When that happens, web_search() falls back
     # to Brave's real Search API using this key, instead of paying for the
     # metered official API on every query up front.
+    # Primary key: the free-tier subscription -- observed limits ~2000
+    # queries/month and 1 request/second.
     api_key: str = ""
+    # Paid backup key (separate Brave subscription: up to 50 req/s, budgeted
+    # ~3000 searches/month). Only spent once the primary key actually fails
+    # (monthly quota exhausted, persistent 429, subscription error) -- never
+    # while the free key is still answering, and never on a merely-empty
+    # result. See search.py's _brave_search_layered.
+    fallback_api_key: str = ""
 
 
 class TavilyConfig(BaseModel):
@@ -174,6 +182,7 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_SEARXNG_URL": ("searxng", "url"),
         "DEEP_RESEARCH_SEARXNG_MIN_INTERVAL_SECONDS": ("searxng", "min_interval_seconds"),
         "DEEP_RESEARCH_BRAVE_API_KEY": ("brave", "api_key"),
+        "DEEP_RESEARCH_BRAVE_FALLBACK_API_KEY": ("brave", "fallback_api_key"),
         "DEEP_RESEARCH_TAVILY_API_KEY": ("tavily", "api_key"),
         "DEEP_RESEARCH_SERPER_API_KEY": ("serper", "api_key"),
         "DEEP_RESEARCH_WIKIPEDIA_CONTACT": ("wikipedia", "contact"),
