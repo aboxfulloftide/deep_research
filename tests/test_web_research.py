@@ -42,4 +42,5 @@ async def test_text_research_adds_full_source_context_and_quote_guidance(monkeyp
     prompt = llm.messages[1]["content"]
     assert "complete surrounding quotation" in prompt
     assert "disputed quotes or claims" in prompt
+    assert "Claim, Rating, or Context" in prompt
     assert "Markdown links" in prompt

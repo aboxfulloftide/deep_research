@@ -281,7 +281,13 @@ async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg,
                     if page and page.text_content:
                         pages.append(
                             f"=== Source: {page.title or result.title} ({result.url}) ===\n"
-                            f"{page.text_content}"
+                            # The lead and opening sections normally contain
+                            # the claim, quote, and the source's conclusion.
+                            # Keeping each source bounded leaves the local
+                            # model enough room to compare both sources and
+                            # answer, rather than spending its whole context
+                            # window on one long article.
+                            f"{page.text_content[:4000]}"
                         )
                     if len(pages) == 2:
                         break
@@ -314,7 +320,10 @@ async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg,
                 f"6. For disputed quotes or claims, distinguish the exact words used, "
                 f"their surrounding qualification, and the scope of the claim; do not "
                 f"collapse them into a misleading yes/no answer.\n"
-                f"7. Cite the most relevant web sources as Markdown links using the URLs "
+                f"7. When a source gives a Claim, Rating, or Context, report that finding "
+                f"accurately. Do not say a speaker praised a specific subgroup unless the "
+                f"source says the speaker was referring to that subgroup.\n"
+                f"8. Cite the most relevant web sources as Markdown links using the URLs "
                 f"provided in DATA."
             ),
         },
