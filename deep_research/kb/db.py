@@ -548,6 +548,20 @@ CREATE INDEX IF NOT EXISTS idx_processing_jobs_subject
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_source ON processing_jobs(source_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_topic ON processing_jobs(topic_id, created_at DESC);
 
+-- A single durable control for planned shutdowns.  A pause prevents workers
+-- from claiming another job; it deliberately does not interrupt a job that is
+-- already running, so the user can wait for that work to finish safely.
+CREATE TABLE IF NOT EXISTS processing_queue_control (
+    id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    paused BOOLEAN NOT NULL DEFAULT FALSE,
+    paused_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+INSERT INTO processing_queue_control (id, paused, updated_at)
+VALUES (TRUE, FALSE, NOW())
+ON CONFLICT (id) DO NOTHING;
+
 -- Append-only explanation and reversal trail for every automated decision.
 -- A reversal is a new row linked through undo_of_decision_id, never an update
 -- to the original decision, so users can reconstruct what happened over time.
@@ -2625,6 +2639,38 @@ class KBDatabase:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(query, *params)
         return [dict(r) for r in rows]
+
+    async def get_processing_queue_control(self) -> dict:
+        """Return the durable queue pause state.
+
+        The singleton row is created by the schema migration.  Keeping this
+        separate from a worker's process state means a planned pause survives
+        a web-server or computer restart.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT paused, paused_at, updated_at FROM processing_queue_control WHERE id = TRUE",
+            )
+        assert row is not None
+        return dict(row)
+
+    async def set_processing_queue_paused(self, paused: bool) -> dict:
+        """Pause or resume claiming future processing jobs.
+
+        Pausing is intentionally *after current job*: work already leased by a
+        worker continues normally, while the next worker iteration sees this
+        state and leaves queued work untouched.
+        """
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE processing_queue_control SET paused = $1, "
+                "paused_at = CASE WHEN $1 THEN $2::timestamptz ELSE NULL END, updated_at = $2::timestamptz "
+                "WHERE id = TRUE RETURNING paused, paused_at, updated_at",
+                paused, now,
+            )
+        assert row is not None
+        return dict(row)
 
     async def claim_next_processing_job(self, worker_id: str, lease_seconds: int = 600) -> dict | None:
         """Atomically lease the highest-priority available job.

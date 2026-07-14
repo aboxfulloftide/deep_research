@@ -26,6 +26,17 @@ async def test_worker_leaves_empty_queue_untouched(kb_db, tmp_path):
     assert await worker.run_once() is False
 
 
+async def test_worker_does_not_start_new_work_while_queue_is_paused(kb_db, tmp_path):
+    job, _ = await kb_db.enqueue_processing_job(
+        "future_job_type", "topic", subject_id="topic-1", idempotency_key="pause:topic-1",
+    )
+    await kb_db.set_processing_queue_paused(True)
+    worker = ProcessingJobWorker(kb_db, Config(), SnapshotStore(tmp_path))
+
+    assert await worker.run_once() is False
+    assert (await kb_db.get_processing_job(job["id"]))["status"] == "queued"
+
+
 async def test_topic_verification_refreshes_the_topic_report(kb_db, tmp_path, monkeypatch):
     topic = await kb_db.create_topic("Verification refresh")
     job = await enqueue_manual_job(kb_db, "topic_verify", "topic", topic["id"], topic_id=topic["id"])

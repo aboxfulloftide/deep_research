@@ -134,6 +134,12 @@ class ProcessingJobWorker:
             if not acquired:
                 return False
             try:
+                # This is a cooperative, persistent "pause after current
+                # job".  A job already running is not interrupted; the worker
+                # simply does not lease another one after it completes.
+                queue_control = await self.kb_db.get_processing_queue_control()
+                if queue_control["paused"]:
+                    return False
                 job = await self.kb_db.claim_next_processing_job(self.worker_id)
                 if job is None:
                     return False

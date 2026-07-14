@@ -13,6 +13,9 @@ const triggerError = ref(null)
 const jobs = ref([])
 const movingJobId = ref(null)
 const queueMoveError = ref(null)
+const queueControl = ref({ paused: false })
+const queuePausing = ref(false)
+const queuePauseError = ref(null)
 
 let pollHandle = null
 
@@ -26,15 +29,32 @@ onUnmounted(() => {
 })
 
 async function load() {
-  const [currentData, runsData, jobsData] = await Promise.all([
+  const [currentData, runsData, jobsData, queueData] = await Promise.all([
     api.fetchCurrentVerificationRun(),
     api.fetchVerificationRuns(),
     api.fetchProcessingJobs(),
+    api.fetchProcessingQueue(),
   ])
   currentRun.value = currentData.run
   runs.value = runsData.runs || []
   jobs.value = jobsData.jobs || []
+  queueControl.value = queueData.queue || { paused: false }
   loading.value = false
+}
+
+async function toggleQueuePause() {
+  if (queuePausing.value) return
+  queuePausing.value = true
+  queuePauseError.value = null
+  try {
+    if (queueControl.value.paused) await api.resumeProcessingQueue()
+    else await api.pauseProcessingQueue()
+    await load()
+  } catch (e) {
+    queuePauseError.value = e.message
+  } finally {
+    queuePausing.value = false
+  }
 }
 
 async function triggerNow() {
@@ -107,7 +127,7 @@ const statusColors = {
 }
 
 function jobLabel(job) {
-  return ({ source_pipeline: 'Source ingest', source_verify: 'Source verification', topic_verify: 'Topic verification', claim_verify: 'Claim verification', verification_sweep: 'Verification sweep', playlist_poll: 'Playlist ingest', ad_sweep: 'Ad screening', contradiction_triage: 'Contradiction triage', counter_evidence: 'Counter-evidence', topic_discovery: 'Topic discovery' })[job.job_type] || job.job_type
+  return ({ source_pipeline: 'Source ingest', source_verify: 'Source verification', topic_verify: 'Topic verification', claim_verify: 'Claim verification', verification_sweep: 'Verification sweep', playlist_poll: 'Playlist ingest', ad_sweep: 'Ad screening', contradiction_triage: 'Contradiction triage', counter_evidence: 'Counter-evidence', topic_discovery: 'Topic discovery', model_experiment: 'Model experiment' })[job.job_type] || job.job_type
 }
 
 function formatProgress(job) {
@@ -177,7 +197,15 @@ function jobElapsed(job) {
 
     <template v-else>
       <section class="mb-8">
-        <h3 class="text-sm font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-1.5"><Activity class="w-4 h-4" /> All Deep Research Activity</h3>
+        <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <h3 class="text-sm font-semibold text-gray-900 dark:text-white flex items-center gap-1.5"><Activity class="w-4 h-4" /> All Deep Research Activity</h3>
+          <button @click="toggleQueuePause" :disabled="queuePausing" class="rounded-md px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50" :class="queueControl.paused ? 'bg-green-600 text-white hover:bg-green-700' : 'bg-amber-500 text-white hover:bg-amber-600'">
+            {{ queuePausing ? 'Saving...' : queueControl.paused ? 'Resume queue' : 'Pause after current job' }}
+          </button>
+        </div>
+        <p v-if="queueControl.paused" class="mb-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-900/30 dark:text-amber-200">Queue paused. Any running work can finish, but no queued work will start. When there are no running jobs, it is ready for a planned shutdown.</p>
+        <p v-else class="mb-2 text-xs text-gray-500 dark:text-gray-400">For a planned shutdown, pause here and wait until no jobs are running. Queued work will remain ready when you resume.</p>
+        <p v-if="queuePauseError" class="mb-2 text-xs text-red-600 dark:text-red-400">{{ queuePauseError }}</p>
         <p v-if="queueMoveError" class="mb-2 text-xs text-red-600 dark:text-red-400">{{ queueMoveError }}</p>
         <div v-if="activeJobs.length" class="space-y-2">
           <div v-for="job in activeJobs" :key="job.id" class="p-3 bg-white dark:bg-gray-800 border border-blue-200 dark:border-blue-800 rounded-lg text-sm">

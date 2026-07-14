@@ -398,6 +398,24 @@ export function useApi() {
     return resp.json()
   }
 
+  async function fetchProcessingQueue() {
+    const resp = await fetch(`${API_BASE}/kb/processing-queue`)
+    if (!resp.ok) throw new Error('Could not load queue controls')
+    return resp.json()
+  }
+
+  async function pauseProcessingQueue() {
+    const resp = await fetch(`${API_BASE}/kb/processing-queue/pause`, { method: 'POST' })
+    if (!resp.ok) throw new Error('Could not pause the queue')
+    return resp.json()
+  }
+
+  async function resumeProcessingQueue() {
+    const resp = await fetch(`${API_BASE}/kb/processing-queue/resume`, { method: 'POST' })
+    if (!resp.ok) throw new Error('Could not resume the queue')
+    return resp.json()
+  }
+
   async function moveProcessingJob(jobId, direction) {
     const resp = await fetch(`${API_BASE}/kb/processing-jobs/${jobId}/move`, {
       method: 'POST',
@@ -576,7 +594,7 @@ export function useApi() {
     fetchResolutionCandidates, reviewResolutionCandidate,
     fetchSources, fetchSource, fetchSourceClaims, fetchSourceDecisions, fetchSourceProcessingStatus, resetSourceTrustTier, archiveSource, restoreSource,
     ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos, deletePlaylist, checkPlaylist, ingestPlaylistBatch,
-    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, fetchProcessingJobs, moveProcessingJob, fetchModelExperimentProfiles, queueModelExperiment, retryProcessingJob,
+    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, fetchProcessingJobs, fetchProcessingQueue, pauseProcessingQueue, resumeProcessingQueue, moveProcessingJob, fetchModelExperimentProfiles, queueModelExperiment, retryProcessingJob,
     chunkSource, extractSource, verifySource, backfillEmbeddings, triggerAdSweep,
     fetchClaims, fetchClaim, fetchClaimDecisions, findCounterEvidence, verifyClaim, setPreferredSource, setClaimVerificationOverride,
     setClaimVerificationContext, searchChunks,

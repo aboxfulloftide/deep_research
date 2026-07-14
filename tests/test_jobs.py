@@ -78,6 +78,20 @@ async def test_queued_processing_job_cancels_without_a_worker(kb_db):
     assert await kb_db.claim_next_processing_job("worker-a") is None
 
 
+async def test_processing_queue_pause_is_persistent_and_reversible(kb_db):
+    initial = await kb_db.get_processing_queue_control()
+    assert initial["paused"] is False
+
+    paused = await kb_db.set_processing_queue_paused(True)
+    assert paused["paused"] is True
+    assert paused["paused_at"] is not None
+    assert (await kb_db.get_processing_queue_control())["paused"] is True
+
+    resumed = await kb_db.set_processing_queue_paused(False)
+    assert resumed["paused"] is False
+    assert resumed["paused_at"] is None
+
+
 async def test_explicit_user_actions_get_separate_durable_jobs(kb_db):
     source, _ = await kb_db.get_or_create_source(
         source_type_code="web", canonical_uri="https://example.com/manual-jobs", canonical_key="manual-jobs",

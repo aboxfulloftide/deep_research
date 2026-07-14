@@ -832,6 +832,22 @@ async def list_processing_jobs(status: str | None = None, limit: int = 50):
     return {"jobs": _serialize(jobs)}
 
 
+@router.get("/processing-queue")
+async def get_processing_queue():
+    return {"queue": _serialize(await kb_db.get_processing_queue_control())}
+
+
+@router.post("/processing-queue/pause")
+async def pause_processing_queue():
+    """Stop the worker from starting work after the current job completes."""
+    return {"queue": _serialize(await kb_db.set_processing_queue_paused(True))}
+
+
+@router.post("/processing-queue/resume")
+async def resume_processing_queue():
+    return {"queue": _serialize(await kb_db.set_processing_queue_paused(False))}
+
+
 @router.get("/model-experiments/profiles")
 async def list_model_experiment_profiles():
     from deep_research.kb.model_experiments import available_profiles
