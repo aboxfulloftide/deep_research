@@ -44,6 +44,7 @@ async def enumerate_youtube_playlist(url: str) -> list[dict]:
 
 async def poll_playlist(
     kb_db: KBDatabase, config: Config, snapshot_store: SnapshotStore, playlist_id: str,
+    *, limit: int | None = None,
 ) -> dict:
     playlists = await kb_db.list_tracked_playlists()
     playlist = next((p for p in playlists if p["id"] == playlist_id), None)
@@ -55,7 +56,8 @@ async def poll_playlist(
         _, created = await kb_db.add_playlist_video(playlist_id, video["video_id"], video.get("title"))
         discovered += created
     queued = 0
-    for video in await kb_db.list_pending_playlist_videos(playlist_id, config.kb.playlist_max_videos_per_run):
+    batch_limit = limit if limit is not None else config.kb.playlist_max_videos_per_run
+    for video in await kb_db.list_pending_playlist_videos(playlist_id, batch_limit):
         result = await ingest_youtube_video(
             video["video_id"], kb_db, snapshot_store,
             trust_tier_code=video.get("default_trust_tier_code"), source_purpose="playlist_discovered",
@@ -72,4 +74,5 @@ async def poll_playlist(
                     kb_db, result.source_id, result.version_id, priority=10,
                 )
             queued += 1
-    return {"discovered": discovered, "queued": queued}
+    pending_after = len(await kb_db.list_pending_playlist_videos(playlist_id, 1))
+    return {"discovered": discovered, "queued": queued, "pending_after": pending_after}

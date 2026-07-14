@@ -66,11 +66,15 @@ async def enqueue_manual_job(
     return job
 
 
-async def enqueue_playlist_poll(kb_db: KBDatabase, playlist_id: str) -> tuple[dict, bool]:
+async def enqueue_playlist_poll(
+    kb_db: KBDatabase, playlist_id: str, *, fresh: bool = False, payload: dict | None = None,
+) -> tuple[dict, bool]:
     """Queue low-priority discovery work; the worker's GPU-idle gate applies."""
+    suffix = f":{uuid.uuid4()}" if fresh else ""
     return await kb_db.enqueue_processing_job(
         "playlist_poll", "playlist", subject_id=playlist_id,
-        idempotency_key=f"playlist_poll:{playlist_id}", priority=-100, is_speculative=True,
+        idempotency_key=f"playlist_poll:{playlist_id}{suffix}", priority=-100, is_speculative=True,
+        payload=payload or {},
     )
 
 
@@ -385,8 +389,15 @@ class ProcessingJobWorker:
         from deep_research.kb.playlists import poll_playlist
 
         await self.kb_db.update_processing_job_progress(job["id"], "discover", lease_seconds=900)
-        result = await poll_playlist(self.kb_db, self.config, self.snapshot_store, job["subject_id"])
+        result = await poll_playlist(
+            self.kb_db, self.config, self.snapshot_store, job["subject_id"],
+            limit=(job.get("payload") or {}).get("limit"),
+        )
         await self.kb_db.finish_processing_job(job["id"], "completed", stage="complete", progress=result)
+        # Keep working through a tracked playlist only after higher-priority
+        # user source work has drained. Each continuation remains capped.
+        if result.get("pending_after", 0):
+            await enqueue_playlist_poll(self.kb_db, job["subject_id"], fresh=True)
 
     async def _run_counter_evidence(self, job: dict) -> None:
         from deep_research.kb.counter_evidence import find_strongest_counter_claim

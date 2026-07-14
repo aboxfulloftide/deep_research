@@ -644,6 +644,16 @@ async def check_playlist(playlist_id: str):
     return {"job": _serialize(job)}
 
 
+@router.post("/playlists/{playlist_id}/ingest")
+async def ingest_playlist_batch(playlist_id: str, limit: int | None = None):
+    playlist = next((p for p in await kb_db.list_tracked_playlists() if p["id"] == playlist_id), None)
+    if playlist is None:
+        raise HTTPException(404, "Tracked playlist not found")
+    batch_limit = min(max(limit or config.kb.playlist_max_videos_per_run, 1), 20)
+    job = await enqueue_manual_job(kb_db, "playlist_poll", "playlist", playlist_id, payload={"limit": batch_limit})
+    return {"job": _serialize(job)}
+
+
 @router.delete("/playlists/{playlist_id}")
 async def delete_playlist(playlist_id: str):
     playlist = await kb_db.delete_tracked_playlist(playlist_id)

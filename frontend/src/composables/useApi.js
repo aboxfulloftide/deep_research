@@ -317,6 +317,12 @@ export function useApi() {
     return resp.json()
   }
 
+  async function ingestPlaylistBatch(id, limit = null) {
+    const suffix = limit ? `?limit=${encodeURIComponent(limit)}` : ''
+    const resp = await fetch(`${API_BASE}/kb/playlists/${id}/ingest${suffix}`, { method: 'POST' })
+    return resp.json()
+  }
+
   async function ingestConversation(text, title = null, trustTier = null, topicName = null) {
     const resp = await fetch(`${API_BASE}/kb/sources/ingest-conversation`, {
       method: 'POST',
@@ -542,7 +548,7 @@ export function useApi() {
     backfillTopic, triggerTopicVerification, fetchTopicProcessingStatus, fetchReport, generateReport,
     fetchResolutionCandidates, reviewResolutionCandidate,
     fetchSources, fetchSource, fetchSourceClaims, fetchSourceDecisions, fetchSourceProcessingStatus, resetSourceTrustTier, archiveSource, restoreSource,
-    ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos, deletePlaylist, checkPlaylist,
+    ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos, deletePlaylist, checkPlaylist, ingestPlaylistBatch,
     ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, retryProcessingJob,
     chunkSource, extractSource, verifySource, backfillEmbeddings, triggerAdSweep,
     fetchClaims, fetchClaim, fetchClaimDecisions, findCounterEvidence, verifyClaim, setPreferredSource, setClaimVerificationOverride,
