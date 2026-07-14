@@ -398,6 +398,15 @@ export function useApi() {
     return resp.json()
   }
 
+  async function moveProcessingJob(jobId, direction) {
+    const resp = await fetch(`${API_BASE}/kb/processing-jobs/${jobId}/move`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ direction }),
+    })
+    return resp.json()
+  }
+
   async function fetchModelExperimentProfiles() {
     const resp = await fetch(`${API_BASE}/kb/model-experiments/profiles`)
     return resp.json()
@@ -567,7 +576,7 @@ export function useApi() {
     fetchResolutionCandidates, reviewResolutionCandidate,
     fetchSources, fetchSource, fetchSourceClaims, fetchSourceDecisions, fetchSourceProcessingStatus, resetSourceTrustTier, archiveSource, restoreSource,
     ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos, deletePlaylist, checkPlaylist, ingestPlaylistBatch,
-    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, fetchProcessingJobs, fetchModelExperimentProfiles, queueModelExperiment, retryProcessingJob,
+    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, fetchProcessingJobs, moveProcessingJob, fetchModelExperimentProfiles, queueModelExperiment, retryProcessingJob,
     chunkSource, extractSource, verifySource, backfillEmbeddings, triggerAdSweep,
     fetchClaims, fetchClaim, fetchClaimDecisions, findCounterEvidence, verifyClaim, setPreferredSource, setClaimVerificationOverride,
     setClaimVerificationContext, searchChunks,

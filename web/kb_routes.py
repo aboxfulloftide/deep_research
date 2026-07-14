@@ -121,6 +121,10 @@ class ModelExperimentRequest(BaseModel):
     reasoning: bool = True
 
 
+class MoveJobRequest(BaseModel):
+    direction: str
+
+
 class IngestYoutubeRequest(BaseModel):
     url: str
     trust_tier: str | None = None
@@ -788,6 +792,20 @@ async def cancel_processing_job(job_id: str):
     job = await kb_db.request_processing_job_cancel(job_id)
     if job is None:
         raise HTTPException(404, "Processing job is not active")
+    return {"job": _serialize(job)}
+
+
+@router.post("/processing-jobs/{job_id}/move")
+async def move_processing_job(job_id: str, req: MoveJobRequest):
+    job = await kb_db.get_processing_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Processing job not found")
+    if job["job_type"] == "model_experiment":
+        raise HTTPException(400, "Model experiments always wait behind normal research work")
+    try:
+        job = await kb_db.move_processing_job_in_queue(job_id, req.direction)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"job": _serialize(job)}
 
 

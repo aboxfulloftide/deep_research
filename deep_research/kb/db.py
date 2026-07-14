@@ -2735,6 +2735,29 @@ class KBDatabase:
             raise ValueError(f"Processing job {job_id!r} is not retryable")
         return dict(row)
 
+    async def move_processing_job_in_queue(self, job_id: str, direction: str) -> dict:
+        """Move a queued job ahead of or behind all other queued work.
+
+        Priority is already the worker's durable ordering contract, so this is
+        atomic and remains correct across web-server restarts.
+        """
+        if direction not in ("next", "back"):
+            raise ValueError("direction must be 'next' or 'back'")
+        now = _now()
+        aggregate = "MAX" if direction == "next" else "MIN"
+        adjustment = 1 if direction == "next" else -1
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"WITH bounds AS (SELECT COALESCE({aggregate}(priority), 0) AS priority FROM processing_jobs WHERE status = 'queued'), "
+                "target AS (SELECT id FROM processing_jobs WHERE id = $1 AND status = 'queued' FOR UPDATE) "
+                "UPDATE processing_jobs SET priority = (SELECT priority FROM bounds) + $2, updated_at = $3 "
+                "WHERE id IN (SELECT id FROM target) RETURNING *",
+                job_id, adjustment, now,
+            )
+        if row is None:
+            raise ValueError(f"Processing job {job_id!r} is not queued")
+        return dict(row)
+
     async def requeue_expired_processing_jobs(self) -> list[dict]:
         """Make abandoned leases visible as queued recovery work on worker startup."""
         now = _now()

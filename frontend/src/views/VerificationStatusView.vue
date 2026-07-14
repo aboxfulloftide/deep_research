@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
-import { ShieldCheck, PlayCircle, Activity } from 'lucide-vue-next'
+import { ShieldCheck, PlayCircle, Activity, ArrowUp, ArrowDown } from 'lucide-vue-next'
 import { useApi } from '../composables/useApi.js'
 
 const api = useApi()
@@ -11,6 +11,8 @@ const loading = ref(true)
 const triggering = ref(false)
 const triggerError = ref(null)
 const jobs = ref([])
+const movingJobId = ref(null)
+const queueMoveError = ref(null)
 
 let pollHandle = null
 
@@ -45,6 +47,20 @@ async function triggerNow() {
     triggerError.value = e.message
   } finally {
     triggering.value = false
+  }
+}
+
+async function moveJob(job, direction) {
+  if (movingJobId.value || job.job_type === 'model_experiment') return
+  movingJobId.value = job.id
+  queueMoveError.value = null
+  try {
+    await api.moveProcessingJob(job.id, direction)
+    await load()
+  } catch (e) {
+    queueMoveError.value = e.message
+  } finally {
+    movingJobId.value = null
   }
 }
 
@@ -157,9 +173,10 @@ function jobElapsed(job) {
     <template v-else>
       <section class="mb-8">
         <h3 class="text-sm font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-1.5"><Activity class="w-4 h-4" /> All Deep Research Activity</h3>
+        <p v-if="queueMoveError" class="mb-2 text-xs text-red-600 dark:text-red-400">{{ queueMoveError }}</p>
         <div v-if="activeJobs.length" class="space-y-2">
           <div v-for="job in activeJobs" :key="job.id" class="p-3 bg-white dark:bg-gray-800 border border-blue-200 dark:border-blue-800 rounded-lg text-sm">
-            <div class="flex justify-between gap-3"><span class="font-medium text-gray-900 dark:text-white">{{ jobLabel(job) }}</span><span class="px-1.5 py-0.5 text-[10px] rounded uppercase font-medium" :class="statusColors.running">{{ job.status }} · {{ job.stage }}</span></div>
+            <div class="flex justify-between gap-3"><span class="font-medium text-gray-900 dark:text-white">{{ jobLabel(job) }}</span><div class="flex items-center gap-1"><button v-if="job.status === 'queued' && job.job_type !== 'model_experiment'" @click="moveJob(job, 'next')" :disabled="movingJobId === job.id" title="Run this job next" class="rounded p-1 text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/30 disabled:opacity-50"><ArrowUp class="w-3.5 h-3.5" /></button><button v-if="job.status === 'queued' && job.job_type !== 'model_experiment'" @click="moveJob(job, 'back')" :disabled="movingJobId === job.id" title="Move this job behind other queued work" class="rounded p-1 text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700 disabled:opacity-50"><ArrowDown class="w-3.5 h-3.5" /></button><span class="px-1.5 py-0.5 text-[10px] rounded uppercase font-medium" :class="statusColors.running">{{ job.status }} · {{ job.stage }}</span></div></div>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ job.source_id ? `source ${job.source_id.slice(0, 8)}` : job.topic_id ? `topic ${job.topic_id.slice(0, 8)}` : job.subject_type }}</p>
             <div class="mt-2">
               <div class="flex justify-between gap-2 text-[11px] text-gray-500 dark:text-gray-400"><span>{{ stageLabel(job) }} <span v-if="job.status === 'running'">· {{ jobElapsed(job) }} elapsed</span></span><span v-if="job.status === 'queued'">{{ queuePosition(job) }}</span><span v-else>~{{ jobProgressPercent(job) }}% stage estimate</span></div>

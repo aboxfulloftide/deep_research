@@ -103,6 +103,23 @@ async def test_model_experiments_are_low_priority_speculative_jobs(kb_db):
     assert claimed["id"] == normal["id"]
 
 
+async def test_queued_jobs_can_be_moved_to_front_or_back(kb_db):
+    first, _ = await kb_db.enqueue_processing_job(
+        "source_pipeline", "source", subject_id="source-1", idempotency_key="move-first", priority=10,
+    )
+    second, _ = await kb_db.enqueue_processing_job(
+        "source_pipeline", "source", subject_id="source-2", idempotency_key="move-second", priority=10,
+    )
+
+    promoted = await kb_db.move_processing_job_in_queue(second["id"], "next")
+    assert promoted["priority"] > first["priority"]
+    assert (await kb_db.claim_next_processing_job("worker"))["id"] == second["id"]
+
+    await kb_db.release_processing_job(second["id"])
+    demoted = await kb_db.move_processing_job_in_queue(second["id"], "back")
+    assert demoted["priority"] < first["priority"]
+
+
 async def test_source_list_exposes_durable_lifecycle_status(kb_db):
     source, _ = await kb_db.get_or_create_source(
         source_type_code="web", canonical_uri="https://example.com/lifecycle", canonical_key="lifecycle",
