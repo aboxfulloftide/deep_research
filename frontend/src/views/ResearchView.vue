@@ -77,7 +77,12 @@ watch(messages, () => {
 
 function renderMarkdown(text) {
   if (!text) return ''
-  return marked.parse(text, { breaks: true })
+  const document = new DOMParser().parseFromString(marked.parse(text, { breaks: true }), 'text/html')
+  for (const link of document.querySelectorAll('a')) {
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer'
+  }
+  return document.body.innerHTML
 }
 
 function selectModel(m) {

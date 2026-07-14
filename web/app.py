@@ -252,9 +252,41 @@ async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg,
         try:
             results = await web_search(query[:200], cfg)
             if results:
-                gathered_data = "\n".join(
+                search_results = "\n".join(
                     f"- {r.title}: {r.url}\n  {r.snippet}" for r in results
                 )
+                gathered_data = search_results
+
+                # Models without reliable tool calling use this path. Search
+                # snippets are useful for finding sources but too abbreviated
+                # to answer questions about contested wording, qualifications,
+                # or chronology. Read the strongest HTML sources as well and
+                # give the model their actual text, while retaining the full
+                # result list for citations and fallback context.
+                candidates = [
+                    result for result in results
+                    if not result.url.lower().split("?", 1)[0].endswith(".pdf")
+                ][:4]
+
+                async def read_result(result):
+                    try:
+                        page = await scrape_page(result.url, cfg)
+                        return result, page
+                    except Exception:
+                        return result, None
+
+                fetched = await asyncio.gather(*(read_result(result) for result in candidates))
+                pages = []
+                for result, page in fetched:
+                    if page and page.text_content:
+                        pages.append(
+                            f"=== Source: {page.title or result.title} ({result.url}) ===\n"
+                            f"{page.text_content}"
+                        )
+                    if len(pages) == 2:
+                        break
+                if pages:
+                    gathered_data = f"{search_results}\n\n" + "\n\n".join(pages)
         except Exception:
             gathered_data = "(Search failed)"
 
@@ -279,6 +311,11 @@ async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg,
                 f"3. Start your response with the answer immediately.\n"
                 f"4. Do NOT include any thinking, reasoning, or analysis process.\n"
                 f"5. Keep your response under 200 words."
+                f"6. For disputed quotes or claims, distinguish the exact words used, "
+                f"their surrounding qualification, and the scope of the claim; do not "
+                f"collapse them into a misleading yes/no answer.\n"
+                f"7. Cite the most relevant web sources as Markdown links using the URLs "
+                f"provided in DATA."
             ),
         },
     ]
