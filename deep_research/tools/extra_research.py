@@ -33,6 +33,12 @@ def _is_html_result(result: SearchResult) -> bool:
     return not result.url.lower().split("?", 1)[0].endswith(".pdf")
 
 
+def _title_key(title: str) -> str:
+    """Identify syndicated copies that have different URLs but the same story."""
+    article_title = re.split(r"\s+[|–—-]\s+", title, maxsplit=1)[0]
+    return "title:" + re.sub(r"\W+", " ", article_title.lower()).strip()
+
+
 async def collect_sources(
     queries: list[str], config: Config, level: int, seen_urls: set[str],
 ) -> list[ResearchSource]:
@@ -44,6 +50,7 @@ async def collect_sources(
     """
     selections: list[tuple[str, SearchResult]] = []
     pending_urls: set[str] = set()
+    pending_titles: set[str] = set()
     per_query_limit = 2 if len(queries) == 1 else SOURCES_PER_QUERY
     for query in queries:
         try:
@@ -52,10 +59,18 @@ async def collect_sources(
             continue
         added = 0
         for result in results:
-            if result.url in seen_urls or result.url in pending_urls or not _is_html_result(result):
+            title_key = _title_key(result.title)
+            if (
+                result.url in seen_urls
+                or title_key in seen_urls
+                or result.url in pending_urls
+                or title_key in pending_titles
+                or not _is_html_result(result)
+            ):
                 continue
             selections.append((query, result))
             pending_urls.add(result.url)
+            pending_titles.add(title_key)
             added += 1
             if added >= per_query_limit:
                 break
@@ -77,7 +92,9 @@ async def collect_sources(
         )
 
     sources = await asyncio.gather(*(read(query, result) for query, result in selections))
-    seen_urls.update(source.url for source in sources)
+    for source in sources:
+        seen_urls.add(source.url)
+        seen_urls.add(_title_key(source.title))
     return sources
 
 

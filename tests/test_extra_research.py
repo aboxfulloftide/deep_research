@@ -36,6 +36,29 @@ async def test_collect_sources_reads_unique_sources_and_keeps_context_bounded(mo
 
 
 @pytest.mark.asyncio
+async def test_collect_sources_skips_syndicated_title_copies(monkeypatch):
+    async def fake_search(query, config):
+        return [
+            SearchResult(title="One article", url="https://first.test/article", snippet="first"),
+            SearchResult(title="One article", url="https://copy.test/article", snippet="copy"),
+            SearchResult(title="Independent article", url="https://second.test/article", snippet="second"),
+        ]
+
+    async def fake_scrape(url, config):
+        return ScrapedPage(url=url, title="", text_content="source text")
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+
+    sources = await extra.collect_sources(["question"], Config(), 1, set())
+
+    assert [source.url for source in sources] == [
+        "https://first.test/article",
+        "https://second.test/article",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_extra_research_runs_three_levels_and_returns_synthesis(monkeypatch):
     calls = []
 
