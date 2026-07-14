@@ -14,6 +14,12 @@ TAVILY_API_URL = "https://api.tavily.com/search"
 SERPER_API_URL = "https://google.serper.dev/search"
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/rest.php/v1/search/page"
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+_QUERY_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_QUERY_STOP_WORDS = {
+    "a", "an", "and", "are", "at", "be", "did", "do", "does", "for",
+    "from", "how", "in", "is", "it", "of", "on", "or", "say", "the",
+    "to", "was", "were", "what", "when", "where", "who", "why", "with",
+}
 # Below this many combined duckduckgo+brave results, spend a metered Tavily
 # query to fill the gap -- keeps Tavily's smaller monthly budget for when
 # duckduckgo+brave actually come up short, instead of spending it every query.
@@ -180,7 +186,43 @@ def _merge(results: list[SearchResult], new: list[SearchResult]) -> list[SearchR
         if r.url not in seen_urls:
             results.append(r)
             seen_urls.add(r.url)
-    return results[:10]
+    return results
+
+
+def _query_terms(query: str) -> set[str]:
+    """Meaningful query terms used to prevent one bad provider from filling
+    the entire context window with unrelated results."""
+    return {
+        token for token in _QUERY_TOKEN_RE.findall(query.lower())
+        if len(token) > 2 and token not in _QUERY_STOP_WORDS
+    }
+
+
+def _relevance_score(result: SearchResult, terms: set[str]) -> int:
+    """A small, transparent lexical guardrail before an LLM sees results.
+
+    Search APIs occasionally return a stale/cross-query response. Ranking by
+    the question's distinctive words is enough to keep those pages from
+    crowding out results returned by the other providers. This deliberately
+    does not attempt to decide truth or source quality.
+    """
+    if not terms:
+        return 0
+    title_terms = set(_QUERY_TOKEN_RE.findall(result.title.lower()))
+    content_terms = set(_QUERY_TOKEN_RE.findall(result.snippet.lower()))
+    return 2 * len(terms & title_terms) + len(terms & content_terms)
+
+
+def _is_relevant(result: SearchResult, terms: set[str]) -> bool:
+    # A multi-word question needs at least two signals. One-term questions
+    # (names, identifiers, product codes) should still be allowed through.
+    minimum = 1 if len(terms) <= 1 else 2
+    return _relevance_score(result, terms) >= minimum
+
+
+def _rank_results(results: list[SearchResult], query: str, limit: int = 10) -> list[SearchResult]:
+    terms = _query_terms(query)
+    return sorted(results, key=lambda result: _relevance_score(result, terms), reverse=True)[:limit]
 
 
 async def web_search(query: str, config: Config) -> list[SearchResult]:
@@ -210,7 +252,9 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
             config, "searxng", "scrape", "error",
             error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
         )
-        raise
+        # SearXNG is one provider, not a single point of failure. Continue to
+        # the direct providers below when it is unavailable.
+        data = {"results": []}
 
     await _log_searxng_engines(config, data, t.elapsed_ms, query)
 
@@ -221,6 +265,8 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
             url=item.get("url", ""),
             snippet=item.get("content", ""),
         ))
+
+    terms = _query_terms(query)
 
     t = timer()
     try:
@@ -256,7 +302,7 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
             )
         results = _merge(results, brave_results)
 
-    if len(results) < MIN_RESULTS_BEFORE_TAVILY_FALLBACK and config.tavily.api_key:
+    if sum(_is_relevant(result, terms) for result in results) < MIN_RESULTS_BEFORE_TAVILY_FALLBACK and config.tavily.api_key:
         t = timer()
         try:
             tavily_results = await _tavily_api_search(query, config.tavily.api_key)
@@ -274,7 +320,7 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
             )
         results = _merge(results, tavily_results)
 
-    if len(results) < MIN_RESULTS_BEFORE_SERPER_FALLBACK and config.serper.api_key:
+    if sum(_is_relevant(result, terms) for result in results) < MIN_RESULTS_BEFORE_SERPER_FALLBACK and config.serper.api_key:
         t = timer()
         try:
             serper_results = await _serper_api_search(query, config.serper.api_key)
@@ -290,7 +336,7 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
             )
         results = _merge(results, serper_results)
 
-    return results
+    return _rank_results(results, query)
 
 
 async def check_providers_now(config: Config) -> dict:
