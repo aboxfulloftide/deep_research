@@ -35,3 +35,11 @@ engines:
     disabled: false
   - name: bing
     disabled: false
+  # wikidata failed on 46/46 logged calls (timeouts + "too many requests",
+  # each timeout stalling the whole SearXNG response); wikipedia failed 8/8.
+  # Both are replaced by direct calls to their own public APIs in
+  # deep_research/tools/search.py (wikipedia_api / wikidata_api).
+  - name: wikidata
+    disabled: true
+  - name: wikipedia
+    disabled: true

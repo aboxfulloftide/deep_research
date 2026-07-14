@@ -13,6 +13,7 @@ BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search"
 TAVILY_API_URL = "https://api.tavily.com/search"
 SERPER_API_URL = "https://google.serper.dev/search"
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/rest.php/v1/search/page"
+WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _QUERY_TOKEN_RE = re.compile(r"[a-z0-9]+")
 _QUERY_STOP_WORDS = {
@@ -154,6 +155,45 @@ async def _wikipedia_api_search(query: str, contact: str = "") -> list[SearchRes
     return results
 
 
+async def _wikidata_api_search(query: str, contact: str = "") -> list[SearchResult]:
+    """Direct call to Wikidata's own entity-search API (wbsearchentities) --
+    replaces SearXNG's "wikidata" engine, which failed on 46 of 46 logged
+    calls (timeouts + "too many requests", each timeout stalling the whole
+    SearXNG response) and is now disabled in searxng/settings.yml. Same
+    no-key Wikimedia infrastructure and User-Agent policy as
+    _wikipedia_api_search; logged as "wikidata_api".
+
+    wbsearchentities matches entity labels/aliases (returning a proper
+    display label + description, unlike Wikidata's REST full-text search,
+    whose result titles are opaque Q-ids) -- so entity-name queries get
+    clean hits and sentence-shaped queries usually get zero results. That's
+    expected and fine: Wikidata is an entity database, and this is a free
+    add-on alongside the engines that do full-text search."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            WIKIDATA_API_URL,
+            params={
+                "action": "wbsearchentities", "search": query,
+                "language": "en", "format": "json", "limit": 10,
+            },
+            headers={"User-Agent": _wikipedia_user_agent(contact)},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = []
+    for item in data.get("search", [])[:10]:
+        entity_id = item.get("id", "")
+        if not entity_id:
+            continue
+        results.append(SearchResult(
+            title=item.get("label", entity_id),
+            url=f"https://www.wikidata.org/wiki/{urllib.parse.quote(entity_id)}",
+            snippet=item.get("description") or "",
+        ))
+    return results
+
+
 async def _log_searxng_engines(config: Config, data: dict, elapsed_ms: int, query: str) -> None:
     """SearXNG fans one call out to several underlying engines (duckduckgo,
     bing, mojeek, wikipedia, ...) and merges their results -- log each engine
@@ -283,6 +323,21 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
         )
     results = _merge(results, wiki_results)
 
+    t = timer()
+    try:
+        wikidata_results = await _wikidata_api_search(query, config.wikipedia.contact)
+        await log_search_call(
+            config, "wikidata_api", "api", "ok" if wikidata_results else "empty",
+            result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=query,
+        )
+    except httpx.HTTPError as e:
+        wikidata_results = []
+        await log_search_call(
+            config, "wikidata_api", "api", "error",
+            error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+        )
+    results = _merge(results, wikidata_results)
+
     if config.brave.api_key:
         t = timer()
         try:
@@ -379,6 +434,15 @@ async def check_providers_now(config: Config) -> dict:
     except httpx.HTTPError as e:
         await log_search_call(config, "wikipedia_api", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
         out["wikipedia_api"] = {"responding": False, "result_count": 0, "error": str(e)}
+
+    t = timer()
+    try:
+        wikidata_results = await _wikidata_api_search(probe, config.wikipedia.contact)
+        await log_search_call(config, "wikidata_api", "api", "ok" if wikidata_results else "empty", result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=probe)
+        out["wikidata_api"] = {"responding": len(wikidata_results) > 0, "result_count": len(wikidata_results), "error": None}
+    except httpx.HTTPError as e:
+        await log_search_call(config, "wikidata_api", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
+        out["wikidata_api"] = {"responding": False, "result_count": 0, "error": str(e)}
 
     if config.brave.api_key:
         t = timer()
