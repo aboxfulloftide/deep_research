@@ -296,7 +296,8 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg):
                 "/no_think\nYou are a careful deep-research analyst. Synthesize the source material into a "
                 "direct, useful answer. Separate well-supported conclusions from tradeoffs, "
                 "uncertainty, and disagreement. Do not invent facts. Cite each important factual "
-                "claim with a Markdown link using the source URLs provided. Use concise headings "
+                "claim with a Markdown link in the exact form [source title](URL), using the "
+                "source URLs provided. Never cite a source title without its URL. Use concise headings "
                 "and a recommendation when the question asks for one."
             ),
         },
@@ -311,6 +312,8 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg):
     ]
     response = await llm.chat(messages)
     answer = response["choices"][0]["message"].get("content", "No answer produced.")
+    source_links = "\n".join(f"- [{source.title}]({source.url})" for source in sources)
+    answer = f"{answer.rstrip()}\n\n### Sources consulted\n{source_links}"
     yield {"event": "answer", "data": answer}
 
 

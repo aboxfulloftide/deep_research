@@ -75,7 +75,16 @@ async def test_extra_research_runs_three_levels_and_returns_synthesis(monkeypatc
 
     assert [level for level, _ in calls] == [1, 2, 3]
     assert len([event for event in events if event["event"] == "status"]) == 6
-    assert events[-1] == {"event": "answer", "data": "primary source comparison\nindependent benchmark analysis"}
+    assert events[-1] == {
+        "event": "answer",
+        "data": (
+            "primary source comparison\nindependent benchmark analysis\n\n"
+            "### Sources consulted\n"
+            "- [Source](https://example.test/1)\n"
+            "- [Source](https://example.test/2)\n"
+            "- [Source](https://example.test/3)"
+        ),
+    }
 
 
 @pytest.mark.asyncio
