@@ -635,6 +635,15 @@ async def list_playlist_videos(playlist_id: str):
     return {"videos": _serialize(await kb_db.list_playlist_videos(playlist_id))}
 
 
+@router.post("/playlists/{playlist_id}/check")
+async def check_playlist(playlist_id: str):
+    playlist = next((p for p in await kb_db.list_tracked_playlists() if p["id"] == playlist_id), None)
+    if playlist is None:
+        raise HTTPException(404, "Tracked playlist not found")
+    job = await enqueue_manual_job(kb_db, "playlist_poll", "playlist", playlist_id)
+    return {"job": _serialize(job)}
+
+
 @router.delete("/playlists/{playlist_id}")
 async def delete_playlist(playlist_id: str):
     playlist = await kb_db.delete_tracked_playlist(playlist_id)
