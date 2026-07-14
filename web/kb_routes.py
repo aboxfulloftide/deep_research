@@ -772,6 +772,14 @@ async def cancel_processing_job(job_id: str):
     return {"job": _serialize(job)}
 
 
+@router.get("/processing-jobs/{job_id}")
+async def get_processing_job(job_id: str):
+    job = await kb_db.get_processing_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Processing job not found")
+    return {"job": _serialize(job)}
+
+
 @router.post("/processing-jobs/{job_id}/retry")
 async def retry_processing_job(job_id: str):
     try:

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from urllib.parse import parse_qs, urlparse
 
 from deep_research.config import Config
@@ -28,7 +29,7 @@ async def track_youtube_playlist(kb_db: KBDatabase, url: str, trust_tier_code: s
 async def enumerate_youtube_playlist(url: str) -> list[dict]:
     """Use yt-dlp's flat mode: no API key/quota and no video downloads."""
     process = await asyncio.create_subprocess_exec(
-        "yt-dlp", "--flat-playlist", "--dump-single-json", "--no-warnings", url,
+        sys.executable, "-m", "yt_dlp", "--flat-playlist", "--dump-single-json", "--no-warnings", url,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await process.communicate()

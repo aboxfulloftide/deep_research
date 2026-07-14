@@ -62,7 +62,12 @@ async function removePlaylist(playlist) {
 }
 
 async function checkPlaylist(playlist) {
-  await api.checkPlaylist(playlist.id)
+  const { job } = await api.checkPlaylist(playlist.id)
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    const status = (await api.fetchProcessingJob(job.id)).job
+    if (['completed', 'partial', 'failed', 'cancelled'].includes(status.status)) break
+  }
   await showPlaylistVideos(playlist)
 }
 
