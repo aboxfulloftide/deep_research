@@ -801,7 +801,13 @@ async def move_processing_job(job_id: str, req: MoveJobRequest):
     if job is None:
         raise HTTPException(404, "Processing job not found")
     if job["job_type"] == "model_experiment":
-        raise HTTPException(400, "Model experiments always wait behind normal research work")
+        if req.direction != "next":
+            raise HTTPException(400, "Model experiments can only be moved to run after the current process")
+        try:
+            job = await kb_db.prioritize_model_experiment(job_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return {"job": _serialize(job)}
     try:
         job = await kb_db.move_processing_job_in_queue(job_id, req.direction)
     except ValueError as exc:

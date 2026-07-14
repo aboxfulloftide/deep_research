@@ -120,6 +120,18 @@ async def test_queued_jobs_can_be_moved_to_front_or_back(kb_db):
     assert demoted["priority"] < first["priority"]
 
 
+async def test_model_experiment_can_explicitly_run_after_current_work(kb_db):
+    experiment = await enqueue_model_experiment(kb_db, {"prompt": "Compare models"})
+    normal, _ = await kb_db.enqueue_processing_job(
+        "source_pipeline", "source", subject_id="source-1", idempotency_key="normal-queued", priority=100,
+    )
+
+    promoted = await kb_db.prioritize_model_experiment(experiment["id"])
+
+    assert promoted["payload"]["run_after_current"] is True
+    assert promoted["priority"] > normal["priority"]
+
+
 async def test_source_list_exposes_durable_lifecycle_status(kb_db):
     source, _ = await kb_db.get_or_create_source(
         source_type_code="web", canonical_uri="https://example.com/lifecycle", canonical_key="lifecycle",

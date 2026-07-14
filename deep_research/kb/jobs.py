@@ -141,7 +141,8 @@ class ProcessingJobWorker:
                     normal_work = []
                     for status in ("queued", "running"):
                         normal_work.extend(await self.kb_db.list_processing_jobs(status=status, limit=1000))
-                    if any(other["id"] != job["id"] and other["job_type"] != "model_experiment" for other in normal_work):
+                    run_after_current = bool((job.get("payload") or {}).get("run_after_current"))
+                    if not run_after_current and any(other["id"] != job["id"] and other["job_type"] != "model_experiment" for other in normal_work):
                         await self.kb_db.release_processing_job(job["id"])
                         return False
                 if job["is_speculative"] and not await gpu_is_idle():

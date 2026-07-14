@@ -2758,6 +2758,26 @@ class KBDatabase:
             raise ValueError(f"Processing job {job_id!r} is not queued")
         return dict(row)
 
+    async def prioritize_model_experiment(self, job_id: str) -> dict:
+        """Explicitly place a safe experiment after the currently active job.
+
+        This opt-in bypasses the usual "normal work first" policy, but the
+        worker still waits for an idle GPU and never swaps the primary server.
+        """
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "WITH bounds AS (SELECT COALESCE(MAX(priority), 0) AS priority FROM processing_jobs WHERE status = 'queued'), "
+                "target AS (SELECT id FROM processing_jobs WHERE id = $1 AND status = 'queued' AND job_type = 'model_experiment' FOR UPDATE) "
+                "UPDATE processing_jobs SET priority = (SELECT priority FROM bounds) + 1, "
+                "payload = COALESCE(payload, '{}'::jsonb) || '{\"run_after_current\": true}'::jsonb, updated_at = $2 "
+                "WHERE id IN (SELECT id FROM target) RETURNING *",
+                job_id, now,
+            )
+        if row is None:
+            raise ValueError(f"Model experiment {job_id!r} is not queued")
+        return dict(row)
+
     async def requeue_expired_processing_jobs(self) -> list[dict]:
         """Make abandoned leases visible as queued recovery work on worker startup."""
         now = _now()
