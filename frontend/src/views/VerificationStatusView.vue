@@ -51,6 +51,9 @@ async function triggerNow() {
 const isRunning = computed(() => currentRun.value != null)
 const activeJobs = computed(() => jobs.value.filter(j => ['queued', 'running'].includes(j.status)))
 const recentJobs = computed(() => jobs.value.filter(j => !['queued', 'running'].includes(j.status)).slice(0, 10))
+const queuedJobs = computed(() => activeJobs.value
+  .filter(job => job.status === 'queued')
+  .sort((a, b) => b.priority - a.priority || new Date(a.created_at) - new Date(b.created_at)))
 
 const STATUS_FIELDS = [
   { key: 'supported_count', label: 'Supported', color: 'text-green-600 dark:text-green-400' },
@@ -88,6 +91,37 @@ function jobLabel(job) {
 
 function formatProgress(job) {
   return Object.entries(job.progress || {}).map(([key, value]) => `${key}: ${value}`).join(' · ')
+}
+
+const STAGE_PROGRESS = {
+  source_pipeline: { queued: 0, trust: 5, chunk: 20, extract: 45, ad_check: 65, attach: 72, verify: 85, report: 95, complete: 100 },
+  source_verify: { queued: 0, verify: 55, complete: 100 },
+  topic_verify: { queued: 0, verify: 55, report: 90, complete: 100 },
+  claim_verify: { queued: 0, verify: 55, complete: 100 },
+  verification_sweep: { queued: 0, verify: 55, complete: 100 },
+  playlist_poll: { queued: 0, discover: 45, complete: 100 },
+  ad_sweep: { queued: 0, ad_check: 55, complete: 100 },
+  contradiction_triage: { queued: 0, triage: 55, complete: 100 },
+  counter_evidence: { queued: 0, counter_evidence: 55, complete: 100 },
+  topic_discovery: { queued: 0, discover: 55, complete: 100 },
+  model_experiment: { waiting_for_idle: 0, gather_sources: 25, evaluate: 65, complete: 100 },
+}
+
+function jobProgressPercent(job) {
+  return STAGE_PROGRESS[job.job_type]?.[job.stage] ?? (job.status === 'queued' ? 0 : 50)
+}
+
+function stageLabel(job) {
+  return ({ trust: 'Assessing source', chunk: 'Preparing content', extract: 'Extracting claims', ad_check: 'Screening ads', attach: 'Connecting topic', verify: 'Checking evidence', report: 'Refreshing report', discover: 'Discovering videos', triage: 'Reviewing contradiction', counter_evidence: 'Finding counter-evidence', gather_sources: 'Gathering test sources', evaluate: 'Running model test', waiting_for_idle: 'Waiting for idle GPU', queued: 'Waiting in queue' })[job.stage] || job.stage
+}
+
+function queuePosition(job) {
+  const index = queuedJobs.value.findIndex(candidate => candidate.id === job.id)
+  return index >= 0 ? `${index + 1} of ${queuedJobs.value.length} queued` : ''
+}
+
+function jobElapsed(job) {
+  return duration({ started_at: job.started_at || job.created_at, completed_at: null })
 }
 </script>
 
@@ -127,6 +161,10 @@ function formatProgress(job) {
           <div v-for="job in activeJobs" :key="job.id" class="p-3 bg-white dark:bg-gray-800 border border-blue-200 dark:border-blue-800 rounded-lg text-sm">
             <div class="flex justify-between gap-3"><span class="font-medium text-gray-900 dark:text-white">{{ jobLabel(job) }}</span><span class="px-1.5 py-0.5 text-[10px] rounded uppercase font-medium" :class="statusColors.running">{{ job.status }} · {{ job.stage }}</span></div>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ job.source_id ? `source ${job.source_id.slice(0, 8)}` : job.topic_id ? `topic ${job.topic_id.slice(0, 8)}` : job.subject_type }}</p>
+            <div class="mt-2">
+              <div class="flex justify-between gap-2 text-[11px] text-gray-500 dark:text-gray-400"><span>{{ stageLabel(job) }} <span v-if="job.status === 'running'">· {{ jobElapsed(job) }} elapsed</span></span><span v-if="job.status === 'queued'">{{ queuePosition(job) }}</span><span v-else>~{{ jobProgressPercent(job) }}% stage estimate</span></div>
+              <div class="mt-1 h-1.5 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700"><div class="h-full bg-blue-600 transition-all" :style="{ width: `${jobProgressPercent(job)}%` }"></div></div>
+            </div>
             <p v-if="formatProgress(job)" class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ formatProgress(job) }}</p>
           </div>
         </div>
