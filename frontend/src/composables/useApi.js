@@ -394,6 +394,11 @@ export function useApi() {
     return resp.json()
   }
 
+  async function fetchProcessingJobs(limit = 50) {
+    const resp = await fetch(`${API_BASE}/kb/processing-jobs?limit=${limit}`)
+    return resp.json()
+  }
+
   async function retryProcessingJob(jobId) {
     const resp = await fetch(`${API_BASE}/kb/processing-jobs/${jobId}/retry`, { method: 'POST' })
     if (!resp.ok) throw new Error('Could not retry this job')
@@ -549,7 +554,7 @@ export function useApi() {
     fetchResolutionCandidates, reviewResolutionCandidate,
     fetchSources, fetchSource, fetchSourceClaims, fetchSourceDecisions, fetchSourceProcessingStatus, resetSourceTrustTier, archiveSource, restoreSource,
     ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos, deletePlaylist, checkPlaylist, ingestPlaylistBatch,
-    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, retryProcessingJob,
+    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, fetchProcessingJobs, retryProcessingJob,
     chunkSource, extractSource, verifySource, backfillEmbeddings, triggerAdSweep,
     fetchClaims, fetchClaim, fetchClaimDecisions, findCounterEvidence, verifyClaim, setPreferredSource, setClaimVerificationOverride,
     setClaimVerificationContext, searchChunks,

@@ -790,6 +790,15 @@ async def get_processing_job(job_id: str):
     return {"job": _serialize(job)}
 
 
+@router.get("/processing-jobs")
+async def list_processing_jobs(status: str | None = None, limit: int = 50):
+    if status is not None:
+        jobs = await kb_db.list_processing_jobs(status=status, limit=limit)
+    else:
+        jobs = await kb_db.list_processing_jobs(limit=limit)
+    return {"jobs": _serialize(jobs)}
+
+
 @router.post("/processing-jobs/{job_id}/retry")
 async def retry_processing_job(job_id: str):
     try:

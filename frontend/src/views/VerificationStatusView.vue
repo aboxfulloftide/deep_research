@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
-import { ShieldCheck, PlayCircle } from 'lucide-vue-next'
+import { ShieldCheck, PlayCircle, Activity } from 'lucide-vue-next'
 import { useApi } from '../composables/useApi.js'
 
 const api = useApi()
@@ -10,6 +10,7 @@ const runs = ref([])
 const loading = ref(true)
 const triggering = ref(false)
 const triggerError = ref(null)
+const jobs = ref([])
 
 let pollHandle = null
 
@@ -23,12 +24,14 @@ onUnmounted(() => {
 })
 
 async function load() {
-  const [currentData, runsData] = await Promise.all([
+  const [currentData, runsData, jobsData] = await Promise.all([
     api.fetchCurrentVerificationRun(),
     api.fetchVerificationRuns(),
+    api.fetchProcessingJobs(),
   ])
   currentRun.value = currentData.run
   runs.value = runsData.runs || []
+  jobs.value = jobsData.jobs || []
   loading.value = false
 }
 
@@ -46,6 +49,8 @@ async function triggerNow() {
 }
 
 const isRunning = computed(() => currentRun.value != null)
+const activeJobs = computed(() => jobs.value.filter(j => ['queued', 'running'].includes(j.status)))
+const recentJobs = computed(() => jobs.value.filter(j => !['queued', 'running'].includes(j.status)).slice(0, 10))
 
 const STATUS_FIELDS = [
   { key: 'supported_count', label: 'Supported', color: 'text-green-600 dark:text-green-400' },
@@ -75,6 +80,14 @@ const statusColors = {
   running: 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
   completed: 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300',
   failed: 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300',
+}
+
+function jobLabel(job) {
+  return ({ source_pipeline: 'Source ingest', source_verify: 'Source verification', topic_verify: 'Topic verification', claim_verify: 'Claim verification', verification_sweep: 'Verification sweep', playlist_poll: 'Playlist ingest', ad_sweep: 'Ad screening', contradiction_triage: 'Contradiction triage', counter_evidence: 'Counter-evidence', topic_discovery: 'Topic discovery' })[job.job_type] || job.job_type
+}
+
+function formatProgress(job) {
+  return Object.entries(job.progress || {}).map(([key, value]) => `${key}: ${value}`).join(' · ')
 }
 </script>
 
@@ -108,6 +121,22 @@ const statusColors = {
     <div v-if="loading" class="text-sm text-gray-500 dark:text-gray-400">Loading...</div>
 
     <template v-else>
+      <section class="mb-8">
+        <h3 class="text-sm font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-1.5"><Activity class="w-4 h-4" /> All Deep Research Activity</h3>
+        <div v-if="activeJobs.length" class="space-y-2">
+          <div v-for="job in activeJobs" :key="job.id" class="p-3 bg-white dark:bg-gray-800 border border-blue-200 dark:border-blue-800 rounded-lg text-sm">
+            <div class="flex justify-between gap-3"><span class="font-medium text-gray-900 dark:text-white">{{ jobLabel(job) }}</span><span class="px-1.5 py-0.5 text-[10px] rounded uppercase font-medium" :class="statusColors.running">{{ job.status }} · {{ job.stage }}</span></div>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ job.source_id ? `source ${job.source_id.slice(0, 8)}` : job.topic_id ? `topic ${job.topic_id.slice(0, 8)}` : job.subject_type }}</p>
+            <p v-if="formatProgress(job)" class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ formatProgress(job) }}</p>
+          </div>
+        </div>
+        <p v-else class="text-sm text-gray-500 dark:text-gray-400">No background work is currently running or queued.</p>
+        <details v-if="recentJobs.length" class="mt-3 text-xs">
+          <summary class="cursor-pointer text-gray-500 dark:text-gray-400">Recent completed or failed work</summary>
+          <div v-for="job in recentJobs" :key="job.id" class="mt-1 flex justify-between gap-2 text-gray-500 dark:text-gray-400"><span>{{ jobLabel(job) }} · {{ job.status }}</span><span v-if="job.error_message" class="text-red-600 dark:text-red-400 truncate" :title="job.error_message">{{ job.error_message }}</span></div>
+        </details>
+      </section>
+
       <!-- Current run -->
       <div v-if="currentRun" class="mb-8 p-4 bg-white dark:bg-gray-800 border border-blue-300 dark:border-blue-700 rounded-lg">
         <div class="flex items-center justify-between mb-2">
