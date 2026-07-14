@@ -78,6 +78,16 @@ async def enqueue_playlist_poll(
     )
 
 
+async def enqueue_model_experiment(kb_db: KBDatabase, payload: dict) -> dict:
+    """Queue a low-priority llama.cpp experiment behind normal KB work."""
+    job, _ = await kb_db.enqueue_processing_job(
+        "model_experiment", "model_experiment", subject_id=str(uuid.uuid4()),
+        idempotency_key=f"model_experiment:{uuid.uuid4()}", priority=-1000,
+        is_speculative=True, payload=payload, stage="waiting_for_idle",
+    )
+    return job
+
+
 class ProcessingJobWorker:
     """Single logical worker for durable KB work.
 
@@ -127,6 +137,13 @@ class ProcessingJobWorker:
                 job = await self.kb_db.claim_next_processing_job(self.worker_id)
                 if job is None:
                     return False
+                if job["job_type"] == "model_experiment":
+                    normal_work = []
+                    for status in ("queued", "running"):
+                        normal_work.extend(await self.kb_db.list_processing_jobs(status=status, limit=1000))
+                    if any(other["id"] != job["id"] and other["job_type"] != "model_experiment" for other in normal_work):
+                        await self.kb_db.release_processing_job(job["id"])
+                        return False
                 if job["is_speculative"] and not await gpu_is_idle():
                     await self.kb_db.release_processing_job(job["id"])
                     return False
@@ -179,6 +196,9 @@ class ProcessingJobWorker:
             return
         if job["job_type"] == "topic_discovery":
             await self._run_topic_discovery(job)
+            return
+        if job["job_type"] == "model_experiment":
+            await self._run_model_experiment(job)
             return
         else:
             await self.kb_db.finish_processing_job(
@@ -411,4 +431,10 @@ class ProcessingJobWorker:
         from deep_research.kb.topic_discovery import discover_topic_proposals
         await self.kb_db.update_processing_job_progress(job["id"], "discover", lease_seconds=900)
         result = await discover_topic_proposals(self.kb_db)
+        await self.kb_db.finish_processing_job(job["id"], "completed", stage="complete", progress=result)
+
+    async def _run_model_experiment(self, job: dict) -> None:
+        from deep_research.kb.model_experiments import run_model_experiment
+
+        result = await run_model_experiment(self.kb_db, self.config, job)
         await self.kb_db.finish_processing_job(job["id"], "completed", stage="complete", progress=result)

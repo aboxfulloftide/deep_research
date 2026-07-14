@@ -1,7 +1,11 @@
 llm:
-  base_url: "http://localhost:11434/v1"  # Ollama default; for llama.cpp use http://host:8080/v1
-  model: "llama3"
-  api_key: "ollama"  # Ollama ignores this but the API requires it
+  # Interactive research always uses the managed llama.cpp server.
+  base_url: "http://localhost:8080/v1"
+  model: ""
+  api_key: "not-needed"
+  backend: "llama_cpp"
+  llama_cpp_base_url: "http://localhost:8080/v1"
+  llama_cpp_api_key: "not-needed"
 
 searxng:
   url: "http://localhost:8888"

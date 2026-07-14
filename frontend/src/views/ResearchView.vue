@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, nextTick, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Send, Loader, Globe, FileSearch, Bot, ChevronDown, Database, Server, Layers } from 'lucide-vue-next'
+import { Send, Loader, Globe, FileSearch, Bot, ChevronDown, Database, Layers, FlaskConical } from 'lucide-vue-next'
 import { marked } from 'marked'
 import { useApi } from '../composables/useApi.js'
 
@@ -25,34 +25,34 @@ const prioritizeKb = ref(localStorage.getItem('prioritizeKb') === 'true')
 // Extra Research is intentionally per-question. It takes longer and uses a
 // bounded three-level search, so the next question returns to Standard mode.
 const researchMode = ref('standard')
-// Which local model server the agent talks to -- see
-// deep_research/model_backends.py. Persisted like prioritizeKb, since it's
-// also a standing preference, not a per-query choice.
-const backend = ref(localStorage.getItem('llmBackend') || 'ollama')
+const experimentProfiles = ref([])
+const experimentProfile = ref('current')
+const experimentContext = ref('')
+const experimentReasoning = ref(true)
+const experimentPrompt = ref('')
+const experimentJobs = ref([])
+const experimentMessage = ref(null)
+const queueingExperiment = ref(false)
 let abortController = null
 
 watch(prioritizeKb, (val) => {
   localStorage.setItem('prioritizeKb', val)
 })
 
-watch(backend, (val) => {
-  localStorage.setItem('llmBackend', val)
-})
-
-async function loadModelsForBackend() {
-  const data = await api.fetchModels(backend.value)
+async function loadModels() {
+  const [data, profileData, jobsData] = await Promise.all([
+    api.fetchModels(),
+    api.fetchModelExperimentProfiles(),
+    api.fetchProcessingJobs(),
+  ])
   models.value = data.models || []
   model.value = data.default || (models.value[0] ?? '')
-}
-
-function switchBackend(newBackend) {
-  if (newBackend === backend.value) return
-  backend.value = newBackend
-  loadModelsForBackend()
+  experimentProfiles.value = profileData.profiles || []
+  experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment').slice(0, 5)
 }
 
 onMounted(async () => {
-  await loadModelsForBackend()
+  await loadModels()
 
   // If resuming a session
   if (route.params.id) {
@@ -91,6 +91,29 @@ function renderMarkdown(text) {
 function selectModel(m) {
   model.value = m
   modelDropdownOpen.value = false
+}
+
+async function queueExperiment() {
+  const prompt = experimentPrompt.value.trim() || query.value.trim()
+  if (!prompt || queueingExperiment.value) return
+  queueingExperiment.value = true
+  experimentMessage.value = null
+  try {
+    const result = await api.queueModelExperiment({
+      prompt,
+      profile_slug: experimentProfile.value,
+      context_size: experimentContext.value ? Number(experimentContext.value) : null,
+      reasoning: experimentReasoning.value,
+    })
+    experimentMessage.value = `Queued experiment ${result.job.id.slice(0, 8)}. It will wait for ingestion and verification work to finish.`
+    experimentPrompt.value = ''
+    const jobsData = await api.fetchProcessingJobs()
+    experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment').slice(0, 5)
+  } catch (err) {
+    experimentMessage.value = err.message
+  } finally {
+    queueingExperiment.value = false
+  }
 }
 
 // llama.cpp reports the full gguf file path as the model "id" (e.g.
@@ -135,7 +158,7 @@ async function submitQuery() {
       status.value = null
       isResearching.value = false
     },
-  }, prioritizeKb.value, backend.value, researchMode.value)
+  }, prioritizeKb.value, researchMode.value)
 }
 
 function stopResearch() {
@@ -231,23 +254,6 @@ const statusText = computed(() => {
     <div class="border-t border-gray-200 dark:border-gray-700 pt-4">
       <!-- Model selector -->
       <div class="flex items-center gap-2 mb-3">
-        <div class="flex items-center rounded-md bg-gray-200 dark:bg-gray-700 text-xs overflow-hidden" title="Which local model server the agent talks to">
-          <button
-            v-for="b in ['ollama', 'llama_cpp']"
-            :key="b"
-            @click="switchBackend(b)"
-            :class="[
-              'flex items-center gap-1 px-2.5 py-1.5 transition-colors',
-              backend === b
-                ? 'bg-blue-600 text-white'
-                : 'hover:bg-gray-300 dark:hover:bg-gray-600'
-            ]"
-          >
-            <Server class="w-3.5 h-3.5" :stroke-width="1.5" />
-            {{ b === 'ollama' ? 'Ollama' : 'llama.cpp' }}
-          </button>
-        </div>
-
         <div class="relative">
           <button
             @click="modelDropdownOpen = !modelDropdownOpen"
@@ -302,6 +308,32 @@ const statusText = computed(() => {
           </button>
         </div>
       </div>
+
+      <details class="mb-3 text-xs rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 p-3">
+        <summary class="cursor-pointer font-medium text-gray-700 dark:text-gray-200 flex items-center gap-1.5">
+          <FlaskConical class="w-3.5 h-3.5" :stroke-width="1.5" />
+          Queue a llama.cpp model experiment
+        </summary>
+        <p class="mt-2 text-gray-500 dark:text-gray-400">Experiments wait for ingestion and verification to drain, require an idle GPU, and never replace the active llama.cpp server. Alternate profiles run temporarily on their evaluation port.</p>
+        <textarea v-model="experimentPrompt" rows="2" class="mt-2 w-full resize-none rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2 py-1.5" placeholder="Experiment question (or use the question in the main box above)..." />
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <select v-model="experimentProfile" class="rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2 py-1.5">
+            <option value="current">Current llama.cpp model</option>
+            <option v-for="profile in experimentProfiles" :key="profile.slug" :value="profile.slug">{{ profile.display_name }} · {{ profile.context_size || '?' }} ctx</option>
+          </select>
+          <input v-model="experimentContext" type="number" min="4096" max="131072" step="1024" class="w-28 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-2 py-1.5" placeholder="Context" title="Optional context window for an alternate profile" />
+          <label class="flex items-center gap-1 text-gray-600 dark:text-gray-300"><input v-model="experimentReasoning" type="checkbox" class="accent-violet-600" /> Enable reasoning</label>
+          <button @click="queueExperiment" :disabled="queueingExperiment || !(experimentPrompt.trim() || query.trim())" class="rounded bg-violet-600 px-2.5 py-1.5 text-white hover:bg-violet-700 disabled:bg-gray-400">{{ queueingExperiment ? 'Queueing...' : 'Queue experiment' }}</button>
+        </div>
+        <p v-if="experimentMessage" class="mt-2" :class="experimentMessage.startsWith('Queued') ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'">{{ experimentMessage }}</p>
+        <div v-if="experimentJobs.length" class="mt-3 space-y-2 text-gray-600 dark:text-gray-300">
+          <div v-for="job in experimentJobs" :key="job.id" class="rounded border border-gray-200 dark:border-gray-700 p-2">
+            <span class="font-medium">{{ job.status }} · {{ job.stage }}</span>
+            <span class="ml-1 text-gray-500">{{ job.progress?.display_name || job.progress?.profile || job.payload?.profile_slug || 'current' }}</span>
+            <details v-if="job.progress?.answer" class="mt-1"><summary class="cursor-pointer">View result</summary><div class="markdown-content mt-2" v-html="renderMarkdown(job.progress.answer)" /></details>
+          </div>
+        </div>
+      </details>
 
       <!-- Query input -->
       <div class="flex gap-2">

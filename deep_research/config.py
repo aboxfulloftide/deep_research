@@ -15,7 +15,7 @@ class LLMConfig(BaseModel):
     base_url: str = "http://localhost:11434/v1"
     model: str = "llama3"
     api_key: str = "ollama"
-    backend: str = "ollama"  # "ollama" | "llama_cpp" -- which preset base_url/api_key currently reflects
+    backend: str = "llama_cpp"  # Interactive chat is served by the managed llama.cpp runtime.
     ollama_base_url: str = "http://localhost:11434/v1"
     ollama_api_key: str = "ollama"
     llama_cpp_base_url: str = "http://localhost:8080/v1"

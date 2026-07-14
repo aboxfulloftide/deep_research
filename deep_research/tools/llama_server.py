@@ -1,6 +1,7 @@
 """Registry-neutral lifecycle helpers for a local llama-server process."""
 
 import asyncio
+import shutil
 from pathlib import Path
 
 import httpx
@@ -8,7 +9,12 @@ import httpx
 
 def build_launch_command(model_path: str, port: int, args: dict | None = None) -> list[str]:
     args = args or {}
-    cmd = [args.get("llama_server_bin", "llama-server"), "-m", model_path, "--host", "127.0.0.1", "--port", str(port),
+    server_bin = args.get("llama_server_bin", "llama-server")
+    if not shutil.which(server_bin):
+        local_build = Path.home() / "llama" / "llama.cpp" / "build" / "bin" / "llama-server"
+        if local_build.exists():
+            server_bin = str(local_build)
+    cmd = [server_bin, "-m", model_path, "--host", "127.0.0.1", "--port", str(port),
            "-ngl", str(args.get("gpu_layers", 99)), "-c", str(args.get("context", 32768)),
            "-b", str(args.get("batch", 4096)), "-ub", str(args.get("ubatch", 512)), "--parallel", str(args.get("parallel", 2))]
     if args.get("flash_attn", True): cmd += ["-fa", "on"]

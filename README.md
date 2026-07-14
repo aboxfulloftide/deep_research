@@ -46,6 +46,16 @@ continues with evidence-focused fallback queries instead of stalling.
 
 Research-answer links open in a new browser tab.
 
+### llama.cpp model experiments
+
+Interactive research uses the managed llama.cpp server only. The Research page
+can queue a model experiment against the current model or a registered
+alternate profile, with an optional context-window override and reasoning
+enabled or disabled. Experiments are deliberately low priority: they wait for
+all ingestion and verification jobs to drain and for the GPU to be idle.
+Alternate profiles run temporarily on their evaluation port and are stopped
+afterward; the primary llama.cpp server is never replaced or reloaded.
+
 ## CLI
 
 The same durable pipeline is available through `deep-research-kb`:

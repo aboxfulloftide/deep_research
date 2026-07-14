@@ -57,7 +57,6 @@ app.include_router(kb_routes.router)
 class QueryRequest(BaseModel):
     query: str
     model: str | None = None
-    backend: str | None = None  # "ollama" | "llama_cpp" -- defaults to config.llm.backend
     session_id: str | None = None
     prioritize_kb: bool = False
     research_mode: Literal["standard", "extra"] = "standard"
@@ -73,21 +72,19 @@ class SessionResponse(BaseModel):
 # --- API Routes ---
 
 @app.get("/api/models")
-async def list_models(backend: str | None = None):
-    """List available models for the given backend (or the configured
-    default if omitted) -- Ollama and llama.cpp expose different endpoints/
-    response shapes, see deep_research/model_backends.py."""
-    backend = backend or config.llm.backend
-    cfg = apply_backend(config.model_copy(deep=True), backend)
+async def list_models():
+    """List models on the project's llama.cpp server.
+
+    The interactive research app deliberately uses one managed local runtime.
+    Ollama remains available for embeddings, but is not a chat backend here.
+    """
+    cfg = apply_backend(config.model_copy(deep=True), "llama_cpp")
     try:
-        models = await backend_list_models(backend, cfg.llm.base_url)
-        # config.llm.model is a single global default that won't exist on
-        # every backend (e.g. "llama3" is neither an Ollama tag nor a
-        # llama.cpp model path) -- fall back to whatever's actually available.
+        models = await backend_list_models("llama_cpp", cfg.llm.base_url)
         default = cfg.llm.model if cfg.llm.model in models else (models[0] if models else "")
-        return {"models": models, "default": default, "backend": backend}
+        return {"models": models, "default": default, "backend": "llama_cpp"}
     except Exception as e:
-        return {"models": [], "default": "", "backend": backend, "error": str(e)}
+        return {"models": [], "default": "", "backend": "llama_cpp", "error": str(e)}
 
 
 @app.get("/api/search-usage")
@@ -142,10 +139,7 @@ async def delete_session(session_id: str):
 @app.post("/api/research")
 async def research(req: QueryRequest):
     """Run a research query and stream results via SSE."""
-    backend = req.backend or config.llm.backend
-
-    # Create LLM client for the selected backend + model
-    cfg = apply_backend(config.model_copy(deep=True), backend)
+    cfg = apply_backend(config.model_copy(deep=True), "llama_cpp")
     cfg.llm.model = req.model or cfg.llm.model
 
     return EventSourceResponse(

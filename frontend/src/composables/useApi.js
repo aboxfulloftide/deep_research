@@ -13,9 +13,8 @@ async function fetch(input, init) {
 }
 
 export function useApi() {
-  async function fetchModels(backend = null) {
-    const qs = backend ? `?backend=${encodeURIComponent(backend)}` : ''
-    const resp = await fetch(`${API_BASE}/models${qs}`)
+  async function fetchModels() {
+    const resp = await fetch(`${API_BASE}/models`)
     return resp.json()
   }
 
@@ -35,11 +34,10 @@ export function useApi() {
     return resp.json()
   }
 
-  function streamResearch(query, model, sessionId, callbacks, prioritizeKb = false, backend = null, researchMode = 'standard') {
+  function streamResearch(query, model, sessionId, callbacks, prioritizeKb = false, researchMode = 'standard') {
     const body = JSON.stringify({
       query,
       model: model || null,
-      backend: backend || null,
       session_id: sessionId || null,
       prioritize_kb: !!prioritizeKb,
       research_mode: researchMode,
@@ -400,6 +398,20 @@ export function useApi() {
     return resp.json()
   }
 
+  async function fetchModelExperimentProfiles() {
+    const resp = await fetch(`${API_BASE}/kb/model-experiments/profiles`)
+    return resp.json()
+  }
+
+  async function queueModelExperiment(payload) {
+    const resp = await fetch(`${API_BASE}/kb/model-experiments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    return resp.json()
+  }
+
   async function retryProcessingJob(jobId) {
     const resp = await fetch(`${API_BASE}/kb/processing-jobs/${jobId}/retry`, { method: 'POST' })
     if (!resp.ok) throw new Error('Could not retry this job')
@@ -555,7 +567,7 @@ export function useApi() {
     fetchResolutionCandidates, reviewResolutionCandidate,
     fetchSources, fetchSource, fetchSourceClaims, fetchSourceDecisions, fetchSourceProcessingStatus, resetSourceTrustTier, archiveSource, restoreSource,
     ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos, deletePlaylist, checkPlaylist, ingestPlaylistBatch,
-    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, fetchProcessingJobs, retryProcessingJob,
+    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, fetchProcessingJobs, fetchModelExperimentProfiles, queueModelExperiment, retryProcessingJob,
     chunkSource, extractSource, verifySource, backfillEmbeddings, triggerAdSweep,
     fetchClaims, fetchClaim, fetchClaimDecisions, findCounterEvidence, verifyClaim, setPreferredSource, setClaimVerificationOverride,
     setClaimVerificationContext, searchChunks,

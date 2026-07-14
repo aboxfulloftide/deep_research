@@ -20,7 +20,9 @@ from deep_research.kb.db import KBDatabase
 from deep_research.kb.decision_log import record_decision, record_undo
 from deep_research.kb.embeddings import backfill_embeddings, embed_texts
 from deep_research.kb.ingest import ingest_file, ingest_pasted_text, ingest_web_page, ingest_youtube_video
-from deep_research.kb.jobs import ProcessingJobWorker, enqueue_manual_job, enqueue_playlist_poll, enqueue_source_pipeline
+from deep_research.kb.jobs import (
+    ProcessingJobWorker, enqueue_manual_job, enqueue_model_experiment, enqueue_playlist_poll, enqueue_source_pipeline,
+)
 from deep_research.kb.merge import review_and_execute
 from deep_research.kb.playlists import track_youtube_playlist
 from deep_research.kb.reports import generate_topic_report
@@ -110,6 +112,13 @@ class VerificationContextRequest(BaseModel):
 class IngestUrlRequest(BaseModel):
     url: str
     trust_tier: str | None = None
+
+
+class ModelExperimentRequest(BaseModel):
+    prompt: str
+    profile_slug: str = "current"
+    context_size: int | None = None
+    reasoning: bool = True
 
 
 class IngestYoutubeRequest(BaseModel):
@@ -797,6 +806,29 @@ async def list_processing_jobs(status: str | None = None, limit: int = 50):
     else:
         jobs = await kb_db.list_processing_jobs(limit=limit)
     return {"jobs": _serialize(jobs)}
+
+
+@router.get("/model-experiments/profiles")
+async def list_model_experiment_profiles():
+    from deep_research.kb.model_experiments import available_profiles
+
+    return _serialize(await available_profiles(config))
+
+
+@router.post("/model-experiments")
+async def queue_model_experiment(req: ModelExperimentRequest):
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "An experiment prompt is required")
+    if req.context_size is not None and not 4096 <= req.context_size <= 131072:
+        raise HTTPException(400, "Context size must be between 4,096 and 131,072 tokens")
+    job = await enqueue_model_experiment(kb_db, {
+        "prompt": prompt,
+        "profile_slug": req.profile_slug,
+        "context_size": req.context_size,
+        "reasoning": req.reasoning,
+    })
+    return {"job": _serialize(job)}
 
 
 @router.post("/processing-jobs/{job_id}/retry")

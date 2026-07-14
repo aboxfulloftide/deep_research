@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from deep_research.kb import decision_log
-from deep_research.kb.jobs import enqueue_manual_job
+from deep_research.kb.jobs import enqueue_manual_job, enqueue_model_experiment
 
 
 async def test_enqueue_processing_job_is_idempotent_and_leases_once(kb_db):
@@ -87,6 +87,20 @@ async def test_explicit_user_actions_get_separate_durable_jobs(kb_db):
 
     assert first["id"] != second["id"]
     assert {job["id"] for job in await kb_db.list_processing_jobs(source_id=source["id"])} == {first["id"], second["id"]}
+
+
+async def test_model_experiments_are_low_priority_speculative_jobs(kb_db):
+    experiment = await enqueue_model_experiment(kb_db, {"prompt": "Compare models"})
+    normal, _ = await kb_db.enqueue_processing_job(
+        "source_pipeline", "source", subject_id="source-1", idempotency_key="normal-before-experiment", priority=100,
+    )
+
+    claimed = await kb_db.claim_next_processing_job("worker")
+
+    assert experiment["is_speculative"] is True
+    assert experiment["priority"] == -1000
+    assert experiment["stage"] == "waiting_for_idle"
+    assert claimed["id"] == normal["id"]
 
 
 async def test_source_list_exposes_durable_lifecycle_status(kb_db):
