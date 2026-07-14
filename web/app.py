@@ -244,7 +244,7 @@ async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg,
     from deep_research.tools.kb_search import kb_search
 
     if not gathered_data and prioritize_kb and kb_routes.kb_db:
-        kb_result = await kb_search(query[:200], kb_routes.kb_db)
+        kb_result = await kb_search(query[:200], kb_routes.kb_db, cfg)
         if kb_result and not kb_result.startswith("No results found"):
             gathered_data = kb_result
 
@@ -346,7 +346,7 @@ async def _tool_loop(llm: LLMClient, query: str, session_id: str, cfg, prioritiz
                         result = "No results found."
                 elif tool_name == "kb_search":
                     if kb_routes.kb_db:
-                        result = await kb_search(tool_args["query"], kb_routes.kb_db)
+                        result = await kb_search(tool_args["query"], kb_routes.kb_db, cfg)
                     else:
                         result = "Local knowledge base is not available."
                 elif tool_name == "scrape_webpage":
