@@ -34,6 +34,18 @@ in `config.yaml`; `config.example.yaml` documents every supported KB setting.
 
 No manual chunk/extract/verify sequence is needed for ordinary use.
 
+## Interactive research modes
+
+The Research page defaults to **Standard** mode: a fast web-first answer with
+full text from the strongest available sources. Choose **Extra · 3 levels**
+when a question needs deeper investigation. It reads independent starting
+sources, uses that evidence to run two bounded follow-up levels, then writes a
+cited synthesis from up to six source excerpts. Progress is shown while each
+level runs; if a local model is slow at planning follow-up queries, the app
+continues with evidence-focused fallback queries instead of stalling.
+
+Research-answer links open in a new browser tab.
+
 ## CLI
 
 The same durable pipeline is available through `deep-research-kb`:
