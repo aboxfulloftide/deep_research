@@ -55,6 +55,12 @@ async function showPlaylistVideos(playlist) {
   playlistVideos.value = { ...playlistVideos.value, [playlist.id]: data.videos || [] }
 }
 
+async function removePlaylist(playlist) {
+  await api.deletePlaylist(playlist.id)
+  playlistVideos.value = Object.fromEntries(Object.entries(playlistVideos.value).filter(([id]) => id !== playlist.id))
+  await loadPlaylists()
+}
+
 function openSource(source) {
   router.push({ name: 'source', params: { id: source.id } })
 }
@@ -384,7 +390,7 @@ const lifecycleClasses = {
     <details v-if="playlists.length" class="mt-6 text-sm">
       <summary class="cursor-pointer text-gray-600 dark:text-gray-300">Tracked playlists ({{ playlists.length }})</summary>
       <div v-for="playlist in playlists" :key="playlist.id" class="mt-2 p-3 border rounded border-gray-200 dark:border-gray-700">
-        <div class="flex justify-between gap-2"><span>{{ playlist.title || playlist.url }}</span><button @click="showPlaylistVideos(playlist)" class="text-blue-600 hover:underline">Show videos</button></div>
+        <div class="flex justify-between gap-2"><span>{{ playlist.title || playlist.url }}</span><span class="flex gap-2"><button @click="showPlaylistVideos(playlist)" class="text-blue-600 hover:underline">Show videos</button><button @click="removePlaylist(playlist)" class="text-red-600 hover:underline">Remove</button></span></div>
         <p v-for="video in playlistVideos[playlist.id] || []" :key="video.video_id" class="text-xs text-gray-500 mt-1">{{ video.title || video.video_id }} — {{ video.ingested_at ? 'ingested' : 'discovered' }}</p>
       </div>
     </details>

@@ -635,6 +635,14 @@ async def list_playlist_videos(playlist_id: str):
     return {"videos": _serialize(await kb_db.list_playlist_videos(playlist_id))}
 
 
+@router.delete("/playlists/{playlist_id}")
+async def delete_playlist(playlist_id: str):
+    playlist = await kb_db.delete_tracked_playlist(playlist_id)
+    if playlist is None:
+        raise HTTPException(404, "Tracked playlist not found")
+    return {"playlist": _serialize(playlist)}
+
+
 @router.get("/topic-discovery-proposals")
 async def list_topic_discovery_proposals(status: str = "open"):
     return {"proposals": _serialize(await kb_db.list_topic_discovery_proposals(status))}

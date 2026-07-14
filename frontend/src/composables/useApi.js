@@ -307,6 +307,11 @@ export function useApi() {
     return resp.json()
   }
 
+  async function deletePlaylist(id) {
+    const resp = await fetch(`${API_BASE}/kb/playlists/${id}`, { method: 'DELETE' })
+    return resp.json()
+  }
+
   async function ingestConversation(text, title = null, trustTier = null, topicName = null) {
     const resp = await fetch(`${API_BASE}/kb/sources/ingest-conversation`, {
       method: 'POST',
@@ -527,7 +532,7 @@ export function useApi() {
     backfillTopic, triggerTopicVerification, fetchTopicProcessingStatus, fetchReport, generateReport,
     fetchResolutionCandidates, reviewResolutionCandidate,
     fetchSources, fetchSource, fetchSourceClaims, fetchSourceDecisions, fetchSourceProcessingStatus, resetSourceTrustTier, archiveSource, restoreSource,
-    ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos,
+    ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos, deletePlaylist,
     ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, retryProcessingJob,
     chunkSource, extractSource, verifySource, backfillEmbeddings, triggerAdSweep,
     fetchClaims, fetchClaim, fetchClaimDecisions, findCounterEvidence, verifyClaim, setPreferredSource, setClaimVerificationOverride,

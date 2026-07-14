@@ -1409,6 +1409,16 @@ class KBDatabase:
             rows = await conn.fetch(query)
         return [dict(r) for r in rows]
 
+    async def delete_tracked_playlist(self, playlist_id: str) -> dict | None:
+        """Stop tracking a playlist without touching its normal video sources.
+
+        ``playlist_videos`` is discovery bookkeeping and cascades with the
+        playlist; sources already ingested from those videos remain intact.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("DELETE FROM tracked_playlists WHERE id = $1 RETURNING *", playlist_id)
+        return dict(row) if row else None
+
     async def add_playlist_video(self, playlist_id: str, video_id: str, title: str | None = None) -> tuple[dict, bool]:
         now = _now()
         async with self.pool.acquire() as conn:
