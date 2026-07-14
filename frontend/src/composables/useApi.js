@@ -35,13 +35,14 @@ export function useApi() {
     return resp.json()
   }
 
-  function streamResearch(query, model, sessionId, callbacks, prioritizeKb = false, backend = null) {
+  function streamResearch(query, model, sessionId, callbacks, prioritizeKb = false, backend = null, researchMode = 'standard') {
     const body = JSON.stringify({
       query,
       model: model || null,
       backend: backend || null,
       session_id: sessionId || null,
       prioritize_kb: !!prioritizeKb,
+      research_mode: researchMode,
     })
 
     const controller = new AbortController()

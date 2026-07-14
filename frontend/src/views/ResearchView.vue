@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, nextTick, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Send, Loader, Globe, FileSearch, Bot, ChevronDown, Database, Server } from 'lucide-vue-next'
+import { Send, Loader, Globe, FileSearch, Bot, ChevronDown, Database, Server, Layers } from 'lucide-vue-next'
 import { marked } from 'marked'
 import { useApi } from '../composables/useApi.js'
 
@@ -22,6 +22,9 @@ const messagesContainer = ref(null)
 // knowledge base first. With this off, research always starts on the web.
 // Persisted the same way dark mode is, since it's a standing preference.
 const prioritizeKb = ref(localStorage.getItem('prioritizeKb') === 'true')
+// Extra Research is intentionally per-question. It takes longer and uses a
+// bounded three-level search, so the next question returns to Standard mode.
+const researchMode = ref('standard')
 // Which local model server the agent talks to -- see
 // deep_research/model_backends.py. Persisted like prioritizeKb, since it's
 // also a standing preference, not a per-query choice.
@@ -132,7 +135,7 @@ async function submitQuery() {
       status.value = null
       isResearching.value = false
     },
-  }, prioritizeKb.value, backend.value)
+  }, prioritizeKb.value, backend.value, researchMode.value)
 }
 
 function stopResearch() {
@@ -282,6 +285,22 @@ const statusText = computed(() => {
           <Database class="w-3.5 h-3.5" :stroke-width="1.5" />
           Use saved sources first
         </label>
+
+        <div class="flex items-center rounded-md bg-gray-200 dark:bg-gray-700 text-xs overflow-hidden" title="Extra Research follows evidence through three bounded search levels before writing an answer">
+          <button
+            @click="researchMode = 'standard'"
+            :class="['px-2.5 py-1.5 transition-colors', researchMode === 'standard' ? 'bg-blue-600 text-white' : 'hover:bg-gray-300 dark:hover:bg-gray-600']"
+          >
+            Standard
+          </button>
+          <button
+            @click="researchMode = 'extra'"
+            :class="['flex items-center gap-1 px-2.5 py-1.5 transition-colors', researchMode === 'extra' ? 'bg-violet-600 text-white' : 'hover:bg-gray-300 dark:hover:bg-gray-600']"
+          >
+            <Layers class="w-3.5 h-3.5" :stroke-width="1.5" />
+            Extra · 3 levels
+          </button>
+        </div>
       </div>
 
       <!-- Query input -->

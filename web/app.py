@@ -3,6 +3,7 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,6 +60,7 @@ class QueryRequest(BaseModel):
     backend: str | None = None  # "ollama" | "llama_cpp" -- defaults to config.llm.backend
     session_id: str | None = None
     prioritize_kb: bool = False
+    research_mode: Literal["standard", "extra"] = "standard"
 
 
 class SessionResponse(BaseModel):
@@ -147,12 +149,14 @@ async def research(req: QueryRequest):
     cfg.llm.model = req.model or cfg.llm.model
 
     return EventSourceResponse(
-        _stream_research(cfg, req.query, req.session_id, req.prioritize_kb),
+        _stream_research(cfg, req.query, req.session_id, req.prioritize_kb, req.research_mode),
         media_type="text/event-stream",
     )
 
 
-async def _stream_research(cfg, query: str, session_id: str | None, prioritize_kb: bool = False):
+async def _stream_research(
+    cfg, query: str, session_id: str | None, prioritize_kb: bool = False, research_mode: str = "standard",
+):
     """Generator that yields SSE events during research."""
     llm = LLMClient(cfg)
 
@@ -202,29 +206,37 @@ async def _stream_research(cfg, query: str, session_id: str | None, prioritize_k
             compact = _compact_product_list(all_products)
             gathered_data = f"{analysis}\n\n{compact}"
 
-        # Check tool support
-        if llm.supports_tools is None:
-            try:
-                from deep_research.prompts import TOOL_DEFINITIONS
-                await llm.chat(
-                    [{"role": "user", "content": "hi"}],
-                    tools=[TOOL_DEFINITIONS[0]],
-                )
-            except Exception:
-                pass
-
-        if gathered_data or not llm.supports_tools:
-            # Text mode — direct answer
-            yield {"event": "status", "data": json.dumps({"step": "generating", "detail": "Composing answer..."})}
-            answer = await _text_mode_answer(llm, query, gathered_data, cfg, prioritize_kb)
-        else:
-            # Tool loop
+        if research_mode == "extra":
             answer = ""
-            async for event in _tool_loop(llm, query, session_id, cfg, prioritize_kb):
+            async for event in _extra_research_answer(llm, query, cfg):
                 if event.get("event") == "answer":
                     answer = event["data"]
                 else:
                     yield event
+        else:
+            # Check tool support
+            if llm.supports_tools is None:
+                try:
+                    from deep_research.prompts import TOOL_DEFINITIONS
+                    await llm.chat(
+                        [{"role": "user", "content": "hi"}],
+                        tools=[TOOL_DEFINITIONS[0]],
+                    )
+                except Exception:
+                    pass
+
+            if gathered_data or not llm.supports_tools:
+                # Text mode — direct answer
+                yield {"event": "status", "data": json.dumps({"step": "generating", "detail": "Composing answer..."})}
+                answer = await _text_mode_answer(llm, query, gathered_data, cfg, prioritize_kb)
+            else:
+                # Tool loop
+                answer = ""
+                async for event in _tool_loop(llm, query, session_id, cfg, prioritize_kb):
+                    if event.get("event") == "answer":
+                        answer = event["data"]
+                    else:
+                        yield event
 
         await db.add_message(session_id, "assistant", content=answer)
         yield {"event": "answer", "data": json.dumps({"answer": answer, "session_id": session_id})}
@@ -234,6 +246,72 @@ async def _stream_research(cfg, query: str, session_id: str | None, prioritize_k
         yield {"event": "error", "data": json.dumps({"error": str(e)})}
     finally:
         await llm.close()
+
+
+async def _extra_research_answer(llm: LLMClient, query: str, cfg):
+    """Run the bounded three-level Extra Research workflow and stream status."""
+    from deep_research.tools.extra_research import (
+        collect_sources,
+        derive_follow_up_queries,
+        source_context,
+    )
+
+    seen_urls: set[str] = set()
+    sources = []
+    queries = [query]
+
+    for level in range(1, 4):
+        detail = (
+            "Searching the original question and reading sources..."
+            if level == 1
+            else "Following evidence into targeted sources..."
+        )
+        yield {
+            "event": "status",
+            "data": json.dumps({"step": "researching", "detail": f"Level {level} of 3: {detail}"}),
+        }
+        level_sources = await collect_sources(queries, cfg, level, seen_urls)
+        sources.extend(level_sources)
+
+        if level < 3:
+            yield {
+                "event": "status",
+                "data": json.dumps({"step": "thinking", "detail": f"Level {level} of 3: choosing follow-up questions from the evidence..."}),
+            }
+            queries = await derive_follow_up_queries(llm, query, sources, level)
+
+    if not sources:
+        yield {"event": "answer", "data": "I could not retrieve usable sources for this extra research run."}
+        return
+
+    yield {
+        "event": "status",
+        "data": json.dumps({"step": "generating", "detail": f"Synthesizing {len(sources)} sources across three research levels..."}),
+    }
+    evidence = source_context(sources)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "/no_think\nYou are a careful deep-research analyst. Synthesize the source material into a "
+                "direct, useful answer. Separate well-supported conclusions from tradeoffs, "
+                "uncertainty, and disagreement. Do not invent facts. Cite each important factual "
+                "claim with a Markdown link using the source URLs provided. Use concise headings "
+                "and a recommendation when the question asks for one."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Research question: {query}\n\n"
+                f"Evidence gathered in three levels:\n\n{evidence}\n\n"
+                "Write the final research answer now."
+            ),
+        },
+    ]
+    response = await llm.chat(messages)
+    answer = response["choices"][0]["message"].get("content", "No answer produced.")
+    yield {"event": "answer", "data": answer}
 
 
 async def _text_mode_answer(llm: LLMClient, query: str, gathered_data: str, cfg, prioritize_kb: bool = False) -> str:
