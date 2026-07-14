@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, nextTick, watch, computed } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Send, Loader, Globe, FileSearch, Bot, ChevronDown, Database, Layers, FlaskConical } from 'lucide-vue-next'
 import { marked } from 'marked'
@@ -34,6 +34,7 @@ const experimentJobs = ref([])
 const experimentMessage = ref(null)
 const queueingExperiment = ref(false)
 let abortController = null
+let experimentPollHandle = null
 
 watch(prioritizeKb, (val) => {
   localStorage.setItem('prioritizeKb', val)
@@ -51,8 +52,18 @@ async function loadModels() {
   experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment').slice(0, 5)
 }
 
+async function refreshExperimentJobs() {
+  try {
+    const jobsData = await api.fetchProcessingJobs()
+    experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment').slice(0, 5)
+  } catch {
+    // The main research flow remains usable if the optional job feed is down.
+  }
+}
+
 onMounted(async () => {
   await loadModels()
+  experimentPollHandle = window.setInterval(refreshExperimentJobs, 5000)
 
   // If resuming a session
   if (route.params.id) {
@@ -68,6 +79,10 @@ onMounted(async () => {
       }
     }
   }
+})
+
+onUnmounted(() => {
+  if (experimentPollHandle) window.clearInterval(experimentPollHandle)
 })
 
 watch(messages, () => {
