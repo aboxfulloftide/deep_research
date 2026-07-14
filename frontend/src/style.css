@@ -1,5 +1,9 @@
 @import "tailwindcss";
 
+/* The app's theme control toggles `.dark` on `<html>`. Tailwind v4 defaults
+   dark: utilities to the OS media preference unless this variant is explicit. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 body {
   margin: 0;
 }
