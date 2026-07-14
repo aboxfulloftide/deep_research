@@ -99,6 +99,10 @@ class KBConfig(BaseModel):
     # spike validated: local llama.cpp for extraction, Ollama for embeddings.
     extraction_llm_base_url: str = "http://localhost:8080/v1"
     extraction_llm_model: str = ""  # empty = auto-detect from the llama.cpp server
+    # Optional verifier role. Leaving these unset preserves the current
+    # single-model deployment while allowing 30B extraction / 14B checking.
+    verification_llm_base_url: str | None = None
+    verification_llm_model: str = ""
     embedding_base_url: str = "http://localhost:11434"
     embedding_model: str = "nomic-embed-text:v1.5"
     claim_duplicate_threshold: float = 0.85
@@ -106,6 +110,9 @@ class KBConfig(BaseModel):
     # in PLAN_KB_ARCHITECTURE.md) — bounds cost so verifying a claim can't fan
     # out into unbounded searches/scrapes/extraction passes.
     verification_max_web_searches: int = 2
+    # Shared cap for one whole unattended sweep. Per-claim limits alone can
+    # turn a large backlog into hundreds of external calls overnight.
+    verification_run_max_web_searches: int = 50
     verification_max_sources_examined: int = 3
     verification_importance_threshold: float = 0.8
     # A web-fallback source only needs extraction run on the handful of
@@ -128,6 +135,7 @@ class KBConfig(BaseModel):
     # used if that detection fails (a non-llama.cpp backend, or /slots
     # disabled) — a deliberately conservative guess, not a tuning knob.
     report_context_fallback_tokens: int = 4096
+    playlist_max_videos_per_run: int = 3
 
 
 class Config(BaseModel):
@@ -179,15 +187,19 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_KB_SNAPSHOT_DIR": ("kb", "snapshot_dir"),
         "DEEP_RESEARCH_KB_EXTRACTION_LLM_BASE_URL": ("kb", "extraction_llm_base_url"),
         "DEEP_RESEARCH_KB_EXTRACTION_LLM_MODEL": ("kb", "extraction_llm_model"),
+        "DEEP_RESEARCH_KB_VERIFICATION_LLM_BASE_URL": ("kb", "verification_llm_base_url"),
+        "DEEP_RESEARCH_KB_VERIFICATION_LLM_MODEL": ("kb", "verification_llm_model"),
         "DEEP_RESEARCH_KB_EMBEDDING_BASE_URL": ("kb", "embedding_base_url"),
         "DEEP_RESEARCH_KB_EMBEDDING_MODEL": ("kb", "embedding_model"),
         "DEEP_RESEARCH_KB_CLAIM_DUPLICATE_THRESHOLD": ("kb", "claim_duplicate_threshold"),
         "DEEP_RESEARCH_KB_VERIFICATION_MAX_WEB_SEARCHES": ("kb", "verification_max_web_searches"),
         "DEEP_RESEARCH_KB_VERIFICATION_MAX_SOURCES_EXAMINED": ("kb", "verification_max_sources_examined"),
         "DEEP_RESEARCH_KB_VERIFICATION_IMPORTANCE_THRESHOLD": ("kb", "verification_importance_threshold"),
+        "DEEP_RESEARCH_KB_VERIFICATION_RUN_MAX_WEB_SEARCHES": ("kb", "verification_run_max_web_searches"),
         "DEEP_RESEARCH_KB_VERIFICATION_CONCURRENCY": ("kb", "verification_concurrency"),
         "DEEP_RESEARCH_KB_VERIFICATION_MAX_CHUNKS_PER_PAGE": ("kb", "verification_max_chunks_per_page"),
         "DEEP_RESEARCH_KB_REPORT_CONTEXT_FALLBACK_TOKENS": ("kb", "report_context_fallback_tokens"),
+        "DEEP_RESEARCH_KB_PLAYLIST_MAX_VIDEOS_PER_RUN": ("kb", "playlist_max_videos_per_run"),
     }
     data = config.model_dump()
     for env_var, (section, key) in env_map.items():

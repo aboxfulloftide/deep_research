@@ -76,7 +76,10 @@ class ReportResult:
 
 def _format_claim_line(claim: dict, source_title: str | None) -> str:
     cite = f" (Source: {source_title})" if source_title else ""
-    flag = f" [{claim['status'].upper()}]" if claim["status"] in ("contradicted", "mixed") else ""
+    # An assertion with no independent check must never read like settled
+    # fact in the synthesis prompt. The final report is asked to preserve
+    # these markers, separating open assertions from corroborated material.
+    flag = f" [{claim['status'].upper()}]" if claim["status"] in ("unverified", "contradicted", "mixed") else ""
     return f"- {claim['canonical_text']}{flag}{cite}"
 
 

@@ -14,6 +14,7 @@ the same fact — no merge happens, just claims.status update on both sides.
 from dataclasses import dataclass
 
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.decision_log import record_decision
 
 
 def _pick_winner_loser_entities(entity_a: dict, entity_b: dict) -> tuple[dict, dict]:
@@ -65,7 +66,9 @@ async def _resolve_ultimate_claim(kb_db: KBDatabase, claim: dict) -> dict:
     return current
 
 
-async def merge_entities(kb_db: KBDatabase, entity_a_id: str, entity_b_id: str) -> dict:
+async def merge_entities(
+    kb_db: KBDatabase, entity_a_id: str, entity_b_id: str, *, automation: dict | None = None,
+) -> dict:
     """Merges two duplicate entities. Returns {"winner_id", "loser_id"}."""
     entity_a = await kb_db.get_entity(entity_a_id)
     entity_b = await kb_db.get_entity(entity_b_id)
@@ -81,10 +84,21 @@ async def merge_entities(kb_db: KBDatabase, entity_a_id: str, entity_b_id: str) 
     await kb_db.reassign_metrics_entity(loser["id"], winner["id"])
     await kb_db.reassign_resolution_candidates_entity(loser["id"], winner["id"])
     await kb_db.mark_entity_merged(loser["id"], winner["id"])
+    if automation:
+        await record_decision(
+            kb_db, "entity_merge", "entity", loser["id"], f"merged into {winner['id']}",
+            related_ids=[winner["id"]], confidence=automation.get("confidence"),
+            reasoning=automation.get("reasoning"), model=automation.get("model"),
+            parse_success=automation.get("parse_success"),
+            previous_state={"name": loser["name"], "merged_into_entity_id": loser.get("merged_into_entity_id")},
+            resulting_state={"merged_into_entity_id": winner["id"]}, reversible=False,
+        )
     return {"winner_id": winner["id"], "loser_id": loser["id"]}
 
 
-async def merge_claims(kb_db: KBDatabase, claim_a_id: str, claim_b_id: str) -> dict:
+async def merge_claims(
+    kb_db: KBDatabase, claim_a_id: str, claim_b_id: str, *, automation: dict | None = None,
+) -> dict:
     claim_a = await kb_db.get_claim(claim_a_id)
     claim_b = await kb_db.get_claim(claim_b_id)
     if claim_a is None or claim_b is None:
@@ -104,6 +118,15 @@ async def merge_claims(kb_db: KBDatabase, claim_a_id: str, claim_b_id: str) -> d
     await kb_db.mark_claim_merged(loser["id"], winner["id"])
     # After merging, the winner has more evidence sources — refresh preferred_source_id
     await kb_db.recompute_preferred_source(winner["id"])
+    if automation:
+        await record_decision(
+            kb_db, "claim_merge", "claim", loser["id"], f"merged into {winner['id']}",
+            related_ids=[winner["id"]], confidence=automation.get("confidence"),
+            reasoning=automation.get("reasoning"), model=automation.get("model"),
+            parse_success=automation.get("parse_success"),
+            previous_state={"canonical_text": loser["canonical_text"], "status": loser["status"]},
+            resulting_state={"merged_into_claim_id": winner["id"], "status": "deprecated"}, reversible=False,
+        )
     return {"winner_id": winner["id"], "loser_id": loser["id"]}
 
 

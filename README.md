@@ -1,0 +1,61 @@
+# Deep Research
+
+Deep Research is a local, LLM-assisted research workspace. Create a topic,
+add a few URLs, YouTube videos, or files, and the knowledge base automatically
+ingests, extracts, checks, connects, and summarizes the material. Automated
+actions are visible in decision history and preserve human control over
+editorial choices such as topic framing and contradiction adjudication.
+
+## Quick start
+
+Requirements: Python 3.10+, Docker, a local OpenAI-compatible LLM endpoint
+for extraction/verification, and Ollama (or another compatible embedding
+endpoint).
+
+```bash
+cp config.example.yaml config.yaml
+docker compose up -d
+python -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/uvicorn web.app:app --reload
+```
+
+Open the web app at `http://localhost:8000`. Configure local model endpoints
+in `config.yaml`; `config.example.yaml` documents every supported KB setting.
+
+## Normal workflow
+
+1. Create a topic.
+2. Add several sources directly from the topic page.
+3. Read the automatically refreshed overview, clearly separated into
+   supported, unverified, and competing claims.
+4. Use the decision history, evidence links, and review controls whenever you
+   want to correct an automated result.
+
+No manual chunk/extract/verify sequence is needed for ordinary use.
+
+## CLI
+
+The same durable pipeline is available through `deep-research-kb`:
+
+```bash
+deep-research-kb ingest-url https://example.com/article
+deep-research-kb ingest-youtube 'https://www.youtube.com/watch?v=...'
+deep-research-kb track-playlist 'https://www.youtube.com/playlist?list=...'
+deep-research-kb extract-pending
+deep-research-kb verify-unverified --trigger cron
+```
+
+For registered local model profiles, `deep-research-kb nightly-role-split`
+runs the configured extraction model, then the verifier model, and leaves the
+verifier loaded for daytime use.
+
+## Development
+
+```bash
+.venv/bin/pytest -q
+cd frontend && npm install && npm run build
+```
+
+`ROADMAP.md` is the current product and implementation record. `HANDOFF.md`
+is the preserved model-evaluation record.

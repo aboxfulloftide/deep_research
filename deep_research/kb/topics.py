@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from deep_research.config import Config, LLMConfig
 from deep_research.kb.chunking import normalize_name
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.decision_log import record_decision
 from deep_research.kb.extraction import detect_model
 from deep_research.llm import LLMClient
 
@@ -56,6 +57,7 @@ Return ONLY a JSON object: {"relationship": "relevant"|"not_relevant", "confiden
 # suppression here is a silent, unrecoverable loss (the suggestion is never
 # created at all) rather than a queued item a human can still catch.
 TOPIC_RELEVANCE_SUPPRESS_THRESHOLD = 0.85
+TOPIC_AUTO_ATTACH_THRESHOLD = 0.9
 
 
 def _parse_relevance_classification(content: str) -> dict:
@@ -98,6 +100,8 @@ async def _classify_claim_topic_relevance(
 class SuggestionResult:
     claims_suggested: int = 0
     sources_suggested: int = 0
+    claims_auto_attached: int = 0
+    sources_auto_attached: int = 0
 
 
 async def get_topic_entity_names(kb_db: KBDatabase, topic_id: str) -> set[str]:
@@ -119,6 +123,7 @@ async def _suggest_claims_and_sources(
     topic = await kb_db.get_topic(topic_id) if llm is not None else None
 
     for claim, score, matched_names in matches:
+        verdict = None
         if llm is not None and topic is not None:
             try:
                 verdict = await _classify_claim_topic_relevance(
@@ -132,19 +137,46 @@ async def _suggest_claims_and_sources(
             ):
                 continue  # confidently just an incidental entity mention -- skip, don't queue
 
+        auto_attach = bool(
+            verdict and verdict.get("relationship") == "relevant"
+            and (verdict.get("confidence") or 0.0) >= TOPIC_AUTO_ATTACH_THRESHOLD
+        )
+
         reason = f"entity overlap: {', '.join(matched_names)}"
-        _, created = await kb_db.suggest_claim_for_topic(topic_id, claim["id"], ENTITY_OVERLAP_METHOD, score)
-        if created:
+        if auto_attach:
+            _, created = await kb_db.attach_claim_to_topic(topic_id, claim["id"], link_reason="auto_relevance", score=score), True
+            await record_decision(
+                kb_db, "topic_auto_attach", "claim", claim["id"], f"attached to topic {topic_id}",
+                related_ids=[topic_id], confidence=verdict.get("confidence"), reasoning=verdict.get("reasoning"),
+                previous_state={"link_status": None}, resulting_state={"link_status": "attached"}, reversible=True,
+            )
+        else:
+            _, created = await kb_db.suggest_claim_for_topic(topic_id, claim["id"], ENTITY_OVERLAP_METHOD, score)
+        if created and auto_attach:
+            result.claims_auto_attached += 1
+        elif created:
             result.claims_suggested += 1
 
         for source_id in await kb_db.get_claim_source_ids(claim["id"]):
             if source_id in suggested_source_ids:
                 continue
             suggested_source_ids.add(source_id)
-            _, s_created = await kb_db.suggest_source_for_topic(
-                topic_id, source_id, f"{ENTITY_OVERLAP_METHOD}_via_claim", score,
-            )
-            if s_created:
+            if auto_attach:
+                _, s_created = await kb_db.attach_source_to_topic(
+                    topic_id, source_id, link_reason="auto_relevance", score=score,
+                ), True
+                await record_decision(
+                    kb_db, "topic_auto_attach", "source", source_id, f"attached to topic {topic_id}",
+                    related_ids=[topic_id, claim["id"]], confidence=verdict.get("confidence"), reasoning=verdict.get("reasoning"),
+                    previous_state={"link_status": None}, resulting_state={"link_status": "attached"}, reversible=True,
+                )
+            else:
+                _, s_created = await kb_db.suggest_source_for_topic(
+                    topic_id, source_id, f"{ENTITY_OVERLAP_METHOD}_via_claim", score,
+                )
+            if s_created and auto_attach:
+                result.sources_auto_attached += 1
+            elif s_created:
                 result.sources_suggested += 1
     return result
 
@@ -220,8 +252,13 @@ async def check_claims_against_topics(
                 )
                 result.claims_suggested += sub_result.claims_suggested
                 result.sources_suggested += sub_result.sources_suggested
+                result.claims_auto_attached += sub_result.claims_auto_attached
+                result.sources_auto_attached += sub_result.sources_auto_attached
 
-            if result.claims_suggested or result.sources_suggested:
+            if (
+                result.claims_suggested or result.sources_suggested
+                or result.claims_auto_attached or result.sources_auto_attached
+            ):
                 results[topic["id"]] = result
 
         return results

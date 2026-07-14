@@ -241,7 +241,10 @@ async def _generate_entity_candidates(kb_db: KBDatabase, entity_row: dict, llm: 
             # resolves either id to its ultimate winner internally, so this is
             # safe to call even if a prior iteration already merged entity_row
             # into something else.
-            await merge_entities(kb_db, entity_row["id"], other["id"])
+            await merge_entities(
+                kb_db, entity_row["id"], other["id"],
+                automation={"reasoning": "Names differ only by spacing or hyphenation.", "parse_success": True},
+            )
             continue
         sim = _entity_similarity(entity_row["normalized_name"], other["normalized_name"], entity_row["entity_type"])
         if sim is None:
@@ -266,7 +269,11 @@ async def _generate_entity_candidates(kb_db: KBDatabase, entity_row: dict, llm: 
             confidence = verdict.get("confidence") or 0.0
             if confidence >= ENTITY_LLM_CONFIDENCE_THRESHOLD:
                 if relationship == "same":
-                    await merge_entities(kb_db, entity_row["id"], other["id"])
+                    await merge_entities(
+                        kb_db, entity_row["id"], other["id"],
+                        automation={"confidence": confidence, "reasoning": verdict.get("reasoning"),
+                                    "model": getattr(llm, "model", None), "parse_success": True},
+                    )
                     continue
                 if relationship == "different":
                     continue
@@ -353,7 +360,11 @@ async def generate_claim_resolution_candidates(
                 confidence = verdict.get("confidence") or 0.0
                 if confidence >= CLAIM_LLM_CONFIDENCE_THRESHOLD:
                     if relationship == "same":
-                        await merge_claims(kb_db, claim_id, other["id"])
+                        await merge_claims(
+                            kb_db, claim_id, other["id"],
+                            automation={"confidence": confidence, "reasoning": verdict.get("reasoning"),
+                                        "model": getattr(llm, "model", None), "parse_success": True},
+                        )
                         continue
                     if relationship == "different":
                         continue

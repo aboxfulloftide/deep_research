@@ -1,0 +1,41 @@
+"""Registry-neutral lifecycle helpers for a local llama-server process."""
+
+import asyncio
+from pathlib import Path
+
+import httpx
+
+
+def build_launch_command(model_path: str, port: int, args: dict | None = None) -> list[str]:
+    args = args or {}
+    cmd = [args.get("llama_server_bin", "llama-server"), "-m", model_path, "--host", "127.0.0.1", "--port", str(port),
+           "-ngl", str(args.get("gpu_layers", 99)), "-c", str(args.get("context", 32768)),
+           "-b", str(args.get("batch", 4096)), "-ub", str(args.get("ubatch", 512)), "--parallel", str(args.get("parallel", 2))]
+    if args.get("flash_attn", True): cmd += ["-fa", "on"]
+    for key, flag in (("tensor_split", "-ts"), ("devices", "-dev"), ("split_mode", "-sm")):
+        if args.get(key): cmd += [flag, args[key]]
+    return cmd
+
+
+async def is_healthy(port: int) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=2) as client:
+            response = await client.get(f"http://127.0.0.1:{port}/health")
+            return response.status_code == 200 and response.json().get("status") == "ok"
+    except httpx.HTTPError:
+        return False
+
+
+async def wait_ready(port: int, attempts: int = 30, interval_seconds: float = 2) -> bool:
+    for _ in range(attempts):
+        if await is_healthy(port): return True
+        await asyncio.sleep(interval_seconds)
+    return False
+
+
+async def start_server(model_path: str, port: int, args: dict, log_path: Path) -> bool:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "ab") as log_file:
+        await asyncio.create_subprocess_exec(*build_launch_command(model_path, port, args), stdout=log_file,
+            stderr=asyncio.subprocess.STDOUT, stdin=asyncio.subprocess.DEVNULL, start_new_session=True)
+    return await wait_ready(port)

@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import httpx
+from deep_research.tools.llama_server import build_launch_command as _build_launch_command, is_healthy, wait_ready
 
 HEALTH_POLL_INTERVAL_SECONDS = 2
 HEALTH_POLL_MAX_ATTEMPTS = 30
@@ -26,43 +27,7 @@ def logs_dir() -> Path:
 
 
 def build_launch_command(model: dict) -> list[str]:
-    args = json.loads(model["server_args_json"])
-    cmd = [
-        args.get("llama_server_bin", "llama-server"),
-        "-m", model["model_path"],
-        "--host", "127.0.0.1", "--port", str(model["port"]),
-        "-ngl", str(args.get("gpu_layers", 99)),
-        "-c", str(args.get("context", 32768)),
-        "-b", str(args.get("batch", 4096)),
-        "-ub", str(args.get("ubatch", 512)),
-        "--parallel", str(args.get("parallel", 2)),
-    ]
-    if args.get("flash_attn", True):
-        cmd += ["-fa", "on"]
-    if args.get("tensor_split"):
-        cmd += ["-ts", args["tensor_split"]]
-    if args.get("devices"):
-        cmd += ["-dev", args["devices"]]
-    if args.get("split_mode"):
-        cmd += ["-sm", args["split_mode"]]
-    return cmd
-
-
-async def is_healthy(port: int) -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            resp = await client.get(f"http://127.0.0.1:{port}/health")
-            return resp.status_code == 200 and resp.json().get("status") == "ok"
-    except httpx.HTTPError:
-        return False
-
-
-async def wait_ready(port: int) -> bool:
-    for _ in range(HEALTH_POLL_MAX_ATTEMPTS):
-        if await is_healthy(port):
-            return True
-        await asyncio.sleep(HEALTH_POLL_INTERVAL_SECONDS)
-    return False
+    return _build_launch_command(model["model_path"], model["port"], json.loads(model["server_args_json"]))
 
 
 async def start_server(model: dict) -> tuple[bool, Path]:

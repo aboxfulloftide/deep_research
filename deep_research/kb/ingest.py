@@ -111,6 +111,7 @@ async def ingest_web_page(
     kb_db: KBDatabase,
     snapshot_store: SnapshotStore,
     trust_tier_code: str | None = None,
+    source_purpose: str = "user_added",
 ) -> IngestResult:
     normalized = normalize_url(url)
     canonical_key = canonical_key_for_url(url)
@@ -121,6 +122,7 @@ async def ingest_web_page(
         canonical_uri=normalized,
         canonical_key=canonical_key,
         trust_tier_code=trust_tier_code,
+        source_purpose=source_purpose,
     )
     source_id = source["id"]
 
@@ -192,6 +194,7 @@ async def ingest_youtube_video(
     kb_db: KBDatabase,
     snapshot_store: SnapshotStore,
     trust_tier_code: str | None = None,
+    source_purpose: str = "user_added",
 ) -> IngestResult:
     video_id = youtube_video_id_from_url(url_or_id)
     if video_id is None:
@@ -223,6 +226,7 @@ async def ingest_youtube_video(
         title=title,
         author=author,
         trust_tier_code=trust_tier_code,
+        source_purpose=source_purpose,
     )
     source_id = source["id"]
 

@@ -22,6 +22,7 @@ import re
 
 from deep_research.config import Config, LLMConfig
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.decision_log import record_decision
 from deep_research.kb.extraction import detect_model
 from deep_research.llm import LLMClient
 
@@ -62,7 +63,9 @@ async def classify_claim_is_ad(llm: LLMClient, claim_text: str) -> dict:
     ]
     resp = await llm.chat(messages)
     content = resp["choices"][0]["message"]["content"] or ""
-    return _parse_ad_check(content)
+    parsed = _parse_ad_check(content)
+    parsed["_parse_success"] = parsed.get("reasoning") != "could not parse model output"
+    return parsed
 
 
 async def check_claims_for_ads(kb_db: KBDatabase, config: Config, claim_ids: list[str]) -> list[str]:
@@ -94,7 +97,18 @@ async def check_claims_for_ads(kb_db: KBDatabase, config: Config, claim_ids: lis
                 verdict = await classify_claim_is_ad(llm, claim["canonical_text"])
             except Exception:
                 continue
-            if verdict.get("is_ad") and (verdict.get("confidence") or 0.0) >= AD_CHECK_CONFIDENCE_THRESHOLD:
+            confidence = verdict.get("confidence") or 0.0
+            will_exclude = bool(verdict.get("is_ad")) and confidence >= AD_CHECK_CONFIDENCE_THRESHOLD
+            await record_decision(
+                kb_db, "ad_check", "claim", claim_id,
+                "excluded_as_ad" if will_exclude else "left_eligible",
+                confidence=confidence, reasoning=verdict.get("reasoning"), model=extraction_model,
+                parse_success=bool(verdict.get("_parse_success", True)),
+                previous_state={"verification_override": claim.get("verification_override")},
+                resulting_state={"verification_override": "exclude" if will_exclude else claim.get("verification_override")},
+                reversible=will_exclude,
+            )
+            if will_exclude:
                 await kb_db.set_claim_verification_override(claim_id, "exclude")
                 flagged.append(claim_id)
     finally:

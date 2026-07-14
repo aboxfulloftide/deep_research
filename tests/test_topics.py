@@ -56,13 +56,31 @@ async def test_suggest_claims_and_sources_keeps_relevant_claim(kb_db, monkeypatc
     claim, _ = await kb_db.get_or_create_claim("fact", "Nvidia GPUs power most modern data centers.")
 
     async def fake_classify(llm, topic_name, topic_description, claim_text, matched_names):
-        return {"relationship": "relevant", "confidence": 0.95, "reasoning": "test"}
+        return {"relationship": "relevant", "confidence": 0.8, "reasoning": "test"}
 
     monkeypatch.setattr(tp, "_classify_claim_topic_relevance", fake_classify)
 
     result = await tp._suggest_claims_and_sources(kb_db, topic["id"], [(claim, 1.0, ["nvidia"])], llm=object())
 
     assert result.claims_suggested == 1
+
+
+async def test_suggest_claims_and_sources_auto_attaches_high_confidence_relevance(kb_db, monkeypatch):
+    topic = await kb_db.create_topic("Nvidia")
+    claim, _ = await kb_db.get_or_create_claim("fact", "Nvidia announced a new product.")
+
+    async def fake_classify(*args, **kwargs):
+        return {"relationship": "relevant", "confidence": 0.95, "reasoning": "Directly about the topic."}
+
+    monkeypatch.setattr(tp, "_classify_claim_topic_relevance", fake_classify)
+    result = await tp._suggest_claims_and_sources(kb_db, topic["id"], [(claim, 1.0, ["nvidia"])], llm=object())
+
+    assert result.claims_auto_attached == 1
+    assert result.claims_suggested == 0
+    assert [row["id"] for row in await kb_db.list_topic_claims(topic["id"])] == [claim["id"]]
+    decisions = await kb_db.list_decisions(subject_type="claim", subject_id=claim["id"])
+    assert decisions[0]["decision_type"] == "topic_auto_attach"
+    assert decisions[0]["reversible"] is True
 
 
 async def test_suggest_claims_and_sources_keeps_claim_on_low_confidence_not_relevant(kb_db, monkeypatch):

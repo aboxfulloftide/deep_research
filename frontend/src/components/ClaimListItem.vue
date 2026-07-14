@@ -18,6 +18,7 @@ const localClaim = ref({ ...props.claim })
 
 const expanded = ref(false)
 const detail = ref(null)
+const decisions = ref([])
 const verifying = ref(false)
 const verifyForce = ref(false)
 const reviewingCandidateId = ref(null)
@@ -25,6 +26,7 @@ const togglingCheck = ref(false)
 const contextDraft = ref(props.claim.verification_context || '')
 const savingContext = ref(false)
 const editingContext = ref(false)
+const findingCounter = ref(false)
 
 const statusColors = {
   unverified: 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300',
@@ -70,16 +72,22 @@ function isLocked() {
 async function toggleExpand() {
   expanded.value = !expanded.value
   if (expanded.value && !detail.value) {
-    detail.value = await api.fetchClaim(localClaim.value.id)
+    const [claimDetail, decisionData] = await Promise.all([
+      api.fetchClaim(localClaim.value.id), api.fetchClaimDecisions(localClaim.value.id),
+    ])
+    detail.value = claimDetail
+    decisions.value = decisionData.decisions || []
   }
 }
 
 async function runVerify() {
   verifying.value = true
   try {
-    const data = await api.verifyClaim(localClaim.value.id, verifyForce.value)
-    localClaim.value = { ...localClaim.value, status: data.result.status }
-    detail.value = await api.fetchClaim(localClaim.value.id)
+    await api.verifyClaim(localClaim.value.id, verifyForce.value)
+    // Verification is queued so it shares the global worker with source
+    // processing. Refresh the expanded detail on the next visit/poll rather
+    // than pretending an immediate verdict exists.
+    detail.value = null
   } finally {
     verifying.value = false
   }
@@ -129,6 +137,16 @@ async function resetCheckOverride() {
     localClaim.value = { ...localClaim.value, ...data.claim }
   } finally {
     togglingCheck.value = false
+  }
+}
+
+async function runCounterEvidence() {
+  findingCounter.value = true
+  try {
+    await api.findCounterEvidence(localClaim.value.id)
+    detail.value = null
+  } finally {
+    findingCounter.value = false
   }
 }
 </script>
@@ -240,6 +258,16 @@ async function resetCheckOverride() {
           </div>
         </div>
 
+        <details v-if="decisions.length" class="mb-3 text-xs">
+          <summary class="cursor-pointer text-gray-500 dark:text-gray-400">Automation history ({{ decisions.length }})</summary>
+          <div class="mt-1.5 space-y-1.5">
+            <div v-for="decision in decisions" :key="decision.id" class="rounded bg-gray-50 dark:bg-gray-900 px-2 py-1.5">
+              <p class="font-medium text-gray-700 dark:text-gray-300">{{ decision.decision }}</p>
+              <p v-if="decision.reasoning" class="text-gray-500 dark:text-gray-400">{{ decision.reasoning }}</p>
+            </div>
+          </div>
+        </details>
+
         <div class="flex items-center gap-2 mb-3">
           <button
             @click="runVerify"
@@ -253,6 +281,15 @@ async function resetCheckOverride() {
             <input type="checkbox" v-model="verifyForce" class="accent-blue-600" />
             Force re-verify
           </label>
+          <button
+            v-if="localClaim.status === 'supported'"
+            @click="runCounterEvidence"
+            :disabled="findingCounter"
+            class="text-xs text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50"
+            title="Find a bounded counter-view for balance; this never changes the verdict"
+          >
+            {{ findingCounter ? 'Searching...' : 'Find counter-view' }}
+          </button>
         </div>
 
         <template v-if="detail.contradicting_claims?.length">
@@ -303,6 +340,18 @@ async function resetCheckOverride() {
                   </button>
                 </template>
               </div>
+            </div>
+          </div>
+        </template>
+
+        <template v-if="detail.counter_claims?.length">
+          <p class="text-xs font-semibold text-blue-600 dark:text-blue-400 mb-1 flex items-center gap-1">
+            <ThumbsDown class="w-3.5 h-3.5" /> Counter-view (for balance)
+          </p>
+          <div class="space-y-2 mb-3">
+            <div v-for="cc in detail.counter_claims" :key="cc.candidate_id" class="text-xs border-l-2 border-blue-300 dark:border-blue-700 pl-2">
+              <p class="text-gray-700 dark:text-gray-300">{{ cc.canonical_text }}</p>
+              <p v-if="cc.reason" class="text-gray-500 dark:text-gray-400 italic">{{ cc.reason }}</p>
             </div>
           </div>
         </template>

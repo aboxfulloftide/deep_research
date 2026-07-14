@@ -7,34 +7,28 @@ the web layer as they already are in storage (SQLite sessions vs. Postgres
 KB). init_kb() is called from app.py's lifespan to share one KBDatabase pool.
 """
 
-import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pgvector import Vector
 from pydantic import BaseModel
 
 from deep_research.config import Config
-from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.conversation import get_topic_conversation_transcript
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.decision_log import record_decision, record_undo
 from deep_research.kb.embeddings import backfill_embeddings, embed_texts
-from deep_research.kb.extraction import run_extraction
 from deep_research.kb.ingest import ingest_file, ingest_pasted_text, ingest_web_page, ingest_youtube_video
+from deep_research.kb.jobs import ProcessingJobWorker, enqueue_manual_job, enqueue_playlist_poll, enqueue_source_pipeline
 from deep_research.kb.merge import review_and_execute
+from deep_research.kb.playlists import track_youtube_playlist
 from deep_research.kb.reports import generate_topic_report
-from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
 from deep_research.kb.timeline import get_topic_timeline
-from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
-from deep_research.kb.trust import set_trust_tier_if_missing
+from deep_research.kb.topics import generate_topic_suggestions
 from deep_research.kb.verification import (
     claim_check_status,
-    is_claim_eligible_for_verification,
-    run_verification_sweep,
-    verify_claim,
-    verify_claims_concurrently,
 )
 
 router = APIRouter(prefix="/api/kb")
@@ -42,6 +36,7 @@ router = APIRouter(prefix="/api/kb")
 config: Config | None = None
 kb_db: KBDatabase | None = None
 snapshot_store: SnapshotStore | None = None
+processing_worker: ProcessingJobWorker | None = None
 
 
 async def init_kb(cfg: Config):
@@ -49,18 +44,24 @@ async def init_kb(cfg: Config):
     configured. A missing KB means /api/kb/* routes fail per-request instead
     of the whole app failing to boot, and the research agent's kb_search
     tool/prioritize_kb toggle are simply unavailable rather than fatal."""
-    global config, kb_db, snapshot_store
+    global config, kb_db, snapshot_store, processing_worker
     config = cfg
     try:
         kb_db = KBDatabase(cfg.kb.postgres_dsn)
         await kb_db.init()
         snapshot_store = SnapshotStore(cfg.kb_snapshot_dir)
+        processing_worker = ProcessingJobWorker(kb_db, cfg, snapshot_store)
+        await processing_worker.start()
     except Exception as e:
         print(f"Local knowledge base unavailable ({e}); /api/kb/* routes and kb_search will not work.")
         kb_db = None
 
 
 async def close_kb():
+    global processing_worker
+    if processing_worker is not None:
+        await processing_worker.stop()
+        processing_worker = None
     if kb_db is not None:
         await kb_db.close()
 
@@ -114,6 +115,24 @@ class IngestUrlRequest(BaseModel):
 class IngestYoutubeRequest(BaseModel):
     url: str
     trust_tier: str | None = None
+
+
+class TrackPlaylistRequest(BaseModel):
+    url: str
+    trust_tier: str | None = None
+
+
+async def _queue_topic_source(topic: dict, result, threshold: float | None = None) -> dict:
+    """Attach an ingested source and enqueue its complete topic pipeline."""
+    if result.status == "failed" or not result.source_id or not result.version_id:
+        raise HTTPException(400, result.error or "Ingestion failed")
+    # This initial link keeps the source visible immediately. The pipeline
+    # repeats it after promotion, when there are claims to attach as well.
+    await kb_db.attach_source_to_topic(topic["id"], result.source_id, link_reason="topic_intake")
+    job, _ = await enqueue_source_pipeline(
+        kb_db, result.source_id, result.version_id, topic_id=topic["id"], threshold=threshold,
+    )
+    return {"result": asdict(result), "topic_id": topic["id"], "job": _serialize(job)}
 
 
 class IngestConversationRequest(BaseModel):
@@ -287,7 +306,11 @@ async def review_claim(topic_id: str, claim_id: str, req: ReviewRequest):
 async def backfill(topic_id: str):
     topic = await _get_topic_or_404(topic_id)
     result = await generate_topic_suggestions(kb_db, config, topic["id"])
-    return {"claims_suggested": result.claims_suggested, "sources_suggested": result.sources_suggested}
+    return {
+        "claims_suggested": result.claims_suggested, "sources_suggested": result.sources_suggested,
+        "claims_auto_attached": result.claims_auto_attached,
+        "sources_auto_attached": result.sources_auto_attached,
+    }
 
 
 @router.get("/topics/{topic_id}/report")
@@ -337,8 +360,13 @@ async def get_claim(claim_id: str):
     evidence = await kb_db.list_claim_evidence(claim_id)
 
     contradictions = await kb_db.get_claim_contradictions(claim_id)
-    supporting_ids = ((claim.get("verification_notes") or {}).get("supporting_claim_ids")) or []
-    related_ids = list({c["other_claim_id"] for c in contradictions} | set(supporting_ids))
+    counter_evidence = await kb_db.get_claim_counter_evidence(claim_id)
+    # New verification runs persist this as first-class evidence. Keep the
+    # JSON fallback for reports created before the migration.
+    supporting_ids = await kb_db.get_claim_support_ids(claim_id)
+    if not supporting_ids:
+        supporting_ids = ((claim.get("verification_notes") or {}).get("supporting_claim_ids")) or []
+    related_ids = list({c["other_claim_id"] for c in contradictions + counter_evidence} | set(supporting_ids))
     claims_by_id = await kb_db.get_claims_bulk(related_ids)
     evidence_by_claim = await kb_db.get_claims_evidence_bulk(related_ids)
 
@@ -357,13 +385,37 @@ async def get_claim(claim_id: str):
     supporting_claims = [
         c for c in (_enrich_related_claim(i, claims_by_id, evidence_by_claim) for i in supporting_ids) if c
     ]
+    counter_claims = []
+    for c in counter_evidence:
+        enriched = _enrich_related_claim(c["other_claim_id"], claims_by_id, evidence_by_claim)
+        if enriched:
+            counter_claims.append({**enriched, "candidate_id": c["candidate_id"], "reason": c["reason"], "score": c["score"]})
 
     return {
         "claim": _serialize(claim),
         "evidence": _serialize(evidence),
         "supporting_claims": _serialize(supporting_claims),
         "contradicting_claims": _serialize(contradicting_claims),
+        "counter_claims": _serialize(counter_claims),
     }
+
+
+@router.get("/claims/{claim_id}/decisions")
+async def get_claim_decisions(claim_id: str, limit: int = 50):
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(404, "Claim not found")
+    decisions = await kb_db.list_decisions(subject_type="claim", subject_id=claim_id, limit=limit)
+    return {"decisions": _serialize(decisions)}
+
+
+@router.post("/claims/{claim_id}/counter-evidence")
+async def find_counter_evidence(claim_id: str, force: bool = False):
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(404, "Claim not found")
+    job = await enqueue_manual_job(kb_db, "counter_evidence", "claim", claim_id, payload={"force": force})
+    return {"job": _serialize(job)}
 
 
 @router.put("/claims/{claim_id}/preferred-source")
@@ -373,6 +425,15 @@ async def set_preferred_source(claim_id: str, req: PreferredSourceRequest):
         raise HTTPException(404, "Claim not found")
     updated = await kb_db.set_preferred_source_manual(claim_id, req.source_id, reviewed_by="web_ui")
     return {"claim": _serialize(updated)}
+
+
+@router.delete("/claims/{claim_id}/preferred-source")
+async def reset_preferred_source(claim_id: str):
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(404, "Claim not found")
+    updated = await kb_db.reset_preferred_source_automatic(claim_id)
+    return {"claim": _serialize(updated or await kb_db.get_claim(claim_id))}
 
 
 @router.put("/claims/{claim_id}/verification-override")
@@ -388,6 +449,23 @@ async def set_claim_verification_override(claim_id: str, req: VerificationOverri
     if req.override not in (None, "include", "exclude"):
         raise HTTPException(400, "override must be 'include', 'exclude', or null")
     updated = await kb_db.set_claim_verification_override(claim_id, req.override)
+    if claim.get("verification_override") == "exclude" and req.override is None:
+        decisions = await kb_db.list_decisions(
+            decision_type="ad_check", subject_type="claim", subject_id=claim_id, limit=100,
+        )
+        original = next((d for d in decisions if d["decision"] == "excluded_as_ad" and d["reversible"]), None)
+        if original:
+            await record_undo(
+                kb_db, original["id"], "ad_check_restore", "claim", claim_id, "restored_to_automatic",
+                previous_state={"verification_override": "exclude"},
+                resulting_state={"verification_override": None}, reversible=False,
+            )
+        else:
+            await record_decision(
+                kb_db, "verification_override_reset", "claim", claim_id, "restored_to_automatic",
+                previous_state={"verification_override": "exclude"},
+                resulting_state={"verification_override": None}, reversible=False,
+            )
     return {"claim": _serialize({**updated, "check_status": claim_check_status(
         updated, config.kb.verification_importance_threshold,
     )})}
@@ -486,13 +564,29 @@ async def review_candidate(candidate_id: str, req: ReviewCandidateRequest):
     }
 
 
+@router.post("/resolution-candidates/{candidate_id}/triage")
+async def triage_candidate(candidate_id: str):
+    candidate = await kb_db.get_resolution_candidate(candidate_id)
+    if candidate is None or candidate["candidate_type"] != "claim_contradiction":
+        raise HTTPException(404, "Contradiction candidate not found")
+    job = await enqueue_manual_job(
+        kb_db, "contradiction_triage", "resolution_candidate", candidate_id,
+    )
+    return {"job": _serialize(job)}
+
+
 @router.get("/sources")
-async def search_sources(q: str = "", limit: int = 50, include_conversations: bool = False):
+async def search_sources(
+    q: str = "", limit: int = 50, include_conversations: bool = False, include_archived: bool = False,
+    include_evidence: bool = False,
+):
     """A pasted conversation's underlying 'conversation' source is pipeline
     plumbing (it needs a source to hang chunks/extraction/evidence off of),
     not something meant to be browsed here -- the topic it's attached to is
     the actual thing to look at, so these are hidden by default."""
-    sources = await kb_db.list_sources(limit=500)
+    sources = await kb_db.list_sources(
+        limit=500, include_inactive=include_archived, include_evidence=include_evidence,
+    )
     if not include_conversations:
         sources = [s for s in sources if s.get("source_type_code") != "conversation"]
     if q:
@@ -509,17 +603,59 @@ async def search_sources(q: str = "", limit: int = 50, include_conversations: bo
 @router.post("/sources/ingest-url")
 async def ingest_url_route(req: IngestUrlRequest):
     result = await ingest_web_page(req.url, config, kb_db, snapshot_store, trust_tier_code=req.trust_tier)
-    if result.status != "failed" and result.source_id:
-        await set_trust_tier_if_missing(kb_db, config, result.source_id)
-    return {"result": asdict(result)}
+    job = None
+    if result.status != "failed" and result.source_id and result.version_id:
+        job, _ = await enqueue_source_pipeline(kb_db, result.source_id, result.version_id)
+    return {"result": asdict(result), "job": _serialize(job) if job else None}
 
 
 @router.post("/sources/ingest-youtube")
 async def ingest_youtube_route(req: IngestYoutubeRequest):
     result = await ingest_youtube_video(req.url, kb_db, snapshot_store, trust_tier_code=req.trust_tier)
-    if result.status != "failed" and result.source_id:
-        await set_trust_tier_if_missing(kb_db, config, result.source_id)
-    return {"result": asdict(result)}
+    job = None
+    if result.status != "failed" and result.source_id and result.version_id:
+        job, _ = await enqueue_source_pipeline(kb_db, result.source_id, result.version_id)
+    return {"result": asdict(result), "job": _serialize(job) if job else None}
+
+
+@router.post("/playlists")
+async def track_playlist(req: TrackPlaylistRequest):
+    playlist, created = await track_youtube_playlist(kb_db, req.url, req.trust_tier)
+    job, _ = await enqueue_playlist_poll(kb_db, playlist["id"])
+    return {"playlist": _serialize(playlist), "created": created, "job": _serialize(job)}
+
+
+@router.get("/playlists")
+async def list_playlists():
+    return {"playlists": _serialize(await kb_db.list_tracked_playlists())}
+
+
+@router.get("/playlists/{playlist_id}/videos")
+async def list_playlist_videos(playlist_id: str):
+    return {"videos": _serialize(await kb_db.list_playlist_videos(playlist_id))}
+
+
+@router.get("/topic-discovery-proposals")
+async def list_topic_discovery_proposals(status: str = "open"):
+    return {"proposals": _serialize(await kb_db.list_topic_discovery_proposals(status))}
+
+
+@router.post("/topic-discovery-proposals/run")
+async def run_topic_discovery():
+    job, _ = await kb_db.enqueue_processing_job(
+        "topic_discovery", "knowledge_base", "default", idempotency_key="topic_discovery:default",
+        priority=-100, is_speculative=True,
+    )
+    return {"job": _serialize(job)}
+
+
+@router.post("/topic-discovery-proposals/{proposal_id}/review")
+async def review_topic_discovery_proposal(proposal_id: str, req: ReviewCandidateRequest):
+    try:
+        proposal = await kb_db.review_topic_discovery_proposal(proposal_id, req.decision)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    return {"proposal": _serialize(proposal)}
 
 
 @router.post("/sources/ingest-file")
@@ -532,62 +668,44 @@ async def ingest_file_route(file: UploadFile = File(...), trust_tier: str | None
     CLI's ingest-file semantics for a stable local path."""
     uploads_dir = Path("~/.local/share/deep_research/kb_uploads").expanduser()
     uploads_dir.mkdir(parents=True, exist_ok=True)
-    dest = uploads_dir / file.filename
+    dest = uploads_dir / Path(file.filename or "upload").name
     dest.write_bytes(await file.read())
     result = await ingest_file(dest, kb_db, snapshot_store, trust_tier_code=trust_tier)
-    if result.status != "failed" and result.source_id:
-        await set_trust_tier_if_missing(kb_db, config, result.source_id)
-    return {"result": asdict(result)}
+    job = None
+    if result.status != "failed" and result.source_id and result.version_id:
+        job, _ = await enqueue_source_pipeline(kb_db, result.source_id, result.version_id)
+    return {"result": asdict(result), "job": _serialize(job) if job else None}
 
 
-_processing_source_ids: set[str] = set()
+@router.post("/topics/{topic_id}/ingest-url")
+async def ingest_topic_url_route(topic_id: str, req: IngestUrlRequest):
+    topic = await _get_topic_or_404(topic_id)
+    result = await ingest_web_page(req.url, config, kb_db, snapshot_store, trust_tier_code=req.trust_tier)
+    return await _queue_topic_source(topic, result)
 
 
-async def _process_conversation_source(source_id: str, threshold: float | None, topic_id: str | None) -> None:
-    """Runs chunk -> extract -> resolve/promote -> verify in the background
-    after a conversation's fast synchronous ingest step returns, so the web
-    request doesn't block for however long verification takes (minutes, per
-    HARDWARE.md's timing measurements) -- the client gets the source_id back
-    immediately and can navigate to the Source Detail page right away, which
-    polls /processing to show that work is still happening. Runs to
-    completion regardless of whether the client is still around to see it;
-    an in-memory set (not a DB row) is enough tracking since this is a
-    single-worker dev server, not a durably-scheduled job like the nightly
-    verification sweep."""
-    _processing_source_ids.add(source_id)
-    try:
-        source = await kb_db.get_source(source_id)
-        version = await kb_db.get_latest_version(source_id)
-        chunk_result = await build_artifact_for_version(kb_db, snapshot_store, source, version, config=config)
-        if chunk_result.chunk_count == 0:
-            return
+@router.post("/topics/{topic_id}/ingest-youtube")
+async def ingest_topic_youtube_route(topic_id: str, req: IngestYoutubeRequest):
+    topic = await _get_topic_or_404(topic_id)
+    result = await ingest_youtube_video(req.url, kb_db, snapshot_store, trust_tier_code=req.trust_tier)
+    return await _queue_topic_source(topic, result)
 
-        artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
-        extraction_result = await run_extraction(kb_db, config, artifacts[0]["id"])
-        if extraction_result.observation_count == 0:
-            return
 
-        promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
-        await check_claims_against_topics(kb_db, config, promotion.new_claim_ids)
-        if topic_id is not None:
-            # attach_source_to_topic was already called once at ingest time
-            # (before any claims existed, just to link the topic<->source);
-            # calling it again now sweeps the claims resolve_and_promote just
-            # created into the topic as 'attached', not merely 'suggested' --
-            # the whole point of grouping a pasted conversation under a topic
-            # is to see its claims there without a manual review step.
-            await kb_db.attach_source_to_topic(topic_id, source_id, link_reason="conversation_paste")
-
-        claims = await kb_db.list_claims_for_source(source_id, limit=500)
-        eff_threshold = threshold if threshold is not None else config.kb.verification_importance_threshold
-        eligible = [c for c in claims if is_claim_eligible_for_verification(c, eff_threshold)]
-        await verify_claims_concurrently(kb_db, config, eligible)
-    finally:
-        _processing_source_ids.discard(source_id)
+@router.post("/topics/{topic_id}/ingest-file")
+async def ingest_topic_file_route(
+    topic_id: str, file: UploadFile = File(...), trust_tier: str | None = Form(None),
+):
+    topic = await _get_topic_or_404(topic_id)
+    uploads_dir = Path("~/.local/share/deep_research/kb_uploads").expanduser()
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    dest = uploads_dir / Path(file.filename or "upload").name
+    dest.write_bytes(await file.read())
+    result = await ingest_file(dest, kb_db, snapshot_store, trust_tier_code=trust_tier)
+    return await _queue_topic_source(topic, result)
 
 
 @router.post("/sources/ingest-conversation")
-async def ingest_conversation_route(req: IngestConversationRequest, background_tasks: BackgroundTasks):
+async def ingest_conversation_route(req: IngestConversationRequest):
     """Paste a chat conversation, get claims extracted (tagged with who said
     them) and verified against independent sources, grouped under a topic so
     there's context beyond a flat claims list -- a pasted conversation is
@@ -595,13 +713,10 @@ async def ingest_conversation_route(req: IngestConversationRequest, background_t
     own title if not given), reusing an existing topic with the same name if
     one exists so multiple related pastes can be grouped together. Only the
     ingest step (writing the text as a source) happens synchronously --
-    chunk/extract/verify can take minutes, so they run as a background task
-    instead of blocking the request; the client gets source_id/topic_id back
-    immediately and should navigate to the Topic Detail page, which shows
-    live progress via GET .../processing rather than leaving the Sources
-    page looking frozen with no way to tell whether it's working or whether
-    leaving would lose the result (it doesn't -- this keeps running
-    server-side either way)."""
+    chunk/extract/verify can take minutes, so they are queued durably instead
+    of blocking the request. The client gets source_id/topic_id/job back
+    immediately; processing continues across browser disconnects and server
+    restarts."""
     ingest_result = await ingest_pasted_text(
         req.text, kb_db, snapshot_store, title=req.title, trust_tier_code=req.trust_tier,
     )
@@ -613,47 +728,54 @@ async def ingest_conversation_route(req: IngestConversationRequest, background_t
     topic, _ = await kb_db.get_or_create_topic(topic_name, topic_type="conversation")
     await kb_db.attach_source_to_topic(topic["id"], ingest_result.source_id, link_reason="conversation_paste")
 
-    background_tasks.add_task(
-        _process_conversation_source, ingest_result.source_id, req.threshold, topic["id"],
+    job, _ = await enqueue_source_pipeline(
+        kb_db, ingest_result.source_id, ingest_result.version_id,
+        topic_id=topic["id"], threshold=req.threshold,
     )
-    return {"source_id": ingest_result.source_id, "topic_id": topic["id"], "status": "processing"}
+    return {
+        "source_id": ingest_result.source_id,
+        "topic_id": topic["id"],
+        "status": job["status"],
+        "job": _serialize(job),
+    }
 
 
 @router.get("/sources/{source_id}/processing")
 async def get_source_processing_status(source_id: str):
-    return {"processing": source_id in _processing_source_ids}
+    jobs = await kb_db.list_processing_jobs(source_id=source_id, limit=10)
+    active = next((job for job in jobs if job["status"] in ("queued", "running")), None)
+    return {"processing": active is not None, "job": _serialize(active or jobs[0]) if jobs else None}
 
 
-_processing_topic_ids: set[str] = set()
+@router.post("/processing-jobs/{job_id}/cancel")
+async def cancel_processing_job(job_id: str):
+    job = await kb_db.request_processing_job_cancel(job_id)
+    if job is None:
+        raise HTTPException(404, "Processing job is not active")
+    return {"job": _serialize(job)}
 
 
-async def _process_topic_verification(topic_id: str, threshold: float | None) -> None:
-    """Verifies whatever's currently eligible among a topic's attached
-    claims -- the manual trigger for claims a human just flagged (or
-    unflagged) via verification_override, so they don't have to wait for the
-    nightly sweep to pick it up."""
-    _processing_topic_ids.add(topic_id)
+@router.post("/processing-jobs/{job_id}/retry")
+async def retry_processing_job(job_id: str):
     try:
-        claims = await kb_db.list_topic_claims(topic_id, link_status="attached")
-        eff_threshold = threshold if threshold is not None else config.kb.verification_importance_threshold
-        eligible = [c for c in claims if is_claim_eligible_for_verification(c, eff_threshold)]
-        await verify_claims_concurrently(kb_db, config, eligible)
-    finally:
-        _processing_topic_ids.discard(topic_id)
+        job = await kb_db.retry_processing_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"job": _serialize(job)}
 
 
 @router.post("/topics/{topic_id}/verify")
-async def trigger_topic_verification(topic_id: str, background_tasks: BackgroundTasks):
+async def trigger_topic_verification(topic_id: str):
     topic = await _get_topic_or_404(topic_id)
-    if topic["id"] in _processing_topic_ids:
-        raise HTTPException(409, "Already verifying this topic's claims")
-    background_tasks.add_task(_process_topic_verification, topic["id"], None)
-    return {"status": "processing"}
+    job = await enqueue_manual_job(kb_db, "topic_verify", "topic", topic["id"], topic_id=topic["id"])
+    return {"status": "queued", "job": _serialize(job)}
 
 
 @router.get("/topics/{topic_id}/processing")
 async def get_topic_processing_status(topic_id: str):
-    return {"processing": topic_id in _processing_topic_ids}
+    jobs = await kb_db.list_processing_jobs(topic_id=topic_id, limit=10)
+    active = next((job for job in jobs if job["status"] in ("queued", "running")), None)
+    return {"processing": active is not None, "job": _serialize(active or jobs[0]) if jobs else None}
 
 
 async def _resolve_source_or_404(source_id: str) -> dict:
@@ -678,16 +800,88 @@ async def get_source_detail(source_id: str):
     }
 
 
+@router.get("/sources/{source_id}/decisions")
+async def get_source_decisions(source_id: str, limit: int = 50):
+    source = await _resolve_source_or_404(source_id)
+    decisions = await kb_db.list_decisions(subject_type="source", subject_id=source["id"], limit=limit)
+    return {"decisions": _serialize(decisions)}
+
+
+@router.post("/sources/{source_id}/trust-tier/reset")
+async def reset_source_trust_tier(source_id: str):
+    source = await _resolve_source_or_404(source_id)
+    previous_tier = source.get("trust_tier_code")
+    if previous_tier is None:
+        return {"source": _serialize(source), "decision": None}
+    await kb_db.set_source_trust_tier(source["id"], None)
+    decisions = await kb_db.list_decisions(
+        decision_type="trust_tier", subject_type="source", subject_id=source["id"], limit=100,
+    )
+    original = next(
+        (d for d in decisions if (d.get("resulting_state") or {}).get("trust_tier_code") == previous_tier and d["reversible"]),
+        None,
+    )
+    if original:
+        decision = await record_undo(
+            kb_db, original["id"], "trust_tier_reset", "source", source["id"], "tier reset to automatic",
+            previous_state={"trust_tier_code": previous_tier}, resulting_state={"trust_tier_code": None},
+            reversible=False,
+        )
+    else:
+        decision = await record_decision(
+            kb_db, "trust_tier_reset", "source", source["id"], "tier reset to automatic",
+            previous_state={"trust_tier_code": previous_tier}, resulting_state={"trust_tier_code": None},
+            reversible=False,
+        )
+    updated = await kb_db.get_source(source["id"])
+    return {"source": _serialize(updated), "decision": _serialize(decision)}
+
+
+@router.post("/sources/{source_id}/archive")
+async def archive_source(source_id: str):
+    source = await _resolve_source_or_404(source_id)
+    updated = await kb_db.set_source_active(source["id"], False)
+    decision = await record_decision(
+        kb_db, "source_archive", "source", source["id"], "archived",
+        previous_state={"is_active": True}, resulting_state={"is_active": False}, reversible=True,
+    )
+    return {"source": _serialize(updated), "decision": _serialize(decision)}
+
+
+@router.post("/sources/{source_id}/restore")
+async def restore_source(source_id: str):
+    source = await kb_db.get_source(source_id)
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    updated = await kb_db.set_source_active(source["id"], True)
+    decisions = await kb_db.list_decisions(
+        decision_type="source_archive", subject_type="source", subject_id=source["id"], limit=50,
+    )
+    original = next((decision for decision in decisions if decision["reversible"]), None)
+    if original:
+        decision = await record_undo(
+            kb_db, original["id"], "source_restore", "source", source["id"], "restored",
+            previous_state={"is_active": False}, resulting_state={"is_active": True}, reversible=False,
+        )
+    else:
+        decision = await record_decision(
+            kb_db, "source_restore", "source", source["id"], "restored",
+            previous_state={"is_active": False}, resulting_state={"is_active": True}, reversible=False,
+        )
+    return {"source": _serialize(updated), "decision": _serialize(decision)}
+
+
 @router.post("/sources/{source_id}/chunk")
 async def chunk_source_route(source_id: str, req: ChunkSourceRequest):
     source = await _resolve_source_or_404(source_id)
     version = await kb_db.get_latest_version(source["id"])
     if version is None:
         raise HTTPException(400, "No ingested version found for this source")
-    result = await build_artifact_for_version(
-        kb_db, snapshot_store, source, version, config=config, chunk_size=req.chunk_size,
+    job = await enqueue_manual_job(
+        kb_db, "source_pipeline", "source", source["id"], source_id=source["id"],
+        payload={"version_id": version["id"], "chunk_size": req.chunk_size},
     )
-    return {"result": asdict(result)}
+    return {"status": "queued", "job": _serialize(job)}
 
 
 @router.post("/sources/{source_id}/extract")
@@ -699,27 +893,11 @@ async def extract_source_route(source_id: str, req: ExtractSourceRequest):
     version = await kb_db.get_latest_version(source["id"])
     if version is None:
         raise HTTPException(400, "No ingested version found for this source")
-    artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
-    if not artifacts:
-        raise HTTPException(400, "No chunked artifact found — chunk this source first")
-
-    extraction_result = await run_extraction(kb_db, config, artifacts[0]["id"], force=req.force)
-    response = {"extraction": asdict(extraction_result)}
-    if extraction_result.status in ("extracted", "partial"):
-        promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
-        response["promotion"] = asdict(promotion)
-        topic_results = await check_claims_against_topics(kb_db, config, promotion.new_claim_ids)
-        suggestions = []
-        for topic_id, result in topic_results.items():
-            topic = await kb_db.get_topic(topic_id)
-            suggestions.append({
-                "topic_id": topic_id,
-                "topic_name": topic["name"] if topic else None,
-                "claims_suggested": result.claims_suggested,
-                "sources_suggested": result.sources_suggested,
-            })
-        response["topic_suggestions"] = suggestions
-    return response
+    job = await enqueue_manual_job(
+        kb_db, "source_pipeline", "source", source["id"], source_id=source["id"],
+        payload={"version_id": version["id"], "force_extract": req.force},
+    )
+    return {"status": "queued", "job": _serialize(job)}
 
 
 @router.get("/sources/{source_id}/claims")
@@ -740,19 +918,11 @@ async def verify_source_route(source_id: str, req: VerifySourceRequest):
     since verify_claims_concurrently reports it as a 'failed' result instead
     of raising."""
     source = await _resolve_source_or_404(source_id)
-    source_claims = await kb_db.list_claims_for_source(source["id"], limit=5000)
-
-    threshold = req.threshold if req.threshold is not None else config.kb.verification_importance_threshold
-    eligible = [c for c in source_claims if is_claim_eligible_for_verification(c, threshold, force=req.force)]
-
-    outcomes = await verify_claims_concurrently(kb_db, config, eligible, force=req.force)
-    results = []
-    for claim, status, result in outcomes:
-        if isinstance(result, Exception):
-            results.append({"canonical_text": claim["canonical_text"], "status": "failed", "error": str(result)})
-        else:
-            results.append({"canonical_text": claim["canonical_text"], **asdict(result)})
-    return {"verified_count": len(results), "results": results}
+    job = await enqueue_manual_job(
+        kb_db, "source_verify", "source", source["id"], source_id=source["id"],
+        payload={"verification_threshold": req.threshold, "force": req.force},
+    )
+    return {"status": "queued", "job": _serialize(job)}
 
 
 @router.get("/claims")
@@ -766,8 +936,10 @@ async def verify_claim_route(claim_id: str, req: VerifyClaimRequest):
     claim = await kb_db.get_claim(claim_id)
     if claim is None:
         raise HTTPException(404, "Claim not found")
-    result = await verify_claim(kb_db, config, claim_id, force=req.force)
-    return {"result": asdict(result)}
+    job = await enqueue_manual_job(
+        kb_db, "claim_verify", "claim", claim_id, payload={"force": req.force},
+    )
+    return {"status": "queued", "job": _serialize(job)}
 
 
 @router.get("/search")
@@ -803,18 +975,22 @@ async def get_current_verification_run_route():
     return {"run": _serialize(run)}
 
 
-async def _verification_sweep_task(threshold: float | None, force: bool):
-    await run_verification_sweep(kb_db, config, trigger="web", threshold=threshold, force=force)
-
-
 @router.post("/verification-runs/trigger")
-async def trigger_verification_run_route(req: TriggerVerificationRunRequest, background_tasks: BackgroundTasks):
+async def trigger_verification_run_route(req: TriggerVerificationRunRequest):
     """Lets a user kick off the same KB-wide sweep the nightly cron job runs,
     without needing the CLI. Only one sweep at a time -- verify_claim makes
     real LLM calls against the single local GPU, so stacking sweeps would
     just contend with itself for no benefit."""
-    current = await kb_db.get_current_verification_run()
-    if current is not None:
-        raise HTTPException(409, "A verification run is already in progress")
-    background_tasks.add_task(_verification_sweep_task, req.threshold, req.force)
-    return {"status": "started"}
+    job = await enqueue_manual_job(
+        kb_db, "verification_sweep", "knowledge_base", "default",
+        payload={"verification_threshold": req.threshold, "force": req.force},
+    )
+    return {"status": "queued", "job": _serialize(job)}
+
+
+@router.post("/ad-sweep")
+async def trigger_ad_sweep(limit: int = 10000):
+    job = await enqueue_manual_job(
+        kb_db, "ad_sweep", "knowledge_base", "default", payload={"limit": limit},
+    )
+    return {"status": "queued", "job": _serialize(job)}

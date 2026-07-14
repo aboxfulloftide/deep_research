@@ -20,7 +20,7 @@ data. Notable upgrades that came for free with the migration:
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
@@ -265,6 +265,7 @@ ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_override TEXT;
 -- _suggest_search_query and _classify_relationship. NULL means no added
 -- context, same default-off shape as verification_override.
 ALTER TABLE claims ADD COLUMN IF NOT EXISTS verification_context TEXT;
+ALTER TABLE claims ADD COLUMN IF NOT EXISTS counter_claim_checked_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_claims_merged_into ON claims(merged_into_claim_id);
 
 -- Step 8: same embedding column as artifact_chunks, same nullable-until-embedded
@@ -276,6 +277,19 @@ CREATE INDEX IF NOT EXISTS idx_claims_embedding
 
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
 CREATE INDEX IF NOT EXISTS idx_claims_event ON claims(event_id);
+
+-- First-class corroboration evidence. Verification notes retain their
+-- human-readable snapshot, while this relationship remains queryable when
+-- either claim is later displayed, merged, or reported on.
+CREATE TABLE IF NOT EXISTS claim_supports (
+    claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    supporting_claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (claim_id, supporting_claim_id),
+    CHECK (claim_id <> supporting_claim_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_supports_supporting ON claim_supports(supporting_claim_id);
 
 -- Provenance for one extraction pass over one artifact's current chunks.
 -- run_signature (model+prompt+schema hash) makes re-extraction idempotent: the
@@ -376,6 +390,10 @@ CREATE TABLE IF NOT EXISTS resolution_candidates (
 
 CREATE INDEX IF NOT EXISTS idx_resolution_candidates_type_status
     ON resolution_candidates(candidate_type, status);
+ALTER TABLE resolution_candidates ADD COLUMN IF NOT EXISTS triage_recommendation TEXT;
+ALTER TABLE resolution_candidates ADD COLUMN IF NOT EXISTS triage_reasoning TEXT;
+ALTER TABLE resolution_candidates ADD COLUMN IF NOT EXISTS triage_model TEXT;
+ALTER TABLE resolution_candidates ADD COLUMN IF NOT EXISTS triaged_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS metrics (
     id TEXT PRIMARY KEY,
@@ -492,6 +510,111 @@ CREATE TABLE IF NOT EXISTS verification_runs (
 ALTER TABLE verification_runs ADD COLUMN IF NOT EXISTS current_claim_texts JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_verification_runs_started ON verification_runs(started_at DESC);
+
+-- Durable work queue for the hands-off pipeline. `subject_*` deliberately
+-- stays polymorphic: a source-ingest job may exist before a `sources` row
+-- exists, while later stages can additionally point at a concrete source/topic.
+-- The worker leases jobs atomically; an expired lease is recoverable after a
+-- crash/reboot instead of becoming invisible process-local state.
+CREATE TABLE IF NOT EXISTS processing_jobs (
+    id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT,
+    source_id TEXT REFERENCES sources(id),
+    topic_id TEXT REFERENCES topics(id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'queued',
+    stage TEXT NOT NULL DEFAULT 'queued',
+    priority INTEGER NOT NULL DEFAULT 0,
+    is_speculative BOOLEAN NOT NULL DEFAULT FALSE,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    progress JSONB NOT NULL DEFAULT '{}'::jsonb,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+    leased_by TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_ready
+    ON processing_jobs(status, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_subject
+    ON processing_jobs(subject_type, subject_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_source ON processing_jobs(source_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_topic ON processing_jobs(topic_id, created_at DESC);
+
+-- Append-only explanation and reversal trail for every automated decision.
+-- A reversal is a new row linked through undo_of_decision_id, never an update
+-- to the original decision, so users can reconstruct what happened over time.
+CREATE TABLE IF NOT EXISTS decision_log (
+    id TEXT PRIMARY KEY,
+    decision_type TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    related_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    decision TEXT NOT NULL,
+    confidence DOUBLE PRECISION,
+    reasoning TEXT,
+    model TEXT,
+    parse_success BOOLEAN,
+    previous_state JSONB,
+    resulting_state JSONB,
+    reversible BOOLEAN NOT NULL DEFAULT FALSE,
+    undo_of_decision_id TEXT REFERENCES decision_log(id),
+    decided_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_log_subject
+    ON decision_log(subject_type, subject_id, decided_at DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_log_type ON decision_log(decision_type, decided_at DESC);
+CREATE INDEX IF NOT EXISTS idx_decision_log_undo ON decision_log(undo_of_decision_id);
+
+-- A source's role is separate from its content type. New interactive ingest
+-- defaults to user_added; later unattended discovery/evidence paths can set
+-- a more specific purpose without overloading source_types.
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS source_purpose TEXT NOT NULL DEFAULT 'user_added';
+
+-- Discovery mechanisms are not content sources. A playlist only discovers
+-- normal video sources, so it gets its own small tracking tables.
+CREATE TABLE IF NOT EXISTS tracked_playlists (
+    id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    playlist_id TEXT NOT NULL,
+    url TEXT NOT NULL UNIQUE,
+    title TEXT,
+    default_trust_tier_code TEXT REFERENCES trust_tiers(code),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL,
+    last_checked_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS playlist_videos (
+    tracked_playlist_id TEXT NOT NULL REFERENCES tracked_playlists(id) ON DELETE CASCADE,
+    video_id TEXT NOT NULL,
+    title TEXT,
+    discovered_at TIMESTAMPTZ NOT NULL,
+    source_id TEXT REFERENCES sources(id),
+    ingested_at TIMESTAMPTZ,
+    PRIMARY KEY (tracked_playlist_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_playlist_videos_pending ON playlist_videos(tracked_playlist_id, ingested_at);
+
+CREATE TABLE IF NOT EXISTS topic_discovery_proposals (
+    id TEXT PRIMARY KEY,
+    entity_id TEXT REFERENCES entities(id),
+    claim_ids JSONB NOT NULL,
+    suggested_name TEXT NOT NULL,
+    reasoning TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TIMESTAMPTZ NOT NULL,
+    reviewed_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_topic_discovery_proposals_open_entity
+    ON topic_discovery_proposals(entity_id) WHERE status = 'open';
 """
 
 SOURCE_TYPES = [
@@ -520,6 +643,10 @@ def _now() -> datetime:
 
 def _new_id() -> str:
     return str(uuid.uuid4())
+
+
+PROCESSING_JOB_STATUSES = frozenset({"queued", "running", "partial", "failed", "completed", "cancelled"})
+PROCESSING_JOB_TERMINAL_STATUSES = frozenset({"partial", "failed", "completed", "cancelled"})
 
 
 async def _register_jsonb_codec(conn: asyncpg.Connection) -> None:
@@ -609,6 +736,7 @@ class KBDatabase:
         published_at: str | None = None,
         trust_tier_code: str | None = None,
         language_code: str | None = None,
+        source_purpose: str = "user_added",
     ) -> tuple[dict, bool]:
         """Returns (source_row, created). Dedupes on canonical_key."""
         existing = await self.get_source_by_canonical_key(canonical_key)
@@ -623,13 +751,13 @@ class KBDatabase:
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO sources (id, source_type_id, canonical_uri, canonical_key, "
-                "title, author, publisher, published_at, trust_tier_id, language_code, "
+                "title, author, publisher, published_at, trust_tier_id, language_code, source_purpose, "
                 "is_active, created_at, updated_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11, $12) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE, $12, $13) "
                 "ON CONFLICT (canonical_key) DO NOTHING",
                 source_id, source_type_id, canonical_uri, canonical_key,
                 title, author, publisher, published_at, trust_tier_id, language_code,
-                now, now,
+                source_purpose, now, now,
             )
 
         source = await self.get_source_by_canonical_key(canonical_key)
@@ -644,12 +772,12 @@ class KBDatabase:
                 title, _now(), source_id,
             )
 
-    async def set_source_trust_tier(self, source_id: str, trust_tier_code: str) -> None:
+    async def set_source_trust_tier(self, source_id: str, trust_tier_code: str | None) -> None:
         """Unlike get_or_create_source's trust_tier_code (only ever applied
         at creation), this can update an existing source -- used by the LLM
         auto-classifier (deep_research/kb/trust.py) to fill in a tier after
         ingest, once actual content/title is available to classify from."""
-        trust_tier_id = await self.get_trust_tier_id(trust_tier_code)
+        trust_tier_id = await self.get_trust_tier_id(trust_tier_code) if trust_tier_code else None
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "UPDATE sources SET trust_tier_id = $1, updated_at = $2 WHERE id = $3",
@@ -806,28 +934,58 @@ class KBDatabase:
 
     # -- listing / display ------------------------------------------------
 
-    async def list_sources(self, limit: int = 50) -> list[dict]:
+    async def list_sources(
+        self, limit: int = 50, include_inactive: bool = False, include_evidence: bool = False,
+    ) -> list[dict]:
         """claim_count and topic_names answer "what is this tied to and why
         is it listed" -- a source with claim_count=0 contributed nothing
         (dead weight from a verification web-fallback that never found
         anything worth keeping; see delete_source_cascade), and topic_names
         shows which topic(s), if any, it's actually part of."""
+        active_clause = "TRUE" if include_inactive else "s.is_active = TRUE"
+        purpose_clause = "TRUE" if include_evidence else "s.source_purpose = 'user_added'"
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT s.*, st.code AS source_type_code, tt.code AS trust_tier_code, "
                 "COUNT(DISTINCT ce.claim_id) AS claim_count, "
-                "COALESCE(array_agg(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL), '{}') AS topic_names "
+                "COALESCE(array_agg(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL), '{}') AS topic_names, "
+                "pj.status AS processing_status, pj.stage AS processing_stage, pj.error_message AS processing_error, "
+                "CASE "
+                "  WHEN pj.status IN ('queued', 'running', 'partial', 'failed', 'cancelled') THEN pj.status "
+                "  WHEN COUNT(DISTINCT ce.claim_id) > 0 THEN 'ready' "
+                "  WHEN artifact_exists.present THEN 'chunked' "
+                "  WHEN version_exists.present THEN 'ingested' "
+                "  WHEN failed_fetch.present THEN 'failed' "
+                "  ELSE 'ingested' END AS lifecycle "
                 "FROM sources s "
                 "JOIN source_types st ON st.id = s.source_type_id "
                 "LEFT JOIN trust_tiers tt ON tt.id = s.trust_tier_id "
                 "LEFT JOIN claim_evidence ce ON ce.source_id = s.id "
                 "LEFT JOIN topic_source_links tsl ON tsl.source_id = s.id AND tsl.link_status = 'attached' "
                 "LEFT JOIN topics t ON t.id = tsl.topic_id "
-                "GROUP BY s.id, st.code, tt.code "
+                "LEFT JOIN LATERAL (SELECT status, stage, error_message FROM processing_jobs "
+                "  WHERE source_id = s.id ORDER BY created_at DESC LIMIT 1) pj ON TRUE "
+                "LEFT JOIN LATERAL (SELECT TRUE AS present FROM source_versions WHERE source_id = s.id LIMIT 1) version_exists ON TRUE "
+                "LEFT JOIN LATERAL (SELECT TRUE AS present FROM artifacts a JOIN source_versions sv ON sv.id = a.source_version_id "
+                "  WHERE sv.source_id = s.id AND a.is_current = TRUE LIMIT 1) artifact_exists ON TRUE "
+                "LEFT JOIN LATERAL (SELECT TRUE AS present FROM source_fetch_attempts "
+                "  WHERE source_id = s.id AND status = 'failed' LIMIT 1) failed_fetch ON TRUE "
+                f"WHERE {active_clause} AND {purpose_clause} "
+                "GROUP BY s.id, st.code, tt.code, pj.status, pj.stage, pj.error_message, "
+                "  version_exists.present, artifact_exists.present, failed_fetch.present "
                 "ORDER BY s.updated_at DESC LIMIT $1",
                 limit,
             )
         return [dict(r) for r in rows]
+
+    async def set_source_active(self, source_id: str, active: bool) -> dict | None:
+        """Archive/restore a source without deleting its evidence history."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE sources SET is_active = $1, updated_at = $2 WHERE id = $3 RETURNING *",
+                active, _now(), source_id,
+            )
+        return dict(row) if row else None
 
     async def list_fetch_attempts(self, source_id: str) -> list[dict]:
         async with self.pool.acquire() as conn:
@@ -1180,6 +1338,178 @@ class KBDatabase:
             row = await conn.fetchrow("SELECT * FROM claims WHERE id = $1", claim_id)
         return dict(row) if row else None
 
+    async def get_claim_by_prefix(self, claim_id_prefix: str) -> dict | None:
+        """Resolve a CLI-friendly ID prefix without loading the whole KB."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM claims WHERE id LIKE $1 ORDER BY id LIMIT 2", f"{claim_id_prefix}%")
+        return dict(rows[0]) if len(rows) == 1 else None
+
+    async def record_claim_supports(self, claim_id: str, supporting_claim_ids: list[str]) -> list[dict]:
+        """Persist corroborating-claim relationships found by verification.
+
+        Rows are append-only evidence: a later check that finds no support
+        must not erase a previously observed supporting relationship.
+        """
+        ids = list({supporting_id for supporting_id in supporting_claim_ids if supporting_id != claim_id})
+        if not ids:
+            return []
+        now = _now()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "INSERT INTO claim_supports (claim_id, supporting_claim_id, created_at) "
+                "SELECT $1, unnest($2::text[]), $3 "
+                "ON CONFLICT (claim_id, supporting_claim_id) DO NOTHING RETURNING *",
+                claim_id, ids, now,
+            )
+        return [dict(row) for row in rows]
+
+    async def list_sources_pending_extraction(self, limit: int = 100) -> list[dict]:
+        """Return current, chunked source versions with no completed extraction.
+
+        This is deliberately source/version based instead of looking for
+        unverified claims: nightly extraction must be able to fill the gap
+        between ingestion and the first extraction pass without also starting
+        verification on the extraction model.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT ON (s.id) s.*, sv.id AS version_id "
+                "FROM sources s "
+                "JOIN source_versions sv ON sv.source_id = s.id AND sv.is_latest = TRUE "
+                "JOIN artifacts a ON a.source_version_id = sv.id AND a.is_current = TRUE "
+                "WHERE s.is_active = TRUE "
+                "AND NOT EXISTS (SELECT 1 FROM extraction_runs er "
+                "                WHERE er.artifact_id = a.id AND er.status IN ('completed', 'partial')) "
+                "ORDER BY s.id, sv.captured_at DESC LIMIT $1",
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    # -- Playlist discovery (not sources themselves) ----------------------
+
+    async def get_or_create_tracked_playlist(
+        self, platform: str, playlist_id: str, url: str, *, title: str | None = None,
+        default_trust_tier_code: str | None = None,
+    ) -> tuple[dict, bool]:
+        now = _now()
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchrow("SELECT * FROM tracked_playlists WHERE url = $1", url)
+            if existing:
+                return dict(existing), False
+            row = await conn.fetchrow(
+                "INSERT INTO tracked_playlists (id, platform, playlist_id, url, title, default_trust_tier_code, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
+                _new_id(), platform, playlist_id, url, title, default_trust_tier_code, now,
+            )
+        return dict(row), True
+
+    async def list_tracked_playlists(self, active_only: bool = False) -> list[dict]:
+        query = "SELECT * FROM tracked_playlists" + (" WHERE active = TRUE" if active_only else "") + " ORDER BY created_at DESC"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query)
+        return [dict(r) for r in rows]
+
+    async def add_playlist_video(self, playlist_id: str, video_id: str, title: str | None = None) -> tuple[dict, bool]:
+        now = _now()
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                "SELECT * FROM playlist_videos WHERE tracked_playlist_id = $1 AND video_id = $2", playlist_id, video_id,
+            )
+            if existing:
+                return dict(existing), False
+            row = await conn.fetchrow(
+                "INSERT INTO playlist_videos (tracked_playlist_id, video_id, title, discovered_at) VALUES ($1, $2, $3, $4) RETURNING *",
+                playlist_id, video_id, title, now,
+            )
+        return dict(row), True
+
+    async def list_pending_playlist_videos(self, playlist_id: str, limit: int) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT pv.*, tp.default_trust_tier_code FROM playlist_videos pv JOIN tracked_playlists tp ON tp.id = pv.tracked_playlist_id "
+                "WHERE pv.tracked_playlist_id = $1 AND pv.ingested_at IS NULL ORDER BY pv.discovered_at LIMIT $2", playlist_id, limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def list_playlist_videos(self, playlist_id: str) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT pv.*, s.title AS source_title FROM playlist_videos pv "
+                "LEFT JOIN sources s ON s.id = pv.source_id WHERE pv.tracked_playlist_id = $1 "
+                "ORDER BY pv.discovered_at DESC", playlist_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def mark_playlist_video_ingested(self, playlist_id: str, video_id: str, source_id: str) -> dict:
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE playlist_videos SET source_id = $1, ingested_at = $2 WHERE tracked_playlist_id = $3 AND video_id = $4 RETURNING *",
+                source_id, now, playlist_id, video_id,
+            )
+            await conn.execute("UPDATE tracked_playlists SET last_checked_at = $1 WHERE id = $2", now, playlist_id)
+        return dict(row)
+
+    # -- Advisory topic discovery -----------------------------------------
+
+    async def list_unassigned_entity_claim_clusters(self, minimum_claims: int = 3, limit: int = 50) -> list[dict]:
+        """Clusters unassigned claims by a shared entity; naming stays human-led."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT e.id AS entity_id, e.name AS entity_name, array_agg(DISTINCT c.id) AS claim_ids "
+                "FROM entities e JOIN claims c ON c.entity_id = e.id "
+                "WHERE c.status != 'deprecated' AND NOT EXISTS ("
+                "  SELECT 1 FROM claim_topics ct WHERE ct.claim_id = c.id AND ct.link_status = 'attached') "
+                "GROUP BY e.id, e.name HAVING count(DISTINCT c.id) >= $1 "
+                "ORDER BY count(DISTINCT c.id) DESC LIMIT $2",
+                minimum_claims, limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def create_topic_discovery_proposal(
+        self, entity_id: str, claim_ids: list[str], suggested_name: str, reasoning: str,
+    ) -> tuple[dict, bool]:
+        now = _now()
+        async with self.pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                "SELECT * FROM topic_discovery_proposals WHERE entity_id = $1 AND status = 'open'", entity_id,
+            )
+            if existing:
+                return dict(existing), False
+            row = await conn.fetchrow(
+                "INSERT INTO topic_discovery_proposals (id, entity_id, claim_ids, suggested_name, reasoning, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+                _new_id(), entity_id, claim_ids, suggested_name, reasoning, now,
+            )
+        return dict(row), True
+
+    async def list_topic_discovery_proposals(self, status: str = "open") -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM topic_discovery_proposals WHERE status = $1 ORDER BY created_at DESC", status,
+            )
+        return [dict(r) for r in rows]
+
+    async def review_topic_discovery_proposal(self, proposal_id: str, decision: str) -> dict:
+        if decision not in {"accepted", "rejected"}:
+            raise ValueError("decision must be accepted or rejected")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE topic_discovery_proposals SET status = $1, reviewed_at = $2 WHERE id = $3 AND status = 'open' RETURNING *",
+                decision, _now(), proposal_id,
+            )
+        if not row:
+            raise ValueError(f"Open topic discovery proposal not found: {proposal_id}")
+        return dict(row)
+
+    async def get_claim_support_ids(self, claim_id: str) -> list[str]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT supporting_claim_id FROM claim_supports WHERE claim_id = $1 ORDER BY created_at DESC",
+                claim_id,
+            )
+        return [row["supporting_claim_id"] for row in rows]
+
     async def get_claims_bulk(self, claim_ids: list[str]) -> dict[str, dict]:
         """One round trip for many claims, keyed by id -- see get_entities_bulk."""
         ids = list({i for i in claim_ids if i})
@@ -1525,7 +1855,9 @@ class KBDatabase:
         always wins over the automatic rule. Called after every new evidence
         link so the preferred source stays current as corroboration accrues."""
         async with self.pool.acquire() as conn:
-            claim = await conn.fetchrow("SELECT is_user_reviewed FROM claims WHERE id = $1", claim_id)
+            claim = await conn.fetchrow(
+                "SELECT is_user_reviewed, preferred_source_id FROM claims WHERE id = $1", claim_id,
+            )
             if claim is None or claim["is_user_reviewed"]:
                 return None
             best = await conn.fetchrow(
@@ -1543,7 +1875,16 @@ class KBDatabase:
                 "WHERE id = $3 AND is_user_reviewed = FALSE RETURNING *",
                 best["source_id"], _now(), claim_id,
             )
-        return dict(row) if row else None
+        result = dict(row) if row else None
+        if result and claim["preferred_source_id"] != best["source_id"]:
+            await self.record_decision(
+                "preferred_source", "claim", claim_id, f"preferred source set to {best['source_id']}",
+                related_ids=[best["source_id"]],
+                reasoning="Highest trust-tier evidence source; ties use earliest source creation.",
+                previous_state={"preferred_source_id": claim["preferred_source_id"]},
+                resulting_state={"preferred_source_id": best["source_id"]}, reversible=True,
+            )
+        return result
 
     async def set_preferred_source_manual(self, claim_id: str, source_id: str, reviewed_by: str | None = None) -> dict:
         """Manual override — marks is_user_reviewed so recompute_preferred_source
@@ -1557,6 +1898,15 @@ class KBDatabase:
                 source_id, reviewed_by, now, claim_id,
             )
         return dict(row)
+
+    async def reset_preferred_source_automatic(self, claim_id: str) -> dict | None:
+        """Remove a user's override and reapply the documented automatic rule."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE claims SET is_user_reviewed = FALSE, reviewed_by = NULL, reviewed_at = NULL "
+                "WHERE id = $1", claim_id,
+            )
+        return await self.recompute_preferred_source(claim_id)
 
     async def list_claim_evidence(self, claim_id: str) -> list[dict]:
         async with self.pool.acquire() as conn:
@@ -1585,6 +1935,17 @@ class KBDatabase:
                 "FROM resolution_candidates rc "
                 "WHERE rc.candidate_type = 'claim_contradiction' AND (rc.left_claim_id = $1 OR rc.right_claim_id = $1) "
                 "ORDER BY rc.created_at DESC",
+                claim_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_claim_counter_evidence(self, claim_id: str) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT rc.id AS candidate_id, rc.score, rc.reason, rc.created_at, "
+                "CASE WHEN rc.left_claim_id = $1 THEN rc.right_claim_id ELSE rc.left_claim_id END AS other_claim_id "
+                "FROM resolution_candidates rc WHERE rc.candidate_type = 'counter_evidence' "
+                "AND (rc.left_claim_id = $1 OR rc.right_claim_id = $1) ORDER BY rc.score DESC, rc.created_at DESC",
                 claim_id,
             )
         return [dict(r) for r in rows]
@@ -1661,6 +2022,35 @@ class KBDatabase:
             "claim_contradiction", score, method, reason,
             left_claim_id=left_id, right_claim_id=right_id,
         )
+
+    async def add_counter_evidence_candidate(
+        self, claim_a_id: str, claim_b_id: str, score: float, method: str, reason: str | None = None,
+    ) -> tuple[dict, bool]:
+        """Record balance evidence without turning it into a contradiction verdict."""
+        left_id, right_id = sorted([claim_a_id, claim_b_id])
+        return await self._add_resolution_candidate(
+            "counter_evidence", score, method, reason,
+            left_claim_id=left_id, right_claim_id=right_id,
+        )
+
+    async def mark_counter_claim_checked(self, claim_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE claims SET counter_claim_checked_at = $1 WHERE id = $2", _now(), claim_id)
+
+    async def set_resolution_candidate_triage(
+        self, candidate_id: str, recommendation: str, reasoning: str, model: str | None,
+    ) -> dict:
+        """Store advisory triage only; it never changes candidate review status."""
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE resolution_candidates SET triage_recommendation = $1, triage_reasoning = $2, "
+                "triage_model = $3, triaged_at = $4, updated_at = $4 WHERE id = $5 RETURNING *",
+                recommendation, reasoning, model, now, candidate_id,
+            )
+        if row is None:
+            raise ValueError(f"No resolution candidate {candidate_id!r}")
+        return dict(row)
 
     async def _add_resolution_candidate(
         self, candidate_type: str, score: float, method: str, reason: str | None,
@@ -2148,6 +2538,270 @@ class KBDatabase:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(query, *params)
         return dict(row) if row else None
+
+    # --- Durable processing jobs -----------------------------------------
+
+    async def enqueue_processing_job(
+        self,
+        job_type: str,
+        subject_type: str,
+        *,
+        idempotency_key: str,
+        subject_id: str | None = None,
+        source_id: str | None = None,
+        topic_id: str | None = None,
+        payload: dict | None = None,
+        priority: int = 0,
+        is_speculative: bool = False,
+        stage: str = "queued",
+    ) -> tuple[dict, bool]:
+        """Create durable work exactly once for an idempotency key.
+
+        Callers own the meaning of the key (for example,
+        ``source_pipeline:<canonical-key>:<version-hash>``). Retrying a job
+        is deliberately a separate operation so an accidental repeat request
+        never revives a failed/cancelled job behind the user's back.
+        """
+        if not job_type.strip() or not subject_type.strip() or not idempotency_key.strip():
+            raise ValueError("job_type, subject_type, and idempotency_key are required")
+        job_id = _new_id()
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO processing_jobs "
+                "(id, job_type, subject_type, subject_id, source_id, topic_id, idempotency_key, "
+                "status, stage, priority, is_speculative, payload, progress, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, '{}'::jsonb, $12, $12) "
+                "ON CONFLICT (idempotency_key) DO NOTHING RETURNING *",
+                job_id, job_type, subject_type, subject_id, source_id, topic_id,
+                idempotency_key, stage, priority, is_speculative, payload or {}, now,
+            )
+            if row is not None:
+                return dict(row), True
+            existing = await conn.fetchrow(
+                "SELECT * FROM processing_jobs WHERE idempotency_key = $1", idempotency_key,
+            )
+        assert existing is not None
+        return dict(existing), False
+
+    async def get_processing_job(self, job_id: str) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM processing_jobs WHERE id = $1", job_id)
+        return dict(row) if row else None
+
+    async def list_processing_jobs(
+        self,
+        *,
+        status: str | None = None,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        source_id: str | None = None,
+        topic_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        if status is not None and status not in PROCESSING_JOB_STATUSES:
+            raise ValueError(f"invalid processing job status: {status!r}")
+        query = "SELECT * FROM processing_jobs WHERE TRUE"
+        params: list[Any] = []
+        for column, value in (
+            ("status", status), ("subject_type", subject_type), ("subject_id", subject_id),
+            ("source_id", source_id), ("topic_id", topic_id),
+        ):
+            if value is not None:
+                params.append(value)
+                query += f" AND {column} = ${len(params)}"
+        params.append(limit)
+        query += f" ORDER BY created_at DESC LIMIT ${len(params)}"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+        return [dict(r) for r in rows]
+
+    async def claim_next_processing_job(self, worker_id: str, lease_seconds: int = 600) -> dict | None:
+        """Atomically lease the highest-priority available job.
+
+        A stale lease is eligible again, which makes a crash/reboot recoverable
+        without a second scheduler or a process-local recovery set. SKIP LOCKED
+        keeps this correct when a future deployment has more than one worker.
+        """
+        if not worker_id.strip() or lease_seconds <= 0:
+            raise ValueError("worker_id and a positive lease_seconds are required")
+        now = _now()
+        lease_expires_at = now + timedelta(seconds=lease_seconds)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "WITH candidate AS ("
+                "  SELECT id FROM processing_jobs "
+                "  WHERE cancel_requested = FALSE "
+                "    AND (status = 'queued' OR (status = 'running' AND lease_expires_at <= $1)) "
+                "  ORDER BY priority DESC, created_at ASC "
+                "  LIMIT 1 FOR UPDATE SKIP LOCKED"
+                ") "
+                "UPDATE processing_jobs j SET status = 'running', leased_by = $2, "
+                "lease_expires_at = $3, started_at = COALESCE(j.started_at, $1), "
+                "attempt_count = j.attempt_count + 1, error_message = NULL, updated_at = $1 "
+                "FROM candidate WHERE j.id = candidate.id RETURNING j.*",
+                now, worker_id, lease_expires_at,
+            )
+        return dict(row) if row else None
+
+    async def update_processing_job_progress(
+        self, job_id: str, stage: str, progress: dict | None = None, *, lease_seconds: int | None = None,
+    ) -> dict:
+        """Persist a worker heartbeat/stage transition for a running job."""
+        if not stage.strip():
+            raise ValueError("stage is required")
+        now = _now()
+        lease_expires_at = now + timedelta(seconds=lease_seconds) if lease_seconds else None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE processing_jobs SET stage = $1, progress = COALESCE($2, progress), "
+                "lease_expires_at = COALESCE($3, lease_expires_at), updated_at = $4 "
+                "WHERE id = $5 AND status = 'running' RETURNING *",
+                stage, progress, lease_expires_at, now, job_id,
+            )
+        if row is None:
+            raise ValueError(f"No running processing job {job_id!r}")
+        return dict(row)
+
+    async def request_processing_job_cancel(self, job_id: str) -> dict | None:
+        """Cancel queued work immediately; ask a running worker to stop safely."""
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE processing_jobs SET cancel_requested = TRUE, "
+                "status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END, "
+                "completed_at = CASE WHEN status = 'queued' THEN $1 ELSE completed_at END, "
+                "lease_expires_at = CASE WHEN status = 'queued' THEN NULL ELSE lease_expires_at END, "
+                "updated_at = $1 "
+                "WHERE id = $2 AND status NOT IN ('partial', 'failed', 'completed', 'cancelled') "
+                "RETURNING *",
+                now, job_id,
+            )
+        return dict(row) if row else None
+
+    async def release_processing_job(self, job_id: str) -> dict:
+        """Return unstarted speculative work to the queue without counting a failure."""
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE processing_jobs SET status = 'queued', leased_by = NULL, lease_expires_at = NULL, "
+                "stage = 'waiting_for_gpu', updated_at = $1 WHERE id = $2 AND status = 'running' RETURNING *",
+                now, job_id,
+            )
+        if row is None:
+            raise ValueError(f"No running processing job {job_id!r}")
+        return dict(row)
+
+    async def finish_processing_job(
+        self, job_id: str, status: str, *, stage: str | None = None,
+        progress: dict | None = None, error_message: str | None = None,
+    ) -> dict:
+        if status not in PROCESSING_JOB_TERMINAL_STATUSES:
+            raise ValueError(f"processing jobs can only finish in a terminal status, got {status!r}")
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE processing_jobs SET status = $1, stage = COALESCE($2, stage), "
+                "progress = COALESCE($3, progress), error_message = $4, leased_by = NULL, "
+                "lease_expires_at = NULL, completed_at = $5, updated_at = $5 "
+                "WHERE id = $6 AND status NOT IN ('partial', 'failed', 'completed', 'cancelled') RETURNING *",
+                status, stage, progress, error_message, now, job_id,
+            )
+        if row is None:
+            raise ValueError(f"No active processing job {job_id!r}")
+        return dict(row)
+
+    async def retry_processing_job(self, job_id: str, *, stage: str = "queued") -> dict:
+        """Explicitly requeue a terminal job without losing its attempt history."""
+        now = _now()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE processing_jobs SET status = 'queued', stage = $1, cancel_requested = FALSE, "
+                "leased_by = NULL, lease_expires_at = NULL, completed_at = NULL, error_message = NULL, "
+                "updated_at = $2 WHERE id = $3 AND status IN ('partial', 'failed', 'cancelled') RETURNING *",
+                stage, now, job_id,
+            )
+        if row is None:
+            raise ValueError(f"Processing job {job_id!r} is not retryable")
+        return dict(row)
+
+    async def requeue_expired_processing_jobs(self) -> list[dict]:
+        """Make abandoned leases visible as queued recovery work on worker startup."""
+        now = _now()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "UPDATE processing_jobs SET status = 'queued', leased_by = NULL, lease_expires_at = NULL, "
+                "error_message = 'Worker lease expired; requeued for recovery', updated_at = $1 "
+                "WHERE status = 'running' AND lease_expires_at <= $1 AND cancel_requested = FALSE "
+                "RETURNING *",
+                now,
+            )
+        return [dict(r) for r in rows]
+
+    # --- Automation decision/action journal -----------------------------
+
+    async def record_decision(
+        self,
+        decision_type: str,
+        subject_type: str,
+        subject_id: str,
+        decision: str,
+        *,
+        related_ids: list[str] | dict | None = None,
+        confidence: float | None = None,
+        reasoning: str | None = None,
+        model: str | None = None,
+        parse_success: bool | None = None,
+        previous_state: dict | None = None,
+        resulting_state: dict | None = None,
+        reversible: bool = False,
+        undo_of_decision_id: str | None = None,
+    ) -> dict:
+        """Append one automated action or its reversal to the durable audit trail."""
+        if not decision_type.strip() or not subject_type.strip() or not subject_id.strip() or not decision.strip():
+            raise ValueError("decision_type, subject_type, subject_id, and decision are required")
+        decision_id = _new_id()
+        now = _now()
+        async with self.pool.acquire() as conn:
+            if undo_of_decision_id is not None:
+                original = await conn.fetchrow(
+                    "SELECT reversible FROM decision_log WHERE id = $1", undo_of_decision_id,
+                )
+                if original is None:
+                    raise ValueError(f"No decision to undo: {undo_of_decision_id!r}")
+                if not original["reversible"]:
+                    raise ValueError(f"Decision {undo_of_decision_id!r} is not marked reversible")
+            row = await conn.fetchrow(
+                "INSERT INTO decision_log "
+                "(id, decision_type, subject_type, subject_id, related_ids, decision, confidence, reasoning, "
+                "model, parse_success, previous_state, resulting_state, reversible, undo_of_decision_id, decided_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *",
+                decision_id, decision_type, subject_type, subject_id, related_ids or [], decision,
+                confidence, reasoning, model, parse_success, previous_state, resulting_state,
+                reversible, undo_of_decision_id, now,
+            )
+        return dict(row)
+
+    async def get_decision(self, decision_id: str) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM decision_log WHERE id = $1", decision_id)
+        return dict(row) if row else None
+
+    async def list_decisions(
+        self, *, decision_type: str | None = None, subject_type: str | None = None,
+        subject_id: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        query = "SELECT * FROM decision_log WHERE TRUE"
+        params: list[Any] = []
+        for column, value in (("decision_type", decision_type), ("subject_type", subject_type), ("subject_id", subject_id)):
+            if value is not None:
+                params.append(value)
+                query += f" AND {column} = ${len(params)}"
+        params.append(limit)
+        query += f" ORDER BY decided_at DESC LIMIT ${len(params)}"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+        return [dict(r) for r in rows]
 
     # --- Verification runs (nightly/manual claim verification sweeps) ---
 

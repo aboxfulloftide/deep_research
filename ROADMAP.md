@@ -463,6 +463,42 @@ its freshness."
 
 ## Recommended implementation order
 
+## Implementation status (2026-07-13)
+
+The following roadmap work is implemented in the current worktree and is
+covered by the automated test suite:
+
+- Durable, recoverable processing jobs are the single execution path for
+  ingestion, chunking, extraction, verification, reports, ad screening,
+  contradiction triage, and playlist discovery. They expose stage, progress,
+  retry, cancellation, and errors; a PostgreSQL advisory lock serializes GPU
+  and search-driving work across CLI and web processes.
+- Direct topic intake accepts URL, YouTube, and file sources, then runs the
+  full pipeline and refreshes the topic overview. Independent sources use the
+  same pipeline. Source lifecycle/purpose filtering keeps evidence and failed
+  shells out of the default "My sources" view.
+- The append-only decision journal captures trust, ad screening, topic
+  auto-attach, automated merge, preferred-source, playlist, and triage
+  actions. Where a safe reversal exists, the web API exposes it; irreversible
+  automatic merges explicitly say so in the journal.
+- Reports are automatically refreshed after source/topic processing and show
+  generated scope/time plus explicit unverified assertions. Support evidence
+  is first-class rather than only a JSON note.
+- High-confidence topic matches attach automatically but remain removable;
+  lower-confidence matches stay suggestions.
+- Retroactive ad screening, advisory-only contradiction triage, separate
+  extractor/verifier configuration, `extract-pending`, and idle-gated
+  YouTube playlist tracking are implemented. A playlist remains discovery
+  metadata; each resulting video is a normal source.
+- Counter-evidence is a separate, cooldown-gated advisory pass. It records a
+  distinct `counter_evidence` candidate and is displayed as "Counter-view
+  (for balance)" without changing the original verdict. Topic discovery
+  similarly creates only idle-time review proposals; it never creates or
+  names a topic automatically.
+- `nightly-role-split` uses registered model profiles to perform exactly one
+  30B extraction -> 14B verification swap, and leaves the verifier loaded
+  for interactive use. The launcher and health checks are shared with evals.
+
 1. Durable `processing_jobs` + the decision/action journal (including
    previous/resulting state, undo metadata, and the LLM parse-success
    flag). Build the job worker as the single choke point: global GPU lock,

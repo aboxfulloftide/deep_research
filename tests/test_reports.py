@@ -38,6 +38,13 @@ def test_batch_blocks_returns_lists_not_joined_strings():
     assert all(isinstance(b, list) for b in batches)
 
 
+def test_report_input_marks_unverified_assertions_explicitly():
+    line = rpt._format_claim_line(
+        {"canonical_text": "An unverified assertion", "status": "unverified"}, "Example Source",
+    )
+    assert "[UNVERIFIED]" in line
+
+
 class _FakeLLM:
     """Simulates a batch call that fails with exceed_context_size_error until
     the block list has been bisected down to a small enough piece, then

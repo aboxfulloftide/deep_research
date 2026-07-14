@@ -68,6 +68,21 @@ async def test_set_trust_tier_if_missing_sets_a_confident_verdict(kb_db, monkeyp
     assert tier == "reputable_reporting"
     refreshed = await kb_db.get_source(source["id"])
     assert refreshed["trust_tier_id"] is not None
+    decisions = await kb_db.list_decisions(subject_type="source", subject_id=source["id"])
+    assert decisions[0]["decision"] == "tier:reputable_reporting"
+    assert decisions[0]["reversible"] is True
+
+
+async def test_source_trust_tier_can_be_reset_to_automatic(kb_db):
+    source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="https://example.com/reset", canonical_key="example:reset",
+        trust_tier_code="official",
+    )
+
+    await kb_db.set_source_trust_tier(source["id"], None)
+
+    refreshed = await kb_db.get_source(source["id"])
+    assert refreshed["trust_tier_id"] is None
 
 
 async def test_set_trust_tier_if_missing_leaves_untiered_on_low_confidence(kb_db, monkeypatch):

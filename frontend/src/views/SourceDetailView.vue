@@ -12,8 +12,11 @@ const source = ref(null)
 const versions = ref([])
 const fetchAttempts = ref([])
 const keyPoints = ref([])
+const decisions = ref([])
 const loading = ref(true)
 const backgroundProcessing = ref(false)
+const processingJob = ref(null)
+const processingError = ref(null)
 
 const chunking = ref(false)
 const chunkResult = ref(null)
@@ -45,6 +48,8 @@ async function load() {
   fetchAttempts.value = data.fetch_attempts || []
   loading.value = false
   await loadKeyPoints()
+  const decisionData = await api.fetchSourceDecisions(sourceId.value)
+  decisions.value = decisionData.decisions || []
 }
 
 async function loadKeyPoints() {
@@ -56,12 +61,42 @@ async function checkProcessingStatus() {
   const wasProcessing = backgroundProcessing.value
   const data = await api.fetchSourceProcessingStatus(sourceId.value)
   backgroundProcessing.value = !!data.processing
+  processingJob.value = data.job || null
+  if (processingJob.value && ['failed', 'partial'].includes(processingJob.value.status)) {
+    processingError.value = processingJob.value.error_message || 'Processing did not finish.'
+  }
   // Just finished (e.g. a pasted conversation's chunk/extract/verify
   // background task) -- refresh so the new claims/versions actually show up
   // without the user having to manually reload the page.
   if (wasProcessing && !backgroundProcessing.value) {
     await load()
   }
+}
+
+async function cancelPipeline() {
+  if (!processingJob.value) return
+  const data = await api.cancelProcessingJob(processingJob.value.id)
+  processingJob.value = data.job
+}
+
+async function retryPipeline() {
+  if (!processingJob.value) return
+  const data = await api.retryProcessingJob(processingJob.value.id)
+  processingJob.value = data.job
+  processingError.value = null
+  backgroundProcessing.value = true
+}
+
+async function resetTrustTier() {
+  const data = await api.resetSourceTrustTier(sourceId.value)
+  source.value = data.source
+  const decisionData = await api.fetchSourceDecisions(sourceId.value)
+  decisions.value = decisionData.decisions || []
+}
+
+async function archiveSource() {
+  const data = await api.archiveSource(sourceId.value)
+  source.value = data.source
 }
 
 const keyPointStatusColors = {
@@ -76,7 +111,9 @@ async function runChunk() {
   chunkResult.value = null
   try {
     const data = await api.chunkSource(sourceId.value)
-    chunkResult.value = data.result
+    chunkResult.value = { job: data.job }
+    processingJob.value = data.job
+    backgroundProcessing.value = true
   } finally {
     chunking.value = false
   }
@@ -87,8 +124,9 @@ async function runExtract() {
   extractResult.value = null
   try {
     const data = await api.extractSource(sourceId.value, extractForce.value)
-    extractResult.value = data
-    await loadKeyPoints()
+    extractResult.value = { job: data.job }
+    processingJob.value = data.job
+    backgroundProcessing.value = true
   } finally {
     extracting.value = false
   }
@@ -100,8 +138,9 @@ async function runVerify() {
   try {
     const threshold = verifyThreshold.value === '' ? null : Number(verifyThreshold.value)
     const data = await api.verifySource(sourceId.value, verifyForce.value, threshold)
-    verifyResult.value = data
-    await loadKeyPoints()
+    verifyResult.value = { job: data.job }
+    processingJob.value = data.job
+    backgroundProcessing.value = true
   } finally {
     verifying.value = false
   }
@@ -131,6 +170,8 @@ const statusColors = {
       </a>
       <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">
         id: {{ source.id }} · trust: {{ source.trust_tier_code || '(none)' }}
+        <button v-if="source.trust_tier_code" @click="resetTrustTier" class="ml-2 hover:underline">reset to automatic</button>
+        <button v-if="source.is_active" @click="archiveSource" class="ml-2 text-red-600 dark:text-red-400 hover:underline">archive</button>
       </p>
     </div>
 
@@ -139,8 +180,14 @@ const statusColors = {
       class="flex items-center gap-2 mb-4 px-3 py-2 text-sm rounded-md bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300"
     >
       <Loader2 class="w-4 h-4 animate-spin shrink-0" />
-      Processing in the background (chunking, extracting, and verifying claims) — this can take a few minutes.
+      Processing in the background{{ processingJob?.stage ? `: ${processingJob.stage}` : '' }} — this can take a few minutes.
       Feel free to navigate away; it keeps running on the server and this page will refresh automatically when it's done.
+      <button v-if="processingJob" @click="cancelPipeline" class="ml-auto text-xs underline">Cancel</button>
+    </div>
+
+    <div v-else-if="processingError" class="flex items-center gap-2 mb-4 px-3 py-2 text-sm rounded-md bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300">
+      {{ processingError }}
+      <button @click="retryPipeline" class="ml-auto text-xs underline">Retry</button>
     </div>
 
     <!-- Actions -->
@@ -155,8 +202,7 @@ const statusColors = {
           {{ chunking ? 'Chunking...' : 'Chunk' }}
         </button>
         <p v-if="chunkResult" class="text-xs text-gray-500 dark:text-gray-400 mt-2">
-          {{ chunkResult.status }} — {{ chunkResult.chunk_count }} chunk(s)
-          <template v-if="chunkResult.status === 'chunked'">, {{ chunkResult.embedded_count }} embedded</template>
+          Processing queued.
         </p>
       </div>
 
@@ -174,13 +220,7 @@ const statusColors = {
           Force re-extract
         </label>
         <div v-if="extractResult" class="text-xs text-gray-500 dark:text-gray-400 mt-2">
-          <p>{{ extractResult.extraction.status }} — {{ extractResult.extraction.observation_count }} observation(s)</p>
-          <p v-if="extractResult.promotion">
-            {{ extractResult.promotion.new_claim_count }} new claim(s), {{ extractResult.promotion.new_entity_count }} new entit{{ extractResult.promotion.new_entity_count === 1 ? 'y' : 'ies' }}
-          </p>
-          <p v-if="extractResult.topic_suggestions?.length">
-            suggested to {{ extractResult.topic_suggestions.length }} topic(s)
-          </p>
+          <p>Processing queued.</p>
         </div>
       </div>
 
@@ -205,10 +245,7 @@ const statusColors = {
           />
         </div>
         <div v-if="verifyResult" class="text-xs text-gray-500 dark:text-gray-400 mt-2 space-y-1">
-          <p>{{ verifyResult.verified_count }} claim(s) verified</p>
-          <p v-for="(r, i) in verifyResult.results" :key="i" :class="statusColors[r.status]">
-            {{ r.status }} — {{ r.canonical_text.slice(0, 60) }}
-          </p>
+          <p>Verification queued — it will run after any active processing.</p>
         </div>
       </div>
     </div>
@@ -218,6 +255,7 @@ const statusColors = {
       Key Points
       <span v-if="keyPoints.length" class="font-normal text-gray-400 dark:text-gray-500">({{ keyPoints.length }})</span>
     </h3>
+
     <div v-if="keyPoints.length === 0" class="mb-6 text-sm text-gray-500 dark:text-gray-400">
       No claims extracted from this source yet — chunk and extract it to populate this.
     </div>
@@ -236,6 +274,17 @@ const statusColors = {
         <span class="text-gray-900 dark:text-white">{{ claim.canonical_text }}</span>
       </div>
     </div>
+
+    <details v-if="decisions.length" class="mb-6 text-sm">
+      <summary class="cursor-pointer text-gray-700 dark:text-gray-300">Automation history ({{ decisions.length }})</summary>
+      <div class="mt-2 space-y-2">
+        <div v-for="decision in decisions" :key="decision.id" class="px-3 py-2 bg-gray-50 dark:bg-gray-800 rounded-md text-xs">
+          <p class="font-medium text-gray-800 dark:text-gray-200">{{ decision.decision }}</p>
+          <p v-if="decision.reasoning" class="mt-0.5 text-gray-500 dark:text-gray-400">{{ decision.reasoning }}</p>
+          <p class="mt-0.5 text-gray-400 dark:text-gray-500">{{ formatDate(decision.decided_at) }}<template v-if="decision.confidence !== null"> · {{ Math.round(decision.confidence * 100) }}% confidence</template></p>
+        </div>
+      </div>
+    </details>
 
     <!-- Versions -->
     <h3 class="text-sm font-semibold text-gray-900 dark:text-white mb-2">Versions</h3>

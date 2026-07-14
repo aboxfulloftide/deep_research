@@ -1,5 +1,17 @@
 const API_BASE = '/api'
 
+// Keep all API helpers honest: a JSON error body is still an HTTP failure.
+// Several older callers only did `resp.json()`, which made a 400/500 look
+// like malformed successful data and left users with no actionable message.
+async function fetch(input, init) {
+  const resp = await globalThis.fetch(input, init)
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}))
+    throw new Error(body.detail || body.error || body.message || `Request failed (${resp.status})`)
+  }
+  return resp
+}
+
 export function useApi() {
   async function fetchModels(backend = null) {
     const qs = backend ? `?backend=${encodeURIComponent(backend)}` : ''
@@ -214,8 +226,8 @@ export function useApi() {
 
   // --- Knowledge base (sources: ingest/chunk/extract/verify) ---
 
-  async function fetchSources(q = '', limit = 50) {
-    const params = new URLSearchParams({ q, limit })
+  async function fetchSources(q = '', limit = 50, includeArchived = false) {
+    const params = new URLSearchParams({ q, limit, include_archived: includeArchived })
     const resp = await fetch(`${API_BASE}/kb/sources?${params}`)
     return resp.json()
   }
@@ -228,6 +240,29 @@ export function useApi() {
 
   async function fetchSourceClaims(id) {
     const resp = await fetch(`${API_BASE}/kb/sources/${id}/claims`)
+    return resp.json()
+  }
+
+  async function fetchSourceDecisions(id) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/decisions`)
+    return resp.json()
+  }
+
+  async function resetSourceTrustTier(id) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/trust-tier/reset`, { method: 'POST' })
+    if (!resp.ok) throw new Error('Could not reset the trust tier')
+    return resp.json()
+  }
+
+  async function archiveSource(id) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/archive`, { method: 'POST' })
+    if (!resp.ok) throw new Error('Could not archive this source')
+    return resp.json()
+  }
+
+  async function restoreSource(id) {
+    const resp = await fetch(`${API_BASE}/kb/sources/${id}/restore`, { method: 'POST' })
+    if (!resp.ok) throw new Error('Could not restore this source')
     return resp.json()
   }
 
@@ -254,6 +289,24 @@ export function useApi() {
     return resp.json()
   }
 
+  async function trackPlaylist(url, trustTier = null) {
+    const resp = await fetch(`${API_BASE}/kb/playlists`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, trust_tier: trustTier }),
+    })
+    return resp.json()
+  }
+
+  async function fetchPlaylists() {
+    const resp = await fetch(`${API_BASE}/kb/playlists`)
+    return resp.json()
+  }
+
+  async function fetchPlaylistVideos(id) {
+    const resp = await fetch(`${API_BASE}/kb/playlists/${id}/videos`)
+    return resp.json()
+  }
+
   async function ingestConversation(text, title = null, trustTier = null, topicName = null) {
     const resp = await fetch(`${API_BASE}/kb/sources/ingest-conversation`, {
       method: 'POST',
@@ -275,6 +328,54 @@ export function useApi() {
       method: 'POST',
       body: formData,
     })
+    return resp.json()
+  }
+
+  async function ingestTopicUrl(topicId, url, trustTier = null) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${topicId}/ingest-url`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, trust_tier: trustTier }),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to add source')
+    }
+    return resp.json()
+  }
+
+  async function ingestTopicYoutube(topicId, url, trustTier = null) {
+    const resp = await fetch(`${API_BASE}/kb/topics/${topicId}/ingest-youtube`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, trust_tier: trustTier }),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to add video')
+    }
+    return resp.json()
+  }
+
+  async function ingestTopicFile(topicId, file, trustTier = null) {
+    const formData = new FormData()
+    formData.append('file', file)
+    if (trustTier) formData.append('trust_tier', trustTier)
+    const resp = await fetch(`${API_BASE}/kb/topics/${topicId}/ingest-file`, { method: 'POST', body: formData })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to add file')
+    }
+    return resp.json()
+  }
+
+  async function cancelProcessingJob(jobId) {
+    const resp = await fetch(`${API_BASE}/kb/processing-jobs/${jobId}/cancel`, { method: 'POST' })
+    if (!resp.ok) throw new Error('Could not cancel this job')
+    return resp.json()
+  }
+
+  async function retryProcessingJob(jobId) {
+    const resp = await fetch(`${API_BASE}/kb/processing-jobs/${jobId}/retry`, { method: 'POST' })
+    if (!resp.ok) throw new Error('Could not retry this job')
     return resp.json()
   }
 
@@ -310,6 +411,11 @@ export function useApi() {
     return resp.json()
   }
 
+  async function triggerAdSweep(limit = 10000) {
+    const resp = await fetch(`${API_BASE}/kb/ad-sweep?limit=${limit}`, { method: 'POST' })
+    return resp.json()
+  }
+
   // --- Knowledge base (claims: browse/verify/search) ---
 
   async function fetchClaims(limit = 100) {
@@ -320,6 +426,17 @@ export function useApi() {
   async function fetchClaim(id) {
     const resp = await fetch(`${API_BASE}/kb/claims/${id}`)
     if (!resp.ok) throw new Error('Claim not found')
+    return resp.json()
+  }
+
+  async function fetchClaimDecisions(id) {
+    const resp = await fetch(`${API_BASE}/kb/claims/${id}/decisions`)
+    if (!resp.ok) throw new Error('Claim history not found')
+    return resp.json()
+  }
+
+  async function findCounterEvidence(id, force = false) {
+    const resp = await fetch(`${API_BASE}/kb/claims/${id}/counter-evidence?force=${force}`, { method: 'POST' })
     return resp.json()
   }
 
@@ -409,10 +526,11 @@ export function useApi() {
     fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,
     backfillTopic, triggerTopicVerification, fetchTopicProcessingStatus, fetchReport, generateReport,
     fetchResolutionCandidates, reviewResolutionCandidate,
-    fetchSources, fetchSource, fetchSourceClaims, fetchSourceProcessingStatus,
-    ingestUrl, ingestYoutube, ingestFile, ingestConversation,
-    chunkSource, extractSource, verifySource, backfillEmbeddings,
-    fetchClaims, fetchClaim, verifyClaim, setPreferredSource, setClaimVerificationOverride,
+    fetchSources, fetchSource, fetchSourceClaims, fetchSourceDecisions, fetchSourceProcessingStatus, resetSourceTrustTier, archiveSource, restoreSource,
+    ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos,
+    ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, retryProcessingJob,
+    chunkSource, extractSource, verifySource, backfillEmbeddings, triggerAdSweep,
+    fetchClaims, fetchClaim, fetchClaimDecisions, findCounterEvidence, verifyClaim, setPreferredSource, setClaimVerificationOverride,
     setClaimVerificationContext, searchChunks,
     fetchVerificationRuns, fetchCurrentVerificationRun, triggerVerificationRun,
     fetchSearchUsage, checkSearchProviders,

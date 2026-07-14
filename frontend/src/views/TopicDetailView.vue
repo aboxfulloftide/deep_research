@@ -1,12 +1,13 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { marked } from 'marked'
-import { Check, X, RefreshCw, FileText, Clock, Loader2, ShieldCheck } from 'lucide-vue-next'
+import { Check, X, RefreshCw, FileText, Clock, Loader2, ShieldCheck, Link, Upload } from 'lucide-vue-next'
 import ClaimListItem from '../components/ClaimListItem.vue'
 import { useApi } from '../composables/useApi.js'
 
 const route = useRoute()
+const router = useRouter()
 const api = useApi()
 
 const topicId = computed(() => route.params.id)
@@ -18,6 +19,7 @@ const transcript = ref([])
 const attachedClaims = ref([])
 const suggestedClaims = ref([])
 const suggestedSources = ref([])
+const attachedSources = ref([])
 const report = ref(null)
 const reportSuggestion = ref(null)
 const activeTab = ref(processingSourceId.value ? 'claims' : 'timeline')
@@ -27,6 +29,10 @@ const generatingReport = ref(false)
 const backgroundProcessing = ref(false)
 const topicProcessing = ref(false)
 const triggerError = ref(null)
+const sourceUrl = ref('')
+const addingSource = ref(false)
+const intakeError = ref(null)
+const processingJob = ref(null)
 
 const anyProcessing = computed(() => backgroundProcessing.value || topicProcessing.value)
 
@@ -64,8 +70,87 @@ async function checkProcessingStatus() {
   const wasProcessing = backgroundProcessing.value
   const data = await api.fetchSourceProcessingStatus(processingSourceId.value)
   backgroundProcessing.value = !!data.processing
+  processingJob.value = data.job || null
+  if (processingJob.value && ['failed', 'partial'].includes(processingJob.value.status)) {
+    intakeError.value = processingJob.value.error_message || 'Source processing did not finish.'
+  }
   if (wasProcessing && !backgroundProcessing.value) {
     await loadAll()
+  }
+}
+
+async function addUrlSource() {
+  if (!sourceUrl.value.trim()) return
+  addingSource.value = true
+  intakeError.value = null
+  try {
+    const urls = sourceUrl.value.split(/\s+/).map(url => url.trim()).filter(Boolean)
+    const results = await Promise.all(urls.map((url) => {
+      const isYoutube = /(?:youtube\.com|youtu\.be)/i.test(url)
+      return isYoutube
+        ? api.ingestTopicYoutube(topic.value.id, url)
+        : api.ingestTopicUrl(topic.value.id, url)
+    }))
+    const data = results.at(-1)
+    sourceUrl.value = ''
+    processingJob.value = data.job
+    backgroundProcessing.value = true
+    await router.replace({ query: { ...route.query, processingSource: data.result.source_id } })
+    if (!processingPollHandle) processingPollHandle = setInterval(checkProcessingStatus, 3000)
+    topicProcessing.value = true
+    if (!topicPollHandle) topicPollHandle = setInterval(checkTopicProcessingStatus, 3000)
+    checkProcessingStatus()
+    checkTopicProcessingStatus()
+    await loadAll()
+  } catch (e) {
+    intakeError.value = e.message
+  } finally {
+    addingSource.value = false
+  }
+}
+
+async function addFileSource(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  addingSource.value = true
+  intakeError.value = null
+  try {
+    const data = await api.ingestTopicFile(topic.value.id, file)
+    processingJob.value = data.job
+    backgroundProcessing.value = true
+    await router.replace({ query: { ...route.query, processingSource: data.result.source_id } })
+    if (!processingPollHandle) processingPollHandle = setInterval(checkProcessingStatus, 3000)
+    topicProcessing.value = true
+    if (!topicPollHandle) topicPollHandle = setInterval(checkTopicProcessingStatus, 3000)
+    checkProcessingStatus()
+    checkTopicProcessingStatus()
+    await loadAll()
+  } catch (e) {
+    intakeError.value = e.message
+  } finally {
+    event.target.value = ''
+    addingSource.value = false
+  }
+}
+
+async function cancelPipeline() {
+  if (!processingJob.value) return
+  try {
+    const data = await api.cancelProcessingJob(processingJob.value.id)
+    processingJob.value = data.job
+  } catch (e) {
+    intakeError.value = e.message
+  }
+}
+
+async function retryPipeline() {
+  if (!processingJob.value) return
+  try {
+    const data = await api.retryProcessingJob(processingJob.value.id)
+    processingJob.value = data.job
+    backgroundProcessing.value = true
+  } catch (e) {
+    intakeError.value = e.message
   }
 }
 
@@ -96,12 +181,13 @@ async function loadAll() {
   const detail = await api.fetchTopic(topicId.value)
   topic.value = detail.topic
 
-  const [tl, tr, ac, sc, ss, rep] = await Promise.all([
+  const [tl, tr, ac, sc, ss, attached, rep] = await Promise.all([
     api.fetchTimeline(topic.value.id),
     api.fetchConversationTranscript(topic.value.id),
     api.fetchTopicClaims(topic.value.id, 'attached'),
     api.fetchTopicClaims(topic.value.id, 'suggested'),
     api.fetchTopicSources(topic.value.id, 'suggested'),
+    api.fetchTopicSources(topic.value.id, 'attached'),
     api.fetchReport(topic.value.id),
   ])
   timeline.value = tl.entries || []
@@ -109,6 +195,7 @@ async function loadAll() {
   attachedClaims.value = ac.claims || []
   suggestedClaims.value = sc.claims || []
   suggestedSources.value = ss.sources || []
+  attachedSources.value = attached.sources || []
   report.value = rep.report || null
   loading.value = false
 }
@@ -131,6 +218,11 @@ async function acceptSource(source) {
 async function rejectSource(source) {
   await api.reviewSourceSuggestion(topic.value.id, source.id, 'rejected')
   suggestedSources.value = suggestedSources.value.filter(s => s.id !== source.id)
+}
+
+async function removeAttachedSource(source) {
+  await api.reviewSourceSuggestion(topic.value.id, source.id, 'rejected')
+  attachedSources.value = attachedSources.value.filter(s => s.id !== source.id)
 }
 
 async function runBackfill() {
@@ -159,6 +251,11 @@ function renderMarkdown(text) {
   if (!text) return ''
   return marked.parse(text, { breaks: true })
 }
+
+function formatReportDate(iso) {
+  if (!iso) return ''
+  return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })
+}
 </script>
 
 <template>
@@ -186,10 +283,45 @@ function renderMarkdown(text) {
     >
       <Loader2 class="w-4 h-4 animate-spin shrink-0" />
       {{ backgroundProcessing
-        ? 'Processing in the background (chunking, extracting, and verifying claims)'
-        : 'Verifying flagged claims in the background' }}
+        ? `Processing in the background${processingJob?.stage ? `: ${processingJob.stage}` : ''}`
+        : 'Processing topic sources in the background' }}
       — this can take a few minutes.
       Feel free to navigate away; it keeps running on the server and this page will refresh automatically when it's done.
+      <button v-if="backgroundProcessing && processingJob" @click="cancelPipeline" class="ml-auto text-xs underline">Cancel</button>
+    </div>
+
+    <details class="mb-4 text-sm" :open="attachedSources.length > 0">
+      <summary class="cursor-pointer text-gray-700 dark:text-gray-300">
+        Attached sources ({{ attachedSources.length }})
+      </summary>
+      <div v-if="attachedSources.length" class="mt-2 space-y-1.5">
+        <div v-for="source in attachedSources" :key="source.id" class="flex items-center gap-2 px-3 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md">
+          <a :href="source.canonical_uri" target="_blank" rel="noopener" class="min-w-0 flex-1 truncate text-blue-600 dark:text-blue-400 hover:underline" @click.stop>{{ source.title || source.canonical_uri }}</a>
+          <button @click="removeAttachedSource(source)" class="text-xs text-red-600 dark:text-red-400 hover:underline">Remove</button>
+        </div>
+      </div>
+      <p v-else class="mt-2 text-xs text-gray-500 dark:text-gray-400">Add a source above to start the automatic pipeline.</p>
+    </details>
+
+    <div class="mb-5 p-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg">
+      <p class="text-sm font-medium text-gray-900 dark:text-white mb-2">Add sources</p>
+      <div class="flex flex-col sm:flex-row gap-2">
+        <textarea
+          v-model="sourceUrl" @keydown.ctrl.enter.prevent="addUrlSource" @keydown.meta.enter.prevent="addUrlSource"
+          rows="2"
+          placeholder="Paste one or more article/YouTube URLs (one per line)"
+          class="flex-1 px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white"
+        ></textarea>
+        <button @click="addUrlSource" :disabled="addingSource || !sourceUrl.trim()" class="flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-md bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white">
+          <Link class="w-4 h-4" /> {{ addingSource ? 'Adding...' : 'Add URL' }}
+        </button>
+        <label class="flex items-center justify-center gap-1.5 px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer">
+          <Upload class="w-4 h-4" /> Add file
+          <input type="file" class="hidden" @change="addFileSource" :disabled="addingSource" />
+        </label>
+      </div>
+      <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">Sources are attached, extracted, checked, and included in the overview automatically.</p>
+      <p v-if="intakeError" class="mt-2 text-xs text-red-600 dark:text-red-400">{{ intakeError }} <button v-if="processingJob?.status === 'failed' || processingJob?.status === 'partial'" @click="retryPipeline" class="underline">Retry</button></p>
     </div>
 
     <div class="flex items-center gap-1 mb-4 border-b border-gray-200 dark:border-gray-700">
@@ -371,6 +503,9 @@ function renderMarkdown(text) {
         <p class="text-sm">No report yet. Generate one from the current timeline and claims.</p>
       </div>
       <template v-else>
+        <p class="mb-2 text-xs text-gray-400 dark:text-gray-500">
+          Generated {{ formatReportDate(report.created_at) }} from {{ report.generated_from_scope?.claim_count ?? 0 }} attached claim(s).
+        </p>
         <div
           v-if="reportSuggestion"
           class="mb-3 px-4 py-2.5 text-sm rounded-md bg-yellow-50 dark:bg-yellow-900/20 text-yellow-800 dark:text-yellow-300 border border-yellow-200 dark:border-yellow-900/40"

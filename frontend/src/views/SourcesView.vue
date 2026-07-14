@@ -10,15 +10,18 @@ const api = useApi()
 const sources = ref([])
 const loading = ref(true)
 const query = ref('')
+const showArchived = ref(false)
 
 const showAdd = ref(false)
 const addTab = ref('url')
 const urlInput = ref('')
 const youtubeInput = ref('')
+const playlistInput = ref('')
 const fileInput = ref(null)
 const trustTier = ref('')
 const submitting = ref(false)
 const lastIngestResult = ref(null)
+const lastIngestJob = ref(null)
 
 const showSearch = ref(false)
 const searchQuery = ref('')
@@ -34,13 +37,22 @@ const TRUST_TIERS = [
   { value: 'user_generated', label: 'User-generated' },
 ]
 
-onMounted(loadSources)
+onMounted(async () => { await loadSources(); await loadPlaylists() })
 
 async function loadSources() {
   loading.value = true
-  const data = await api.fetchSources(query.value)
+  const data = await api.fetchSources(query.value, 50, showArchived.value)
   sources.value = data.sources || []
   loading.value = false
+}
+
+async function loadPlaylists() {
+  playlists.value = (await api.fetchPlaylists()).playlists || []
+}
+
+async function showPlaylistVideos(playlist) {
+  const data = await api.fetchPlaylistVideos(playlist.id)
+  playlistVideos.value = { ...playlistVideos.value, [playlist.id]: data.videos || [] }
 }
 
 function openSource(source) {
@@ -50,6 +62,7 @@ function openSource(source) {
 async function submitIngest() {
   submitting.value = true
   lastIngestResult.value = null
+  lastIngestJob.value = null
   try {
     let data
     if (addTab.value === 'url') {
@@ -58,11 +71,19 @@ async function submitIngest() {
     } else if (addTab.value === 'youtube') {
       if (!youtubeInput.value.trim()) return
       data = await api.ingestYoutube(youtubeInput.value.trim(), trustTier.value || null)
+    } else if (addTab.value === 'playlist') {
+      if (!playlistInput.value.trim()) return
+      data = await api.trackPlaylist(playlistInput.value.trim(), trustTier.value || null)
+      lastIngestResult.value = { status: 'ingested', source_created: data.created, playlist: true }
+      lastIngestJob.value = data.job || null
+      playlistInput.value = ''
+      return
     } else {
       if (!fileInput.value) return
       data = await api.ingestFile(fileInput.value, trustTier.value || null)
     }
     lastIngestResult.value = data.result
+    lastIngestJob.value = data.job || null
     if (data.result?.status !== 'failed') {
       urlInput.value = ''
       youtubeInput.value = ''
@@ -74,12 +95,21 @@ async function submitIngest() {
   }
 }
 
+async function restoreSource(source) {
+  await api.restoreSource(source.id)
+  await loadSources()
+}
+
 function onFileChange(e) {
   fileInput.value = e.target.files[0] || null
 }
 
 const backfilling = ref(false)
 const backfillResult = ref(null)
+const sweepingAds = ref(false)
+const adSweepJob = ref(null)
+const playlists = ref([])
+const playlistVideos = ref({})
 
 async function runBackfillEmbeddings() {
   backfilling.value = true
@@ -89,6 +119,16 @@ async function runBackfillEmbeddings() {
     backfillResult.value = data.result
   } finally {
     backfilling.value = false
+  }
+}
+
+async function runAdSweep() {
+  sweepingAds.value = true
+  try {
+    const data = await api.triggerAdSweep()
+    adSweepJob.value = data.job
+  } finally {
+    sweepingAds.value = false
   }
 }
 
@@ -107,6 +147,28 @@ function formatDate(iso) {
   if (!iso) return ''
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 }
+
+const lifecycleLabels = {
+  queued: 'Queued',
+  running: 'Processing',
+  ingested: 'Ingested',
+  chunked: 'Chunked',
+  ready: 'Ready',
+  partial: 'Partial',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+}
+
+const lifecycleClasses = {
+  queued: 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
+  running: 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
+  ingested: 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300',
+  chunked: 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300',
+  ready: 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300',
+  partial: 'bg-yellow-100 dark:bg-yellow-900/40 text-yellow-700 dark:text-yellow-300',
+  failed: 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300',
+  cancelled: 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300',
+}
 </script>
 
 <template>
@@ -114,6 +176,9 @@ function formatDate(iso) {
     <div class="flex items-center justify-between mb-4">
       <h2 class="text-xl font-bold text-gray-900 dark:text-white">Sources</h2>
       <div class="flex items-center gap-2">
+        <button @click="showArchived = !showArchived; loadSources()" class="px-3 py-1.5 text-sm rounded-md border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700">
+          {{ showArchived ? 'Hide archived' : 'Show archived' }}
+        </button>
         <button
           @click="runBackfillEmbeddings"
           :disabled="backfilling"
@@ -122,6 +187,14 @@ function formatDate(iso) {
         >
           <Layers class="w-4 h-4" />
           {{ backfilling ? 'Backfilling...' : 'Backfill embeddings' }}
+        </button>
+        <button
+          @click="runAdSweep"
+          :disabled="sweepingAds"
+          title="Screen existing claims for confident sponsor/ad classifications"
+          class="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 transition-colors"
+        >
+          {{ sweepingAds ? 'Queueing...' : 'Screen ads' }}
         </button>
         <button
           @click="showSearch = !showSearch; showAdd = false"
@@ -141,6 +214,8 @@ function formatDate(iso) {
     </div>
 
     <!-- Search content -->
+    <p v-if="adSweepJob" class="mb-3 text-xs text-blue-600 dark:text-blue-400">Ad screening is {{ adSweepJob.status }} and runs after active user work.</p>
+
     <div
       v-if="showSearch"
       class="mb-6 p-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg space-y-3"
@@ -188,7 +263,7 @@ function formatDate(iso) {
     >
       <div class="flex items-center gap-1 border-b border-gray-200 dark:border-gray-700">
         <button
-          v-for="tab in [{ key: 'url', label: 'URL', icon: Globe }, { key: 'youtube', label: 'YouTube', icon: Youtube }, { key: 'file', label: 'File', icon: FileUp }]"
+          v-for="tab in [{ key: 'url', label: 'URL', icon: Globe }, { key: 'youtube', label: 'YouTube', icon: Youtube }, { key: 'playlist', label: 'Playlist', icon: Youtube }, { key: 'file', label: 'File', icon: FileUp }]"
           :key="tab.key"
           @click="addTab = tab.key"
           class="flex items-center gap-1.5 px-3 py-2 text-sm border-b-2 transition-colors"
@@ -216,6 +291,13 @@ function formatDate(iso) {
         class="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white"
       />
       <input
+        v-if="addTab === 'playlist'"
+        v-model="playlistInput"
+        type="text"
+        placeholder="YouTube playlist URL — checks for new videos during idle time"
+        class="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white"
+      />
+      <input
         v-if="addTab === 'file'"
         type="file"
         @change="onFileChange"
@@ -235,7 +317,7 @@ function formatDate(iso) {
           :disabled="submitting"
           class="px-3 py-1.5 text-sm rounded-md bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
         >
-          {{ submitting ? 'Ingesting...' : 'Ingest' }}
+          {{ submitting ? 'Saving...' : (addTab === 'playlist' ? 'Track playlist' : 'Ingest') }}
         </button>
       </div>
 
@@ -248,7 +330,14 @@ function formatDate(iso) {
       >
         <template v-if="lastIngestResult.status === 'failed'">Failed: {{ lastIngestResult.error }}</template>
         <template v-else-if="lastIngestResult.status === 'unchanged'">No change — content is identical to the latest version.</template>
-        <template v-else>Ingested a new version (source {{ lastIngestResult.source_created ? 'created' : 'existing' }}).</template>
+        <template v-else-if="lastIngestResult.playlist">
+          Playlist tracking is active. New videos will be added as normal sources during idle time.
+          <span v-if="lastIngestJob"> Discovery is {{ lastIngestJob.status }}.</span>
+        </template>
+        <template v-else>
+          Ingested a new version (source {{ lastIngestResult.source_created ? 'created' : 'existing' }}).
+          <span v-if="lastIngestJob"> Automatic processing is {{ lastIngestJob.status }}.</span>
+        </template>
       </div>
     </div>
 
@@ -274,17 +363,30 @@ function formatDate(iso) {
             </span>
             <span
               class="ml-1.5"
-              :class="source.claim_count > 0 ? 'text-gray-400 dark:text-gray-500' : 'text-yellow-600 dark:text-yellow-400'"
+              :class="source.claim_count > 0 ? 'text-gray-400 dark:text-gray-500' : 'text-gray-500 dark:text-gray-400'"
             >
-              {{ source.claim_count > 0 ? `${source.claim_count} claim(s)` : 'no surviving claims' }}
+              {{ source.claim_count > 0 ? `${source.claim_count} claim(s)` : 'no claims yet' }}
             </span>
+            <span v-if="source.processing_error" class="ml-1.5 text-red-600 dark:text-red-400">{{ source.processing_error }}</span>
           </p>
         </div>
         <div class="flex items-center gap-2 shrink-0 ml-3 text-xs text-gray-400 dark:text-gray-500">
+          <button v-if="!source.is_active" @click.stop="restoreSource(source)" class="text-blue-600 dark:text-blue-400 hover:underline">Restore</button>
           <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 uppercase">{{ source.source_type_code }}</span>
+          <span class="px-1.5 py-0.5 rounded" :class="lifecycleClasses[source.lifecycle] || lifecycleClasses.ingested">
+            {{ lifecycleLabels[source.lifecycle] || source.lifecycle }}
+          </span>
           <span>{{ formatDate(source.updated_at) }}</span>
         </div>
       </div>
     </div>
+
+    <details v-if="playlists.length" class="mt-6 text-sm">
+      <summary class="cursor-pointer text-gray-600 dark:text-gray-300">Tracked playlists ({{ playlists.length }})</summary>
+      <div v-for="playlist in playlists" :key="playlist.id" class="mt-2 p-3 border rounded border-gray-200 dark:border-gray-700">
+        <div class="flex justify-between gap-2"><span>{{ playlist.title || playlist.url }}</span><button @click="showPlaylistVideos(playlist)" class="text-blue-600 hover:underline">Show videos</button></div>
+        <p v-for="video in playlistVideos[playlist.id] || []" :key="video.video_id" class="text-xs text-gray-500 mt-1">{{ video.title || video.video_id }} — {{ video.ingested_at ? 'ingested' : 'discovered' }}</p>
+      </div>
+    </details>
   </div>
 </template>

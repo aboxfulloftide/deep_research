@@ -1,6 +1,29 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+from deep_research.config import Config
 from deep_research.kb import verification as v
+
+
+async def test_batch_verification_uses_the_dedicated_verifier_endpoint(monkeypatch):
+    config = Config()
+    config.kb.extraction_llm_base_url = "http://extractor/v1"
+    config.kb.verification_llm_base_url = "http://verifier/v1"
+    seen = []
+
+    async def fake_detect(url):
+        seen.append(url)
+        return "detected-verifier"
+
+    async def fake_verify(_db, _config, claim_id, **kwargs):
+        assert kwargs["extraction_model"] == "detected-verifier"
+        return SimpleNamespace(status="unverified")
+
+    monkeypatch.setattr(v, "detect_model", fake_detect)
+    monkeypatch.setattr(v, "verify_claim", fake_verify)
+    outcomes = await v.verify_claims_concurrently(None, config, [{"id": "claim-1"}])
+    assert seen == ["http://verifier/v1"]
+    assert outcomes[0][1] == "unverified"
 
 
 # -- _Budget: pure state machine, no I/O -------------------------------------
@@ -44,6 +67,13 @@ def test_budget_stops_after_two_supports():
     budget2 = v._Budget(max_sources=10, max_searches=10)
     budget2.supports = 1
     assert budget2.should_stop() is False
+
+
+def test_budget_stops_after_an_official_weighted_corroboration():
+    budget = v._Budget(max_sources=10, max_searches=10)
+    budget.supports = 1
+    budget.support_weight = 1.0
+    assert budget.should_stop() is True
 
 
 def test_budget_does_not_stop_on_source_budget_exhaustion_alone():
@@ -374,6 +404,45 @@ async def test_rank_candidates_degrades_gracefully_when_embedding_backend_down(k
 
 
 # -- run_verification_sweep concurrency guard --------------------------------
+
+
+async def test_run_search_budget_is_atomic_and_bounded():
+    budget = v._RunSearchBudget(2)
+
+    assert await budget.reserve() is True
+    assert await budget.reserve() is True
+    assert await budget.reserve() is False
+    assert budget.used == 2
+
+
+async def test_run_search_budget_can_be_unbounded_for_explicit_actions():
+    budget = v._RunSearchBudget(None)
+
+    assert await budget.reserve() is True
+    assert await budget.reserve() is True
+    assert budget.used == 0
+
+
+async def test_batch_verification_detects_the_model_once(monkeypatch):
+    calls = {"detect": 0, "models": []}
+
+    async def fake_detect(_url):
+        calls["detect"] += 1
+        return "shared-model"
+
+    async def fake_verify(_db, _config, claim_id, **kwargs):
+        calls["models"].append(kwargs["extraction_model"])
+        return SimpleNamespace(status="supported")
+
+    monkeypatch.setattr(v, "detect_model", fake_detect)
+    monkeypatch.setattr(v, "verify_claim", fake_verify)
+
+    outcomes = await v.verify_claims_concurrently(
+        None, Config(), [{"id": "claim-1"}, {"id": "claim-2"}], concurrency=2,
+    )
+
+    assert len(outcomes) == 2
+    assert calls == {"detect": 1, "models": ["shared-model", "shared-model"]}
 # verify_claim makes real LLM calls against a single shared GPU (the machine
 # this runs on has one, with a second coming later) -- a second sweep starting
 # while one is already in progress would double up GPU load for no benefit,
@@ -532,3 +601,13 @@ async def test_set_claim_verification_context_strips_and_treats_blank_as_clear(k
 
     blanked = await kb_db.set_claim_verification_context(claim["id"], "   ")
     assert blanked["verification_context"] is None
+
+
+async def test_supporting_claims_are_durable_first_class_evidence(kb_db):
+    claim, _ = await kb_db.get_or_create_claim("fact", "Main claim")
+    support, _ = await kb_db.get_or_create_claim("fact", "Independent supporting claim")
+
+    created = await kb_db.record_claim_supports(claim["id"], [support["id"], support["id"]])
+
+    assert len(created) == 1
+    assert await kb_db.get_claim_support_ids(claim["id"]) == [support["id"]]

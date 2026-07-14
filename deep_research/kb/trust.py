@@ -22,6 +22,7 @@ import re
 
 from deep_research.config import Config, LLMConfig
 from deep_research.kb.db import KBDatabase
+from deep_research.kb.decision_log import record_decision
 from deep_research.kb.extraction import detect_model
 from deep_research.llm import LLMClient
 
@@ -71,7 +72,9 @@ async def classify_source_trust_tier(llm: LLMClient, canonical_uri: str, title: 
     ]
     resp = await llm.chat(messages)
     content = resp["choices"][0]["message"]["content"] or ""
-    return _parse_trust_tier_classification(content)
+    parsed = _parse_trust_tier_classification(content)
+    parsed["_parse_success"] = parsed.get("reasoning") != "could not parse model output"
+    return parsed
 
 
 async def set_trust_tier_if_missing(kb_db: KBDatabase, config: Config, source_id: str) -> str | None:
@@ -101,7 +104,17 @@ async def set_trust_tier_if_missing(kb_db: KBDatabase, config: Config, source_id
 
     tier = verdict.get("tier")
     confidence = verdict.get("confidence") or 0.0
-    if tier not in TRUST_TIER_CODES or confidence < TRUST_TIER_LLM_CONFIDENCE_THRESHOLD:
+    will_set = tier in TRUST_TIER_CODES and confidence >= TRUST_TIER_LLM_CONFIDENCE_THRESHOLD
+    await record_decision(
+        kb_db, "trust_tier", "source", source_id,
+        f"tier:{tier}" if will_set else "tier:left_unset",
+        confidence=confidence, reasoning=verdict.get("reasoning"), model=extraction_model,
+        parse_success=bool(verdict.get("_parse_success", True)),
+        previous_state={"trust_tier_code": source.get("trust_tier_code")},
+        resulting_state={"trust_tier_code": tier if will_set else source.get("trust_tier_code")},
+        reversible=will_set,
+    )
+    if not will_set:
         return None
 
     await kb_db.set_source_trust_tier(source_id, tier)

@@ -254,6 +254,29 @@ async def _rank_chunks_by_similarity(
     return scored
 
 
+class _RunSearchBudget:
+    """One atomic external-search allowance shared by a whole batch.
+
+    Individual claim checks already have their own small search budget. This
+    additional guard prevents concurrency from multiplying those allowances
+    into an unbounded nightly/provider bill.
+    """
+
+    def __init__(self, limit: int | None):
+        self.limit = limit
+        self.used = 0
+        self._lock = asyncio.Lock()
+
+    async def reserve(self) -> bool:
+        if self.limit is None:
+            return True
+        async with self._lock:
+            if self.used >= self.limit:
+                return False
+            self.used += 1
+            return True
+
+
 class _Budget:
     """Tracks the per-claim verification budget and the stop conditions.
 
@@ -275,6 +298,10 @@ class _Budget:
         self.external_sources_examined = 0
         self.web_searches_used = 0
         self.supports = 0
+        # Evidence quality matters: an official corroboration can settle a
+        # claim, whereas weaker sources must accumulate. `supports` remains a
+        # count for backwards-compatible reporting; this is the verdict gate.
+        self.support_weight = 0.0
         self.contradicts = 0
 
     @property
@@ -295,14 +322,14 @@ class _Budget:
         return self.web_searches_used < self.max_searches
 
     def should_stop(self) -> bool:
-        return self.contradicts > 0 or self.supports >= 2
+        return self.contradicts > 0 or self.support_weight >= 1.0 or self.supports >= 2
 
     def final_status(self) -> str:
         if self.contradicts > 0 and self.supports > 0:
             return "mixed"
         if self.contradicts > 0:
             return "contradicted"
-        if self.supports >= 2:
+        if self.support_weight >= 1.0 or self.supports >= 2:
             return "supported"
         return "unverified"
 
@@ -353,6 +380,13 @@ async def _examine_candidates(
         relationship = result.get("relationship")
         if relationship == "supports":
             budget.supports += 1
+            # Default unknown sources to 0.5, preserving the prior
+            # two-independent-source behavior. Explicitly classified tiers
+            # use their trust ranking, so one official source (1.0) suffices.
+            tier_weights = {"official": 1.0, "reputable_reporting": 0.75,
+                            "secondary_analysis": 0.5, "user_generated": 0.25}
+            source_weight = max((tier_weights.get(s.get("trust_tier_code"), 0.5) for s in other_sources), default=0.5)
+            budget.support_weight += source_weight
             if supporting_ids is not None:
                 supporting_ids.append(other_claim["id"])
         elif relationship == "contradicts":
@@ -402,6 +436,7 @@ async def _resolve_new_verification_claims(
 
 async def verify_claim(
     kb_db: KBDatabase, config: Config, claim_id: str, force: bool = False,
+    run_search_budget: _RunSearchBudget | None = None, extraction_model: str | None = None,
 ) -> VerificationResult:
     claim = await kb_db.get_claim(claim_id)
     if claim is None:
@@ -429,9 +464,13 @@ async def verify_claim(
     # exists (see _quarantine_new_verification_claims).
     own_topics = await kb_db.get_topics_for_claim(claim_id)
 
-    extraction_base_url = config.kb.extraction_llm_base_url
-    with _timed(timings, "detect_model"):
-        extraction_model = config.kb.extraction_llm_model or await detect_model(extraction_base_url)
+    extraction_base_url = config.kb.verification_llm_base_url or config.kb.extraction_llm_base_url
+    if extraction_model is None:
+        with _timed(timings, "detect_model"):
+            extraction_model = (
+                config.kb.verification_llm_model or config.kb.extraction_llm_model
+                or await detect_model(extraction_base_url)
+            )
     llm = LLMClient(Config(llm=LLMConfig(base_url=extraction_base_url, model=extraction_model, api_key="not-needed")))
 
     try:
@@ -450,6 +489,8 @@ async def verify_claim(
         # and budget remains.
         snapshot_store = SnapshotStore(config.kb_snapshot_dir)
         while not budget.should_stop() and budget.searches_remaining():
+            if run_search_budget is not None and not await run_search_budget.reserve():
+                break
             budget.web_searches_used += 1
             if tried_queries or verification_context:
                 # Either not the first search attempted against this claim
@@ -478,7 +519,9 @@ async def verify_claim(
                 if budget.should_stop() or not budget.sources_remaining("external"):
                     break
                 with _timed(timings, "scrape_ingest"):
-                    ingest_result = await ingest_web_page(result.url, config, kb_db, snapshot_store)
+                    ingest_result = await ingest_web_page(
+                        result.url, config, kb_db, snapshot_store, source_purpose="verification_evidence",
+                    )
                 if ingest_result.status == "failed" or ingest_result.source_id in examined_source_ids:
                     continue
 
@@ -564,6 +607,7 @@ async def verify_claim(
         "timings": timings,
         "web_search_queries": tried_queries,
     }
+    await kb_db.record_claim_supports(claim_id, supporting_ids)
     await kb_db.update_claim_verification(claim_id, status, notes)
 
     return VerificationResult(
@@ -649,6 +693,7 @@ def claim_check_status(claim: dict, threshold: float) -> str:
 async def verify_claims_concurrently(
     kb_db: KBDatabase, config: Config, claims: list[dict], *, force: bool = False,
     concurrency: int | None = None, on_start=None, on_result=None,
+    run_search_budget: _RunSearchBudget | None = None,
 ) -> list[tuple[dict, str, "VerificationResult | Exception"]]:
     """Verifies many claims at once, up to `concurrency` in flight
     simultaneously (default: config.kb.verification_concurrency, which should
@@ -669,6 +714,16 @@ async def verify_claims_concurrently(
     own per-source exception handling.
     """
     concurrency = concurrency or config.kb.verification_concurrency
+    # A 100-claim sweep used to make 100 identical /models probes. Resolve
+    # once before spawning tasks, then keep the actual verification calls
+    # concurrent as configured.
+    shared_model = None
+    if claims:
+        verification_base_url = config.kb.verification_llm_base_url or config.kb.extraction_llm_base_url
+        shared_model = (
+            config.kb.verification_llm_model or config.kb.extraction_llm_model
+            or await detect_model(verification_base_url)
+        )
     semaphore = asyncio.Semaphore(max(1, concurrency))
     outcomes: list[tuple[dict, str, "VerificationResult | Exception"]] = []
 
@@ -677,7 +732,10 @@ async def verify_claims_concurrently(
             if on_start:
                 await on_start(claim)
             try:
-                result = await verify_claim(kb_db, config, claim["id"], force=force)
+                result = await verify_claim(
+                    kb_db, config, claim["id"], force=force, run_search_budget=run_search_budget,
+                    extraction_model=shared_model,
+                )
                 status = result.status
             except Exception as exc:
                 result = exc
@@ -721,12 +779,19 @@ async def run_verification_sweep(
         )
 
     all_claims = await kb_db.list_claims(limit=10000)
+    # Work on attached, high-importance claims first. If the run is bounded
+    # by time or its shared search quota, the claims users deliberately put
+    # in topics receive the most valuable coverage.
+    all_claims.sort(
+        key=lambda claim: (bool(claim.get("topics")), claim.get("importance_score") or 0), reverse=True,
+    )
     eff_threshold = threshold if threshold is not None else config.kb.verification_importance_threshold
     eligible = [c for c in all_claims if is_claim_eligible_for_verification(c, eff_threshold, force=force)]
     if limit is not None:
         eligible = eligible[:limit]
 
     counts = {"supported": 0, "contradicted": 0, "mixed": 0, "unverified": 0, "skipped": 0, "failed": 0}
+    run_search_budget = _RunSearchBudget(config.kb.verification_run_max_web_searches)
     run = await kb_db.create_verification_run(trigger, claims_total=len(eligible))
     in_flight: dict[str, str] = {}
     in_flight_lock = asyncio.Lock()
@@ -748,11 +813,15 @@ async def run_verification_sweep(
     try:
         await verify_claims_concurrently(
             kb_db, config, eligible, force=force, concurrency=concurrency,
-            on_start=handle_start, on_result=handle_result,
+            on_start=handle_start, on_result=handle_result, run_search_budget=run_search_budget,
         )
         await kb_db.complete_verification_run(run["id"])
     except Exception as exc:
         await kb_db.complete_verification_run(run["id"], error_message=str(exc))
         raise
 
-    return {"run_id": run["id"], "eligible_count": len(eligible), "threshold": eff_threshold, "counts": counts}
+    return {
+        "run_id": run["id"], "eligible_count": len(eligible), "threshold": eff_threshold,
+        "counts": counts, "web_searches_used": run_search_budget.used,
+        "web_search_limit": run_search_budget.limit,
+    }

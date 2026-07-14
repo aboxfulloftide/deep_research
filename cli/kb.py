@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import os
 import sys
 
 import httpx
@@ -7,27 +8,52 @@ from rich.console import Console
 from rich.table import Table
 
 from deep_research.config import load_config
-from deep_research.kb.ad_check import check_claims_for_ads
-from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import backfill_embeddings, embed_texts
-from deep_research.kb.extraction import run_extraction
 from deep_research.kb.ingest import ingest_file, ingest_web_page, ingest_youtube_video
+from deep_research.kb.jobs import ProcessingJobWorker, enqueue_manual_job, enqueue_playlist_poll, enqueue_source_pipeline
 from deep_research.kb.merge import review_and_execute
+from deep_research.kb.playlists import track_youtube_playlist
 from deep_research.kb.reports import generate_topic_report
-from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
 from deep_research.kb.timeline import get_topic_timeline
-from deep_research.kb.topics import check_claims_against_topics, generate_topic_suggestions
-from deep_research.kb.trust import set_trust_tier_if_missing
-from deep_research.kb.verification import (
-    is_claim_eligible_for_verification,
-    run_verification_sweep,
-    verify_claim,
-    verify_claims_concurrently,
-)
+from deep_research.kb.topics import generate_topic_suggestions
 
 console = Console()
+
+
+async def _wait_for_job(kb_db, config, snapshot_store, job_id: str) -> dict:
+    """Drive or observe a durable job until it reaches a terminal state.
+
+    The advisory lock inside ProcessingJobWorker means this is safe alongside
+    the web worker: if another process owns the work, this command simply
+    observes its persisted stage rather than launching a competing model run.
+    """
+    worker = ProcessingJobWorker(kb_db, config, snapshot_store)
+    last_stage = None
+    while True:
+        job = await kb_db.get_processing_job(job_id)
+        if job is None:
+            raise RuntimeError(f"Queued job {job_id!r} disappeared")
+        if job["status"] in ("partial", "failed", "completed", "cancelled"):
+            return job
+        if job["stage"] != last_stage:
+            console.print(f"  [dim]pipeline: {job['stage']}[/dim]")
+            last_stage = job["stage"]
+        ran = await worker.run_once()
+        if not ran:
+            await asyncio.sleep(0.5)
+
+
+def _print_job_result(job: dict) -> None:
+    if job["status"] == "completed":
+        console.print("[green]Processing complete.[/green]")
+    elif job["status"] == "partial":
+        console.print(f"[yellow]Processing completed partially.[/yellow] {job.get('error_message') or ''}")
+    elif job["status"] == "cancelled":
+        console.print("[yellow]Processing cancelled.[/yellow]")
+    else:
+        console.print(f"[red]Processing failed:[/red] {job.get('error_message') or 'unknown error'}")
 
 
 def _fmt_ts(value) -> str:
@@ -62,27 +88,86 @@ async def cmd_ingest_url(args):
     config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
     result = await ingest_web_page(args.url, config, kb_db, snapshot_store, trust_tier_code=args.trust_tier)
-    if result.status != "failed" and result.source_id:
-        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     _print_result(result, args.url)
+    if result.status != "failed" and result.source_id and result.version_id:
+        job, _ = await enqueue_source_pipeline(kb_db, result.source_id, result.version_id)
+        console.print("[dim]Automatic processing queued.[/dim]")
+        _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
 
 
 async def cmd_ingest_youtube(args):
     config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
     result = await ingest_youtube_video(args.url, kb_db, snapshot_store, trust_tier_code=args.trust_tier)
-    if result.status != "failed" and result.source_id:
-        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     _print_result(result, args.url)
+    if result.status != "failed" and result.source_id and result.version_id:
+        job, _ = await enqueue_source_pipeline(kb_db, result.source_id, result.version_id)
+        console.print("[dim]Automatic processing queued.[/dim]")
+        _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
+
+
+async def cmd_track_playlist(args):
+    config, kb_db, snapshot_store = _kb_setup(args)
+    await kb_db.init()
+    playlist, created = await track_youtube_playlist(kb_db, args.url, args.trust_tier)
+    job, _ = await enqueue_playlist_poll(kb_db, playlist["id"])
+    console.print(f"[green]{'Tracking' if created else 'Already tracking'}[/green] {playlist['url']}")
+    if args.now:
+        _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
+
+
+async def _run_kb_subcommand(config_path: str | None, command: list[str], env: dict[str, str]) -> None:
+    args = [sys.executable, "-m", "cli.kb"]
+    if config_path:
+        args += ["--config", config_path]
+    process = await asyncio.create_subprocess_exec(*args, *command, env={**os.environ, **env})
+    if await process.wait():
+        raise RuntimeError(f"Nightly step failed: {' '.join(command)}")
+
+
+async def cmd_nightly_role_split(args):
+    """One controlled 30B-extract -> 14B-verify nightly server swap.
+
+    Profiles come from the local evaluation registry so paths/launch flags are
+    never embedded in app code. The production KB config stays the source of
+    DB and snapshot settings; only each role's server endpoint is overridden.
+    """
+    from deep_research.evals import registry
+    from deep_research.evals.server import start_server, stop_server
+
+    config = load_config(args.config)
+    extractor = await registry.get_model(config, args.extractor)
+    verifier = await registry.get_model(config, args.verifier)
+    if not extractor or not verifier:
+        raise RuntimeError("Both --extractor and --verifier must be registered eval model slugs")
+    ready, log = await start_server(extractor)
+    if not ready:
+        raise RuntimeError(f"Extractor server did not become healthy; see {log}")
+    try:
+        await _run_kb_subcommand(args.config, ["extract-pending", "--limit", str(args.extract_limit)], {
+            "DEEP_RESEARCH_KB_EXTRACTION_LLM_BASE_URL": f"http://127.0.0.1:{extractor['port']}/v1",
+        })
+    finally:
+        if not await stop_server(extractor):
+            raise RuntimeError("Extractor server did not stop; refusing to load verifier on the same GPU")
+    ready, log = await start_server(verifier)
+    if not ready:
+        raise RuntimeError(f"Verifier server did not become healthy; see {log}")
+    await _run_kb_subcommand(args.config, ["verify-unverified", "--trigger", "cron", "--limit", str(args.verify_limit)], {
+        "DEEP_RESEARCH_KB_VERIFICATION_LLM_BASE_URL": f"http://127.0.0.1:{verifier['port']}/v1",
+    })
+    console.print("[green]Nightly role split complete; verifier remains loaded for interactive work.[/green]")
 
 
 async def cmd_ingest_file(args):
     config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
     result = await ingest_file(args.path, kb_db, snapshot_store, trust_tier_code=args.trust_tier)
-    if result.status != "failed" and result.source_id:
-        await set_trust_tier_if_missing(kb_db, config, result.source_id)
     _print_result(result, args.path)
+    if result.status != "failed" and result.source_id and result.version_id:
+        job, _ = await enqueue_source_pipeline(kb_db, result.source_id, result.version_id)
+        console.print("[dim]Automatic processing queued.[/dim]")
+        _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
 
 
 async def cmd_list_sources(args):
@@ -178,20 +263,12 @@ async def cmd_chunk_source(args):
         console.print(f"[red]No ingested version found for source {match['id']}[/red]")
         return
 
-    result = await build_artifact_for_version(
-        kb_db, snapshot_store, match, version, config=config, chunk_size=args.chunk_size,
+    job = await enqueue_manual_job(
+        kb_db, "source_pipeline", "source", match["id"], source_id=match["id"],
+        payload={"version_id": version["id"], "chunk_size": args.chunk_size},
     )
-
-    verb = {
-        "chunked": "[green]Chunked[/green]",
-        "unchanged": "[yellow]Already chunked (unchanged)[/yellow]",
-        "empty": "[yellow]No extractable text found[/yellow]",
-    }[result.status]
-    console.print(f"{verb} {match.get('title') or match['id']}")
-    console.print(f"  artifact_id: {result.artifact_id} ({'new generation' if result.artifact_created else 'existing'})")
-    console.print(f"  chunks:      {result.chunk_count}")
-    if result.status == "chunked":
-        console.print(f"  embedded:    {result.embedded_count}/{result.chunk_count}")
+    console.print(f"[dim]Queued full source pipeline for {match.get('title') or match['id']}.[/dim]")
+    _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
 
 
 async def cmd_search(args):
@@ -222,7 +299,7 @@ async def cmd_search(args):
 
 
 async def cmd_extract_source(args):
-    config, kb_db, _ = _kb_setup(args)
+    config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
 
     match = await _resolve_source(kb_db, args.source_id)
@@ -235,52 +312,40 @@ async def cmd_extract_source(args):
         console.print(f"[red]No ingested version found for source {match['id']}[/red]")
         return
 
-    artifacts = await kb_db.get_current_artifacts_for_version(version["id"])
-    if not artifacts:
-        console.print(f"[red]No chunked artifact found — run `chunk-source {match['id'][:8]}` first[/red]")
-        return
-    artifact = artifacts[0]
+    job = await enqueue_manual_job(
+        kb_db, "source_pipeline", "source", match["id"], source_id=match["id"],
+        payload={"version_id": version["id"], "force_extract": args.force},
+    )
+    console.print(f"[dim]Queued full source pipeline for {match.get('title') or match['id']}.[/dim]")
+    _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
 
-    console.print(f"Extracting from {match.get('title') or match['id']}...")
-    extraction_result = await run_extraction(kb_db, config, artifact["id"], force=args.force)
 
-    if extraction_result.status == "empty":
-        console.print("[yellow]No chunks to extract from.[/yellow]")
+async def cmd_extract_pending(args):
+    """Batch the sources that were chunked but have never been extracted.
+
+    This is the first half of the nightly model-role split.  Each source is
+    still routed through the durable worker, but verification is explicitly
+    deferred so the caller can swap to the verifier model before the next
+    nightly step.
+    """
+    config, kb_db, snapshot_store = _kb_setup(args)
+    await kb_db.init()
+    pending = await kb_db.list_sources_pending_extraction(args.limit)
+    if not pending:
+        console.print("[dim]No chunked sources are pending extraction.[/dim]")
         return
-    if extraction_result.status == "unchanged":
-        console.print(
-            f"[yellow]Already extracted with this model/prompt (run {extraction_result.extraction_run_id})[/yellow]"
+    console.print(f"[dim]Extracting {len(pending)} pending source(s).[/dim]")
+    failures = 0
+    for source in pending:
+        job, _ = await enqueue_source_pipeline(
+            kb_db, source["id"], source["version_id"], defer_verification=True,
         )
-        console.print(f"  observations: {extraction_result.observation_count}")
-        return
-
-    verb = "[green]Extracted[/green]" if extraction_result.status == "extracted" else "[yellow]Partially extracted[/yellow]"
-    console.print(f"{verb} — {extraction_result.observation_count} observation(s) from {extraction_result.chunk_count} chunk(s)")
-    if extraction_result.failed_chunk_count:
-        console.print(f"  [red]{extraction_result.failed_chunk_count} chunk(s) failed — rerun to retry[/red]")
-
-    console.print("Resolving and promoting...")
-    promotion = await resolve_and_promote(kb_db, config, extraction_result.extraction_run_id)
-    console.print(f"  promoted:          {promotion.promoted_count}")
-    console.print(f"  new claims:        {promotion.new_claim_count}")
-    console.print(f"  new entities:      {promotion.new_entity_count}")
-    console.print(f"  entity candidates: {promotion.entity_candidate_count}")
-    console.print(f"  claim candidates:  {promotion.claim_candidate_count}")
-
-    ad_flagged = await check_claims_for_ads(kb_db, config, promotion.new_claim_ids)
-    if ad_flagged:
-        console.print(f"  ad/sponsor claims excluded from verification: {len(ad_flagged)}")
-
-    # Forward-check (decision 27): new claims get checked against every
-    # existing topic, not just topics created after this point.
-    topic_results = await check_claims_against_topics(kb_db, config, promotion.new_claim_ids)
-    if topic_results:
-        console.print("  topic suggestions:")
-        for topic_id, result in topic_results.items():
-            topic = await kb_db.get_topic(topic_id)
-            console.print(
-                f"    {topic['name']}: {result.claims_suggested} claim(s), {result.sources_suggested} source(s)"
-            )
+        console.print(f"[dim]{source.get('title') or source['id']}[/dim]")
+        result = await _wait_for_job(kb_db, config, snapshot_store, job["id"])
+        _print_job_result(result)
+        failures += result["status"] in ("failed", "partial")
+    if failures:
+        raise RuntimeError(f"{failures} source(s) did not extract completely")
 
 
 async def cmd_list_claims(args):
@@ -415,7 +480,7 @@ def _print_verification_result(result):
 
 
 async def cmd_verify_claim(args):
-    config, kb_db, _ = _kb_setup(args)
+    config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
 
     claims = await kb_db.list_claims(limit=5000)
@@ -424,13 +489,15 @@ async def cmd_verify_claim(args):
         console.print(f"[red]No claim found matching ID prefix {args.claim_id!r}[/red]")
         return
 
-    console.print(f"Verifying: {match['canonical_text']}")
-    result = await verify_claim(kb_db, config, match["id"], force=args.force)
-    _print_verification_result(result)
+    job = await enqueue_manual_job(
+        kb_db, "claim_verify", "claim", match["id"], payload={"force": args.force},
+    )
+    console.print(f"[dim]Queued verification: {match['canonical_text']}[/dim]")
+    _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
 
 
 async def cmd_verify_source(args):
-    config, kb_db, _ = _kb_setup(args)
+    config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
 
     match = await _resolve_source(kb_db, args.source_id)
@@ -438,32 +505,12 @@ async def cmd_verify_source(args):
         console.print(f"[red]No source found matching ID prefix {args.source_id!r}[/red]")
         return
 
-    all_claims = await kb_db.list_claims(limit=5000)
-    evidence_by_claim = {}
-    for c in all_claims:
-        evidence = await kb_db.list_claim_evidence(c["id"])
-        if any(e["source_id"] == match["id"] for e in evidence):
-            evidence_by_claim[c["id"]] = c
-
-    threshold = args.threshold if args.threshold is not None else config.kb.verification_importance_threshold
-    eligible = [
-        c for c in evidence_by_claim.values()
-        if is_claim_eligible_for_verification(c, threshold, force=args.force)
-    ]
-    if not eligible:
-        console.print(f"[dim]No unverified claims from this source at or above importance {threshold}.[/dim]")
-        return
-
-    console.print(f"Verifying {len(eligible)} claim(s) from {match.get('title') or match['id']}...")
-
-    async def on_result(claim, status, result):
-        console.print(f"\n[bold]{claim['canonical_text']}[/bold]")
-        if status == "failed":
-            console.print(f"[red]failed: {result}[/red]")
-        else:
-            _print_verification_result(result)
-
-    await verify_claims_concurrently(kb_db, config, eligible, force=args.force, on_result=on_result)
+    job = await enqueue_manual_job(
+        kb_db, "source_verify", "source", match["id"], source_id=match["id"],
+        payload={"verification_threshold": args.threshold, "force": args.force},
+    )
+    console.print(f"[dim]Queued verification for {match.get('title') or match['id']}.[/dim]")
+    _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
 
 
 async def cmd_verify_unverified(args):
@@ -474,32 +521,37 @@ async def cmd_verify_unverified(args):
     having to click into it individually. Same eligibility rule as
     verify-source (importance threshold, not already attempted unless
     --force), just across the whole KB instead of one source's claims."""
-    config, kb_db, _ = _kb_setup(args)
+    config, kb_db, snapshot_store = _kb_setup(args)
     await kb_db.init()
 
-    seen = {"n": 0}
-
-    def on_result(claim, status, result):
-        seen["n"] += 1
-        console.print(f"\n[{seen['n']}] [bold]{claim['canonical_text']}[/bold]")
-        if status == "failed":
-            console.print(f"[red]failed: {result}[/red]")
-        else:
-            _print_verification_result(result)
-
-    summary = await run_verification_sweep(
-        kb_db, config, trigger=args.trigger, threshold=args.threshold,
-        limit=args.limit, force=args.force, on_result=on_result,
+    job = await enqueue_manual_job(
+        kb_db, "verification_sweep", "knowledge_base", "default",
+        payload={"verification_threshold": args.threshold, "limit": args.limit, "force": args.force},
     )
-    if summary["eligible_count"] == 0:
-        console.print(f"[dim]No unverified claims at or above importance {summary['threshold']}.[/dim]")
+    console.print("[dim]Queued KB-wide verification sweep.[/dim]")
+    _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
+
+
+async def cmd_ad_sweep(args):
+    config, kb_db, snapshot_store = _kb_setup(args)
+    await kb_db.init()
+    job = await enqueue_manual_job(
+        kb_db, "ad_sweep", "knowledge_base", "default", payload={"limit": args.limit},
+    )
+    console.print("[dim]Queued retroactive ad/sponsor sweep.[/dim]")
+    _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
+
+
+async def cmd_triage_contradiction(args):
+    config, kb_db, snapshot_store = _kb_setup(args)
+    await kb_db.init()
+    candidates = await kb_db.list_resolution_candidates(candidate_type="claim_contradiction", status=None, limit=5000)
+    candidate = next((c for c in candidates if c["id"].startswith(args.candidate_id)), None)
+    if candidate is None:
+        console.print(f"[red]No contradiction candidate matching {args.candidate_id!r}[/red]")
         return
-
-    counts = summary["counts"]
-    console.print(
-        f"\n[bold]Done.[/bold] supported={counts['supported']} contradicted={counts['contradicted']} "
-        f"mixed={counts['mixed']} unverified={counts['unverified']} skipped={counts['skipped']} failed={counts['failed']}"
-    )
+    job = await enqueue_manual_job(kb_db, "contradiction_triage", "resolution_candidate", candidate["id"])
+    _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))
 
 
 async def _resolve_topic(kb_db, topic_id_prefix: str) -> dict | None:
@@ -697,6 +749,19 @@ def main():
     p_yt.add_argument("--trust-tier")
     p_yt.set_defaults(func=cmd_ingest_youtube)
 
+    p_playlist = subparsers.add_parser("track-playlist", help="Track a YouTube playlist as discovery, not as a source")
+    p_playlist.add_argument("url")
+    p_playlist.add_argument("--trust-tier", choices=["official", "reputable_reporting", "secondary_analysis", "user_generated"])
+    p_playlist.add_argument("--now", action="store_true", help="Run the first discovery pass when the GPU is idle")
+    p_playlist.set_defaults(func=cmd_track_playlist)
+
+    p_nightly = subparsers.add_parser("nightly-role-split", help="Run registered extractor then verifier models in one nightly swap")
+    p_nightly.add_argument("--extractor", default="qwen3-30b", help="Registered extractor model slug")
+    p_nightly.add_argument("--verifier", default="qwen3-14b", help="Registered verifier model slug")
+    p_nightly.add_argument("--extract-limit", type=int, default=100)
+    p_nightly.add_argument("--verify-limit", type=int, default=1000)
+    p_nightly.set_defaults(func=cmd_nightly_role_split)
+
     p_file = subparsers.add_parser("ingest-file", help="Ingest a local file (PDF, Markdown, text, HTML, docx)")
     p_file.add_argument("path")
     p_file.add_argument("--trust-tier")
@@ -725,6 +790,12 @@ def main():
     p_extract.add_argument("source_id", help="Source ID or prefix")
     p_extract.add_argument("--force", action="store_true", help="Re-extract even if this model/prompt already ran")
     p_extract.set_defaults(func=cmd_extract_source)
+
+    p_extract_pending = subparsers.add_parser(
+        "extract-pending", help="Extract every chunked source with no completed extraction; does not verify",
+    )
+    p_extract_pending.add_argument("--limit", type=int, default=100, help="Cap sources in this batch")
+    p_extract_pending.set_defaults(func=cmd_extract_pending)
 
     p_claims = subparsers.add_parser("list-claims", help="List canonical claims")
     p_claims.add_argument("--limit", type=int, default=100)
@@ -774,6 +845,16 @@ def main():
         help="Recorded on the verification_runs row so the status page can show what kicked off the run",
     )
     p_verify_unverified.set_defaults(func=cmd_verify_unverified)
+
+    p_ad_sweep = subparsers.add_parser(
+        "ad-sweep", help="Confidence-gated retroactive sponsor/ad screening for existing claims",
+    )
+    p_ad_sweep.add_argument("--limit", type=int, default=10000)
+    p_ad_sweep.set_defaults(func=cmd_ad_sweep)
+
+    p_triage = subparsers.add_parser("triage-contradiction", help="Prepare advisory evidence-quality guidance; never resolves a contradiction")
+    p_triage.add_argument("candidate_id", help="Contradiction candidate ID or prefix")
+    p_triage.set_defaults(func=cmd_triage_contradiction)
 
     p_create_topic = subparsers.add_parser("create-topic", help="Create a topic")
     p_create_topic.add_argument("name")
