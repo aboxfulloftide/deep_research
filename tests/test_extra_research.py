@@ -53,3 +53,22 @@ async def test_extra_research_runs_three_levels_and_returns_synthesis(monkeypatc
     assert [level for level, _ in calls] == [1, 2, 3]
     assert len([event for event in events if event["event"] == "status"]) == 6
     assert events[-1] == {"event": "answer", "data": "primary source comparison\nindependent benchmark analysis"}
+
+
+@pytest.mark.asyncio
+async def test_follow_up_query_planning_falls_back_to_evidence_title():
+    class FailingLLM:
+        async def chat(self, messages):
+            raise RuntimeError("model unavailable")
+
+    queries = await extra.derive_follow_up_queries(
+        FailingLLM(),
+        "original question",
+        [extra.ResearchSource("Qwen coding guide", "https://example.test", "evidence", 1, "original question")],
+        1,
+    )
+
+    assert queries == [
+        "Qwen coding guide official documentation technical details",
+        "Qwen coding guide independent comparison limitations benchmarks",
+    ]

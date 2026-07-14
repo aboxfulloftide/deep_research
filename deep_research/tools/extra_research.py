@@ -131,7 +131,11 @@ async def derive_follow_up_queries(
         },
     ]
     try:
-        response = await llm.chat(messages)
+        # Query planning is helpful but must never hold up the whole research
+        # run. Smaller local models can spend a long time in reasoning mode
+        # for this tiny task, so fall back promptly to evidence-derived
+        # searches instead.
+        response = await asyncio.wait_for(llm.chat(messages), timeout=20)
         content = response["choices"][0]["message"].get("content", "")
         queries = _parse_queries(content, original_query)
     except Exception:
@@ -140,9 +144,11 @@ async def derive_follow_up_queries(
     # A reliable fallback keeps Extra mode useful with smaller models that
     # cannot follow the query-planning format.
     if len(queries) < FOLLOW_UP_QUERY_LIMIT:
+        anchor = next((source.title for source in reversed(evidence) if source.title), original_query)
+        anchor = anchor[:120]
         fallbacks = [
-            f"{original_query} primary sources technical details",
-            f"{original_query} independent comparison limitations",
+            f"{anchor} official documentation technical details",
+            f"{anchor} independent comparison limitations benchmarks",
         ]
         known = {query.lower() for query in queries} | {original_query.lower()}
         queries.extend(query for query in fallbacks if query.lower() not in known)
