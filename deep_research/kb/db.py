@@ -2741,7 +2741,8 @@ class KBDatabase:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "UPDATE processing_jobs SET status = 'queued', leased_by = NULL, lease_expires_at = NULL, "
-                "stage = 'waiting_for_gpu', updated_at = $1 WHERE id = $2 AND status = 'running' RETURNING *",
+                "stage = 'waiting_for_gpu', attempt_count = GREATEST(attempt_count - 1, 0), "
+                "updated_at = $1 WHERE id = $2 AND status = 'running' RETURNING *",
                 now, job_id,
             )
         if row is None:

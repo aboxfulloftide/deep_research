@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 
 from deep_research.config import Config, LLMConfig
 from deep_research.evals import registry
@@ -39,11 +40,36 @@ async def available_profiles(config: Config) -> dict:
     }
 
 
+async def _active_profile(config: Config, active_model: str) -> dict | None:
+    """Find the registry profile backing the currently loaded primary model.
+
+    A registered profile carries the exact launch arguments needed to restore
+    the manually managed 8080 server after an alternate-model experiment.
+    """
+    active_path = Path(active_model).expanduser()
+    try:
+        active_path = active_path.resolve()
+    except OSError:
+        pass
+    for candidate in await registry.list_models(config):
+        candidate_path = Path(candidate["model_path"]).expanduser()
+        try:
+            candidate_path = candidate_path.resolve()
+        except OSError:
+            pass
+        if candidate_path == active_path:
+            primary = dict(candidate)
+            primary["port"] = 8080
+            return primary
+    return None
+
+
 async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
-    """Compare one model/config without changing the primary llama server.
+    """Compare one model/config while preserving the primary llama server.
 
     Alternate profiles run on their registry evaluation port and are stopped
-    afterward. The 8080 interactive/KB server is never stopped or reloaded.
+    afterward. If an alternate cannot coexist in VRAM, the idle primary is
+    temporarily swapped out and restored before normal queue work can resume.
     """
     payload = job.get("payload") or {}
     prompt = (payload.get("prompt") or "").strip()
@@ -53,6 +79,7 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
     reasoning = bool(payload.get("reasoning", True))
     requested_context = payload.get("context_size")
     started_profile = None
+    primary_to_restore = None
 
     if profile_slug == "current":
         base_url = config.llm.llama_cpp_base_url
@@ -68,11 +95,29 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
         if requested_context:
             server_args["context"] = int(requested_context)
         profile["server_args_json"] = json.dumps(server_args)
-        # Never replace the primary server. This temporary server only starts
-        # after the worker's normal-work and GPU-idle gates have passed.
+        primary_model = await detect_model(config.llm.llama_cpp_base_url)
+        # Two copies of the same compact model can coexist on this machine,
+        # which lets us compare context/reasoning settings without touching
+        # the interactive server. A larger/different profile cannot coexist
+        # in VRAM, so the worker safely swaps only after its queue/GPU gates
+        # have found normal work idle, then restores the primary in `finally`.
+        if Path(profile["model_path"]).expanduser() != Path(primary_model).expanduser():
+            primary_to_restore = await _active_profile(config, primary_model)
+            if primary_to_restore is None:
+                raise RuntimeError(
+                    "Cannot safely swap models because the active 8080 model is not registered for restoration",
+                )
+            await kb_db.update_processing_job_progress(
+                job["id"], "swapping_model",
+                {"from_model": primary_model, "to_profile": profile_slug}, lease_seconds=900,
+            )
+            if not await stop_server(primary_to_restore):
+                raise RuntimeError("Could not stop the idle primary llama.cpp server for the experiment")
         if not await is_healthy(profile["port"]):
             ready, log_path = await start_server(profile)
             if not ready:
+                if primary_to_restore is not None:
+                    await start_server(primary_to_restore)
                 raise RuntimeError(f"Experiment server did not become ready; see {log_path}")
             started_profile = profile
         try:
@@ -82,6 +127,10 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
         except Exception:
             if started_profile is not None:
                 await stop_server(started_profile)
+            if primary_to_restore is not None:
+                ready, log_path = await start_server(primary_to_restore)
+                if not ready:
+                    raise RuntimeError(f"Could not restore the primary llama.cpp server; see {log_path}")
             raise
         display_name = profile["display_name"]
 
@@ -127,3 +176,10 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
     finally:
         if started_profile is not None:
             await stop_server(started_profile)
+        if primary_to_restore is not None:
+            await kb_db.update_processing_job_progress(
+                job["id"], "restoring_model", {"profile": primary_to_restore["slug"]}, lease_seconds=900,
+            )
+            ready, log_path = await start_server(primary_to_restore)
+            if not ready:
+                raise RuntimeError(f"Could not restore the primary llama.cpp server; see {log_path}")

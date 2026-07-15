@@ -54,7 +54,9 @@ alternate profile, with an optional context-window override and reasoning
 enabled or disabled. Experiments are deliberately low priority: they wait for
 all ingestion and verification jobs to drain and for the GPU to be idle.
 Alternate profiles run temporarily on their evaluation port and are stopped
-afterward; the primary llama.cpp server is never replaced or reloaded.
+afterward. If a larger alternate profile cannot fit alongside the primary
+model, the worker waits until the queue is idle, temporarily swaps models for
+the experiment, and restores the primary server before normal work resumes.
 
 ## CLI
 

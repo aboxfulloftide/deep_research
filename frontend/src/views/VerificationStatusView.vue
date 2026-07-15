@@ -145,7 +145,7 @@ const STAGE_PROGRESS = {
   contradiction_triage: { queued: 0, triage: 55, complete: 100 },
   counter_evidence: { queued: 0, counter_evidence: 55, complete: 100 },
   topic_discovery: { queued: 0, discover: 55, complete: 100 },
-  model_experiment: { waiting_for_idle: 0, gather_sources: 25, evaluate: 65, complete: 100 },
+  model_experiment: { waiting_for_idle: 0, waiting_for_gpu: 0, swapping_model: 10, gather_sources: 25, evaluate: 65, restoring_model: 90, complete: 100 },
 }
 
 function jobProgressPercent(job) {
@@ -153,7 +153,7 @@ function jobProgressPercent(job) {
 }
 
 function stageLabel(job) {
-  return ({ trust: 'Assessing source', chunk: 'Preparing content', extract: 'Extracting claims', ad_check: 'Screening ads', attach: 'Connecting topic', verify: 'Checking evidence', report: 'Refreshing report', discover: 'Discovering videos', triage: 'Reviewing contradiction', counter_evidence: 'Finding counter-evidence', gather_sources: 'Gathering test sources', evaluate: 'Running model test', waiting_for_idle: 'Waiting for idle GPU', queued: 'Waiting in queue' })[job.stage] || job.stage
+  return ({ trust: 'Assessing source', chunk: 'Preparing content', extract: 'Extracting claims', ad_check: 'Screening ads', attach: 'Connecting topic', verify: 'Checking evidence', report: 'Refreshing report', discover: 'Discovering videos', triage: 'Reviewing contradiction', counter_evidence: 'Finding counter-evidence', gather_sources: 'Gathering test sources', evaluate: 'Running model test', waiting_for_idle: 'Waiting for idle GPU', waiting_for_gpu: 'Waiting for idle GPU', swapping_model: 'Temporarily loading test model', restoring_model: 'Restoring primary model', queued: 'Waiting in queue' })[job.stage] || job.stage
 }
 
 function queuePosition(job) {

@@ -117,6 +117,19 @@ async def test_model_experiments_are_low_priority_speculative_jobs(kb_db):
     assert claimed["id"] == normal["id"]
 
 
+async def test_releasing_speculative_work_does_not_inflate_attempts(kb_db):
+    job, _ = await kb_db.enqueue_processing_job(
+        "playlist_poll", "playlist", subject_id="playlist-1", idempotency_key="playlist:idle", is_speculative=True,
+    )
+    claimed = await kb_db.claim_next_processing_job("worker")
+    assert claimed["attempt_count"] == 1
+
+    released = await kb_db.release_processing_job(job["id"])
+
+    assert released["status"] == "queued"
+    assert released["attempt_count"] == 0
+
+
 async def test_queued_jobs_can_be_moved_to_front_or_back(kb_db):
     first, _ = await kb_db.enqueue_processing_job(
         "source_pipeline", "source", subject_id="source-1", idempotency_key="move-first", priority=10,
