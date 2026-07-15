@@ -320,6 +320,8 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
     from deep_research.tools.extra_research import (
         analysis_context,
         analyze_sources_separately,
+        build_claim_ledger,
+        claim_ledger_context,
         collect_sources,
         derive_gap_closing_query,
         derive_follow_up_queries,
@@ -382,25 +384,35 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
     analyses = await analyze_sources_separately(llm, query, sources)
     yield {
         "event": "status",
+        "data": json.dumps({"step": "thinking", "detail": "Building a source-quoted claim ledger and excluding unsupported facts..."}),
+    }
+    claims = await build_claim_ledger(llm, query, sources)
+    if not claims:
+        yield {"event": "answer", "data": "I found sources but could not extract source-quoted evidence reliably enough to produce a research answer."}
+        return
+    yield {
+        "event": "status",
         "data": json.dumps({"step": "generating", "detail": "Combining source analyses into a draft answer..."}),
     }
     briefs = analysis_context(analyses)
+    ledger = claim_ledger_context(claims)
     messages = [
         {
             "role": "system",
             "content": (
                 "/no_think\nYou are a careful deep-research analyst. Synthesize source-by-source analyses into a "
-                "direct, useful answer. Separate well-supported conclusions from tradeoffs, "
-                "uncertainty, and disagreement. Do not invent facts. Cite each important factual "
-                "claim with a Markdown link in the exact form [source title](URL), using the "
-                "source URLs provided. Never cite a source title without its URL. Use concise headings "
-                "and a recommendation when the question asks for one."
+                "decision memo using ONLY the supplied claim ledger. Do not add facts from your general knowledge or "
+                "from the source analyses. Separate verified specifications, reproducible estimates, and unknowns. "
+                "Every factual or numerical sentence must include an exact Markdown source link from the ledger. "
+                "Never use [citation: N], a bare citation number, or a source not in the ledger. If evidence is "
+                "insufficient, say so. Prefer a ranked shortlist and concise tradeoffs over an encyclopedia."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Research question: {query}\n\nSource analyses:\n\n{briefs}\n\nWrite a draft research answer now."
+                f"Research question: {query}\n\nClaim ledger (authoritative):\n{ledger}\n\n"
+                f"Source analyses (context only; not evidence):\n{briefs}\n\nWrite the decision memo now."
             ),
         },
     ]
@@ -416,15 +428,16 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
             "role": "system",
             "content": (
                 "/no_think\nYou are a strict final fact checker. Correct the draft only where the supplied evidence "
-                "does not support it, it overstates certainty, or it misses the original question. Keep supported claims, "
-                "preserve or add exact Markdown source links, and return the corrected final answer only."
+                "does not support it, it overstates certainty, has an uncited number, or uses a citation not present in "
+                "the ledger. Remove a claim rather than guessing. Keep only facts that map to a ledger row, preserve exact "
+                "Markdown source links, and return the corrected final answer only. Never output [citation: N]."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"Original question: {query}\n\nDraft answer:\n{draft}\n\n"
-                f"Source evidence for fact checking:\n{evidence}"
+                f"Authoritative claim ledger:\n{ledger}\n\nSource evidence for quote checks:\n{evidence}"
             ),
         },
     ]

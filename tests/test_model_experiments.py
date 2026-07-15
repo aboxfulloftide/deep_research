@@ -17,6 +17,8 @@ class _FakeLLM:
         self.config = config
 
     async def chat(self, messages):
+        if "extract evidence for a research claim ledger" in messages[0]["content"].lower():
+            return {"choices": [{"message": {"content": '[{"statement":"An evidence-grounded fact.","quote":"Evidence text","confidence":0.9}]'}}]}
         return {"choices": [{"message": {"content": "An evidence-grounded answer."}}]}
 
     async def close(self):

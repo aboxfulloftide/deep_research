@@ -8,6 +8,9 @@ from web import app
 
 class _FakeLLM:
     async def chat(self, messages):
+        system = messages[0]["content"]
+        if "extract evidence for a research claim ledger" in system.lower():
+            return {"choices": [{"message": {"content": '[{"statement":"Evidence supports the answer.","quote":"source evidence text","confidence":0.9}]'}}]}
         return {"choices": [{"message": {"content": "primary source comparison\nindependent benchmark analysis"}}]}
 
 
@@ -85,7 +88,7 @@ async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check
 
     async def fake_collect(queries, config, level, seen_urls, **kwargs):
         calls.append((level, queries))
-        return [extra.ResearchSource("Source", f"https://example.test/{level}", "evidence", level, queries[0])]
+        return [extra.ResearchSource("Source", f"https://example.test/{level}", "source evidence text", level, queries[0])]
 
     async def fake_follow_ups(llm, query, sources, level):
         return [f"level {level} first", f"level {level} second"]
@@ -102,7 +105,7 @@ async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check
     assert [level for level, _ in calls] == [1, 2, 3, 4]
     assert calls[0][1] == ["question", "first factual branch", "second factual branch"]
     assert calls[-1][1] == ["gap-closing source"]
-    assert len([event for event in events if event["event"] == "status"]) == 11
+    assert len([event for event in events if event["event"] == "status"]) == 12
     assert events[-1] == {
         "event": "answer",
         "data": (
@@ -144,3 +147,22 @@ async def test_starting_query_planning_keeps_original_out_of_derived_queries():
     queries = await extra.derive_starting_queries(PlanningLLM(), "original question")
 
     assert queries == ["primary data source", "independent comparison"]
+
+
+@pytest.mark.asyncio
+async def test_claim_ledger_rejects_a_claim_without_a_verbatim_quote():
+    source = extra.ResearchSource("Source", "https://example.test", "the supported fact is here", 1, "query")
+    claims = extra._parse_ledger(
+        '[{"statement":"Unsupported statement", "quote":"not present", "confidence":0.9}]', source,
+    )
+    assert claims == []
+
+
+@pytest.mark.asyncio
+async def test_claim_ledger_keeps_source_attributed_verbatim_evidence():
+    source = extra.ResearchSource("Source", "https://example.test", "The supported fact is here.", 1, "query")
+    claims = extra._parse_ledger(
+        '[{"statement":"A supported fact exists.", "quote":"supported fact is here", "confidence":0.9}]', source,
+    )
+    assert claims[0].source_url == "https://example.test"
+    assert "[Source](https://example.test)" in extra.claim_ledger_context(claims)

@@ -12,6 +12,8 @@ from deep_research.llm import LLMClient
 from deep_research.tools.extra_research import (
     analysis_context,
     analyze_sources_separately,
+    build_claim_ledger,
+    claim_ledger_context,
     collect_sources,
     derive_gap_closing_query,
     derive_follow_up_queries,
@@ -175,21 +177,27 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                 job["id"], "evaluate", {"source_count": len(sources), "context_size": context_size}, lease_seconds=900,
             )
             briefs = analysis_context(await analyze_sources_separately(llm, prompt, sources))
+            claims = await build_claim_ledger(llm, prompt, sources)
+            if not claims:
+                raise RuntimeError("Could not extract source-quoted claims for the experiment")
+            ledger = claim_ledger_context(claims)
             system = (
-                "You are evaluating a local research assistant. Combine the source-by-source analyses into a precise, "
-                "evidence-grounded answer. State uncertainty and cite supplied sources as Markdown links."
+                "You are evaluating a local research assistant. Write a concise decision memo using ONLY the supplied "
+                "claim ledger. Do not add facts from general knowledge or from the source analyses. Every factual or "
+                "numerical sentence must contain an exact Markdown link from the ledger. Separate official specifications, "
+                "estimates, and unknowns. Never use [citation: N] or a source not in the ledger."
             )
             if not reasoning:
                 system = "/no_think\n" + system
             response = await llm.chat([
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"Question: {prompt}\n\nSource analyses:\n{briefs}"},
+                {"role": "user", "content": f"Question: {prompt}\n\nClaim ledger:\n{ledger}\n\nSource analyses (context only):\n{briefs}"},
             ])
             draft = response["choices"][0]["message"].get("content", "No answer produced.")
             fact_check_system = (
                 "You are a strict final fact checker. Check the draft against the original question and the supplied "
-                "source excerpts. Correct unsupported or overstated claims, preserve supported claims, and return only "
-                "the corrected evidence-grounded answer with Markdown source links."
+                "claim ledger. Remove unsupported, overstated, or uncited claims instead of guessing. Return only the "
+                "corrected evidence-grounded answer with Markdown source links from the ledger. Never output [citation: N]."
             )
             if not reasoning:
                 fact_check_system = "/no_think\n" + fact_check_system
@@ -199,7 +207,7 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                     "role": "user",
                     "content": (
                         f"Original question: {prompt}\n\nDraft answer:\n{draft}\n\n"
-                        f"Source excerpts:\n{source_context(sources, per_source_chars=900)}"
+                        f"Claim ledger:\n{ledger}\n\nSource excerpts:\n{source_context(sources, per_source_chars=900)}"
                     ),
                 },
             ])

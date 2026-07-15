@@ -6,8 +6,10 @@ for a practical local model to synthesize.
 """
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from deep_research.config import Config
 from deep_research.llm import LLMClient
@@ -31,6 +33,20 @@ class ResearchSource:
     level: int
     query: str
     full_content: str = ""
+    source_kind: str = "secondary"
+    quality_score: int = 0
+
+
+@dataclass(frozen=True)
+class EvidenceClaim:
+    """A source-grounded fact that is allowed into the final synthesis."""
+
+    statement: str
+    quote: str
+    source_title: str
+    source_url: str
+    source_kind: str
+    confidence: float
 
 
 def _is_html_result(result: SearchResult) -> bool:
@@ -41,6 +57,24 @@ def _title_key(title: str) -> str:
     """Identify syndicated copies that have different URLs but the same story."""
     article_title = re.split(r"\s+[|–—-]\s+", title, maxsplit=1)[0]
     return "title:" + re.sub(r"\W+", " ", article_title.lower()).strip()
+
+
+def classify_source(url: str) -> tuple[str, int]:
+    """Give primary technical material priority without silently excluding corroboration."""
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if host in {"arxiv.org", "openreview.net"}:
+        return "paper", 5
+    if host in {"github.com", "huggingface.co"} or host.endswith(".ai") or host.endswith(".org") and any(
+        marker in host for marker in ("mistral", "qwen", "meta", "tii", "allenai")
+    ):
+        return "primary", 5
+    if any(marker in host for marker in ("docs.", "developer.", "benchmark", "lmarena", "lmsys")):
+        return "technical_reference", 4
+    if host in {"paperswithcode.com", "swebench.com"}:
+        return "benchmark", 4
+    if host in {"reddit.com", "news.ycombinator.com", "medium.com"}:
+        return "community", 1
+    return "secondary", 2
 
 
 async def collect_sources(
@@ -63,7 +97,8 @@ async def collect_sources(
         except Exception:
             continue
         added = 0
-        for result in results:
+        ranked_results = sorted(results, key=lambda result: classify_source(result.url)[1], reverse=True)
+        for result in ranked_results:
             title_key = _title_key(result.title)
             if (
                 result.url in seen_urls
@@ -88,6 +123,7 @@ async def collect_sources(
         except Exception:
             content = result.snippet
             title = result.title
+        source_kind, quality_score = classify_source(result.url)
         return ResearchSource(
             title=title,
             url=result.url,
@@ -95,6 +131,8 @@ async def collect_sources(
             level=level,
             query=query,
             full_content=content,
+            source_kind=source_kind,
+            quality_score=quality_score,
         )
 
     sources = await asyncio.gather(*(read(query, result) for query, result in selections))
@@ -142,8 +180,10 @@ async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[s
             "role": "system",
             "content": (
                 "/no_think\nYou plan a concise web-research search set. Return exactly two search queries, one per line. "
-                "Break the user's question into complementary factual branches: important constraints, comparisons, "
-                "primary data, or decision criteria. Keep each query independently searchable. Do not answer the question."
+                "First identify ambiguous constraints that must not be assumed (for example total RAM versus VRAM). "
+                "Then break the question into complementary factual branches: official specifications, primary data, "
+                "independently reproducible benchmarks, or decision criteria. Keep each query independently searchable. "
+                "Do not answer the question."
             ),
         },
         {"role": "user", "content": f"Research question: {original_query}"},
@@ -175,8 +215,9 @@ async def derive_follow_up_queries(
             "role": "system",
             "content": (
                 "/no_think\nYou plan web research. Return exactly two concise search queries, one per line. "
-                "Use the evidence to find primary material, independent corroboration, or a "
-                "specific unresolved tradeoff. Do not answer the original question."
+                "Use the evidence to find an official model card, technical paper, benchmark owner, or independent "
+                "corroboration for a specific unresolved tradeoff. Avoid generic reviews and search-result summaries. "
+                "Do not answer the original question."
             ),
         },
         {
@@ -285,3 +326,73 @@ async def analyze_sources_separately(
 
 def analysis_context(analyses: list[str]) -> str:
     return "\n\n".join(analyses)
+
+
+def _normalise(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _parse_ledger(content: str, source: ResearchSource) -> list[EvidenceClaim]:
+    """Accept only claims whose quoted evidence actually occurs in that source."""
+    try:
+        rows = json.loads(content.strip())
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    source_text = _normalise(source.content)
+    claims: list[EvidenceClaim] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        statement = str(row.get("statement") or "").strip()
+        quote = str(row.get("quote") or "").strip()
+        if len(statement) < 12 or len(quote) < 12 or _normalise(quote) not in source_text:
+            continue
+        try:
+            confidence = float(row.get("confidence", 0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        claims.append(EvidenceClaim(
+            statement=statement, quote=quote, source_title=source.title, source_url=source.url,
+            source_kind=source.source_kind, confidence=max(0.0, min(confidence, 1.0)),
+        ))
+    return claims
+
+
+async def build_claim_ledger(
+    llm: LLMClient, original_query: str, sources: list[ResearchSource],
+) -> list[EvidenceClaim]:
+    """Extract auditable claims before synthesis; unsupported prose never enters the answer context."""
+    semaphore = asyncio.Semaphore(2)
+
+    async def extract(source: ResearchSource) -> list[EvidenceClaim]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "/no_think\nExtract evidence for a research claim ledger. Return ONLY a JSON array. Each item must be "
+                    '{"statement":"atomic fact relevant to the question","quote":"verbatim quote from the supplied source, max 35 words","confidence":0.0}. '
+                    "Do not infer, estimate, combine facts, or include a claim unless the quote directly supports it. "
+                    "For numerical claims, preserve the exact units and qualifiers."
+                ),
+            },
+            {"role": "user", "content": f"Question: {original_query}\n\nSource text:\n{source.content[:SOURCE_ANALYSIS_CHARS]}"},
+        ]
+        try:
+            async with semaphore:
+                response = await llm.chat(messages)
+            return _parse_ledger(response["choices"][0]["message"].get("content", ""), source)
+        except Exception:
+            return []
+
+    per_source = await asyncio.gather(*(extract(source) for source in sources))
+    return [claim for claims in per_source for claim in claims]
+
+
+def claim_ledger_context(claims: list[EvidenceClaim]) -> str:
+    return "\n".join(
+        f"- {claim.statement}\n  Evidence: {claim.quote}\n  Source: [{claim.source_title}]({claim.source_url}) "
+        f"({claim.source_kind}; confidence {claim.confidence:.2f})"
+        for claim in claims
+    )
