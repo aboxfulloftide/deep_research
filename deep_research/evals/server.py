@@ -9,6 +9,7 @@ start the next).
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -38,32 +39,53 @@ async def start_server(model: dict) -> tuple[bool, Path]:
     log_path = logs_dir() / f"{model['slug']}-server.log"
     cmd = build_launch_command(model)
 
-    with open(log_path, "ab") as log_file:
-        await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=log_file, stderr=asyncio.subprocess.STDOUT,
-            stdin=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
+    if model.get("systemd_detach"):
+        # A boot launcher is itself a systemd unit. Starting a child directly
+        # from it would leave that child in the launcher's cgroup, which is
+        # cleaned up as soon as a Type=oneshot launcher exits. Put the actual
+        # server in a transient sibling unit instead. It intentionally has no
+        # restart policy: model-experiment code stops it by model path while
+        # swapping profiles and restores the primary itself afterward.
+        unit_name = model.get("systemd_unit", f"deep-research-llama-runtime-{model['port']}")
+        proc = await asyncio.create_subprocess_exec(
+            "systemd-run", "--user", "--quiet", "--collect", "--no-block",
+            f"--unit={unit_name}", *cmd,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
+        if await proc.wait() != 0:
+            return False, log_path
+    else:
+        with open(log_path, "ab") as log_file:
+            await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=log_file, stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
 
     ready = await wait_ready(model["port"])
     return ready, log_path
 
 
 async def stop_server(model: dict) -> bool:
-    """Matches tonight's `pkill -f "llama-server.*<model path>"` + poll-until-
-    gone approach -- shells out rather than adding a psutil dependency for
-    process matching that already works fine as a one-liner."""
+    """Stop exactly one registered llama-server process.
+
+    Profiles can use the same GGUF on an evaluation port while the primary
+    server keeps that GGUF loaded on 8080. Matching only the model path would
+    kill both; include the port so experiment cleanup cannot stop the primary.
+    """
     model_path = model["model_path"]
+    port = model["port"]
+    pattern = f"llama-server.*-m {re.escape(model_path)}.*--port {port}"
     proc = await asyncio.create_subprocess_exec(
-        "pkill", "-f", f"llama-server.*{model_path}",
+        "pkill", "-f", pattern,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
     await proc.wait()
 
     for _ in range(STOP_POLL_MAX_ATTEMPTS):
         check = await asyncio.create_subprocess_exec(
-            "pgrep", "-f", f"llama-server.*{model_path}",
+            "pgrep", "-f", pattern,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         rc = await check.wait()

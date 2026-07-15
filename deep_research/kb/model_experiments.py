@@ -9,7 +9,15 @@ from deep_research.evals import registry
 from deep_research.evals.server import start_server, stop_server
 from deep_research.kb.extraction import detect_context_size, detect_model
 from deep_research.llm import LLMClient
-from deep_research.tools.extra_research import collect_sources, source_context
+from deep_research.tools.extra_research import (
+    analysis_context,
+    analyze_sources_separately,
+    collect_sources,
+    derive_gap_closing_query,
+    derive_follow_up_queries,
+    derive_starting_queries,
+    source_context,
+)
 from deep_research.tools.llama_server import is_healthy
 
 
@@ -95,6 +103,10 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
         if requested_context:
             server_args["context"] = int(requested_context)
         profile["server_args_json"] = json.dumps(server_args)
+        # The web worker can be restarted while an experiment runs. Put the
+        # temporary server in its own user unit so a web-service restart does
+        # not kill it mid-swap.
+        profile["systemd_detach"] = True
         primary_model = await detect_model(config.llm.llama_cpp_base_url)
         # Two copies of the same compact model can coexist on this machine,
         # which lets us compare context/reasoning settings without touching
@@ -107,6 +119,7 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                 raise RuntimeError(
                     "Cannot safely swap models because the active 8080 model is not registered for restoration",
                 )
+            primary_to_restore["systemd_detach"] = True
             await kb_db.update_processing_job_progress(
                 job["id"], "swapping_model",
                 {"from_model": primary_model, "to_profile": profile_slug}, lease_seconds=900,
@@ -135,34 +148,64 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
         display_name = profile["display_name"]
 
     try:
-        await kb_db.update_processing_job_progress(
-            job["id"], "gather_sources",
-            {"profile": profile_slug, "model": model, "context_size": context_size, "reasoning": reasoning},
-            lease_seconds=900,
-        )
-        sources = await collect_sources([prompt], config, 1, set())
-        if not sources:
-            raise RuntimeError("Could not collect source context for model experiment")
-
-        await kb_db.update_processing_job_progress(
-            job["id"], "evaluate", {"source_count": len(sources), "context_size": context_size}, lease_seconds=900,
-        )
-        system = (
-            "You are evaluating a local research assistant. Give a precise, evidence-grounded answer. "
-            "State uncertainty and cite supplied sources as Markdown links."
-        )
-        if not reasoning:
-            system = "/no_think\n" + system
         llm = LLMClient(Config(llm=LLMConfig(base_url=base_url, model=model, api_key="not-needed")))
         started_at = time.monotonic()
         try:
+            await kb_db.update_processing_job_progress(
+                job["id"], "gather_sources",
+                {"profile": profile_slug, "model": model, "context_size": context_size, "reasoning": reasoning},
+                lease_seconds=900,
+            )
+            seen_urls: set[str] = set()
+            sources = []
+            queries = [prompt, *await derive_starting_queries(llm, prompt)]
+            for level in range(1, 5):
+                sources.extend(await collect_sources(
+                    queries, config, level, seen_urls,
+                    sources_per_query=1 if level == 4 else None,
+                ))
+                if level < 3:
+                    queries = await derive_follow_up_queries(llm, prompt, sources, level)
+                elif level == 3:
+                    queries = await derive_gap_closing_query(llm, prompt, sources)
+            if not sources:
+                raise RuntimeError("Could not collect source context for model experiment")
+
+            await kb_db.update_processing_job_progress(
+                job["id"], "evaluate", {"source_count": len(sources), "context_size": context_size}, lease_seconds=900,
+            )
+            briefs = analysis_context(await analyze_sources_separately(llm, prompt, sources))
+            system = (
+                "You are evaluating a local research assistant. Combine the source-by-source analyses into a precise, "
+                "evidence-grounded answer. State uncertainty and cite supplied sources as Markdown links."
+            )
+            if not reasoning:
+                system = "/no_think\n" + system
             response = await llm.chat([
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"Question: {prompt}\n\nEvidence:\n{source_context(sources)}"},
+                {"role": "user", "content": f"Question: {prompt}\n\nSource analyses:\n{briefs}"},
             ])
+            draft = response["choices"][0]["message"].get("content", "No answer produced.")
+            fact_check_system = (
+                "You are a strict final fact checker. Check the draft against the original question and the supplied "
+                "source excerpts. Correct unsupported or overstated claims, preserve supported claims, and return only "
+                "the corrected evidence-grounded answer with Markdown source links."
+            )
+            if not reasoning:
+                fact_check_system = "/no_think\n" + fact_check_system
+            response = await llm.chat([
+                {"role": "system", "content": fact_check_system},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Original question: {prompt}\n\nDraft answer:\n{draft}\n\n"
+                        f"Source excerpts:\n{source_context(sources, per_source_chars=900)}"
+                    ),
+                },
+            ])
+            answer = response["choices"][0]["message"].get("content", "").strip() or draft
         finally:
             await llm.close()
-        answer = response["choices"][0]["message"].get("content", "No answer produced.")
         return {
             "profile": profile_slug,
             "display_name": display_name,

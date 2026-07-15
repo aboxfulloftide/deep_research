@@ -1,4 +1,4 @@
-"""Bounded three-level web research for the interactive Extra mode.
+"""Bounded multi-level web research for the interactive Extra mode.
 
 This intentionally has hard caps. "Deep" should mean progressively better
 evidence, not an unbounded number of browser requests or a prompt too large
@@ -18,6 +18,9 @@ from deep_research.tools.search import web_search
 SOURCES_PER_QUERY = 1
 SOURCE_EXCERPT_CHARS = 3_000
 FOLLOW_UP_QUERY_LIMIT = 2
+INITIAL_QUERY_LIMIT = 2
+GAP_CLOSING_QUERY_LIMIT = 1
+SOURCE_ANALYSIS_CHARS = 2_500
 
 
 @dataclass
@@ -27,6 +30,7 @@ class ResearchSource:
     content: str
     level: int
     query: str
+    full_content: str = ""
 
 
 def _is_html_result(result: SearchResult) -> bool:
@@ -40,18 +44,19 @@ def _title_key(title: str) -> str:
 
 
 async def collect_sources(
-    queries: list[str], config: Config, level: int, seen_urls: set[str],
+    queries: list[str], config: Config, level: int, seen_urls: set[str], *, sources_per_query: int | None = None,
 ) -> list[ResearchSource]:
     """Search each query and read new HTML sources from it.
 
-    The first level receives two independent starting sources. Later levels
-    each have two focused queries, so one source per query keeps the final
-    synthesis at six readable sources.
+    The first level combines the original wording with planned subquestions.
+    Follow-up levels use focused evidence branches; the final level uses one
+    gap-closing query. This keeps the whole run bounded while diversifying
+    evidence beyond the user's exact wording.
     """
     selections: list[tuple[str, SearchResult]] = []
     pending_urls: set[str] = set()
     pending_titles: set[str] = set()
-    per_query_limit = 2 if len(queries) == 1 else SOURCES_PER_QUERY
+    per_query_limit = sources_per_query if sources_per_query is not None else (2 if len(queries) == 1 else SOURCES_PER_QUERY)
     for query in queries:
         try:
             results = await web_search(query, config)
@@ -89,6 +94,7 @@ async def collect_sources(
             content=content[:SOURCE_EXCERPT_CHARS],
             level=level,
             query=query,
+            full_content=content,
         )
 
     sources = await asyncio.gather(*(read(query, result) for query, result in selections))
@@ -107,7 +113,7 @@ def source_context(sources: list[ResearchSource], *, per_source_chars: int = SOU
     )
 
 
-def _parse_queries(content: str, original_query: str) -> list[str]:
+def _parse_queries(content: str, original_query: str, limit: int = FOLLOW_UP_QUERY_LIMIT) -> list[str]:
     queries: list[str] = []
     seen = {original_query.strip().lower()}
     for line in content.splitlines():
@@ -119,9 +125,44 @@ def _parse_queries(content: str, original_query: str) -> list[str]:
             continue
         seen.add(normalized)
         queries.append(candidate)
-        if len(queries) == FOLLOW_UP_QUERY_LIMIT:
+        if len(queries) == limit:
             break
     return queries
+
+
+async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[str]:
+    """Plan two complementary searches before querying the web.
+
+    The original wording remains a search query. These additions turn a broad
+    question into smaller factual branches instead of betting the first round
+    on whichever exact words the user happened to type.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "/no_think\nYou plan a concise web-research search set. Return exactly two search queries, one per line. "
+                "Break the user's question into complementary factual branches: important constraints, comparisons, "
+                "primary data, or decision criteria. Keep each query independently searchable. Do not answer the question."
+            ),
+        },
+        {"role": "user", "content": f"Research question: {original_query}"},
+    ]
+    try:
+        response = await asyncio.wait_for(llm.chat(messages), timeout=20)
+        content = response["choices"][0]["message"].get("content", "")
+        queries = _parse_queries(content, original_query, INITIAL_QUERY_LIMIT)
+    except Exception:
+        queries = []
+
+    if len(queries) < INITIAL_QUERY_LIMIT:
+        fallbacks = [
+            f"{original_query} primary sources data",
+            f"{original_query} comparison tradeoffs limitations",
+        ]
+        known = {original_query.lower()} | {query.lower() for query in queries}
+        queries.extend(query for query in fallbacks if query.lower() not in known)
+    return queries[:INITIAL_QUERY_LIMIT]
 
 
 async def derive_follow_up_queries(
@@ -154,7 +195,7 @@ async def derive_follow_up_queries(
         # searches instead.
         response = await asyncio.wait_for(llm.chat(messages), timeout=20)
         content = response["choices"][0]["message"].get("content", "")
-        queries = _parse_queries(content, original_query)
+        queries = _parse_queries(content, original_query, FOLLOW_UP_QUERY_LIMIT)
     except Exception:
         queries = []
 
@@ -170,3 +211,77 @@ async def derive_follow_up_queries(
         known = {query.lower() for query in queries} | {original_query.lower()}
         queries.extend(query for query in fallbacks if query.lower() not in known)
     return queries[:FOLLOW_UP_QUERY_LIMIT]
+
+
+async def derive_gap_closing_query(
+    llm: LLMClient, original_query: str, evidence: list[ResearchSource],
+) -> list[str]:
+    """Choose one final source that can corroborate the biggest remaining gap."""
+    evidence_brief = source_context(evidence[-4:], per_source_chars=700)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "/no_think\nYou are closing a web-research evidence gap. Return exactly one concise search query. "
+                "Prefer a primary source, authoritative dataset, or independent corroboration for the most important "
+                "unresolved factual claim. Do not answer the question."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Original question: {original_query}\n\nEvidence so far:\n{evidence_brief}",
+        },
+    ]
+    try:
+        response = await asyncio.wait_for(llm.chat(messages), timeout=20)
+        content = response["choices"][0]["message"].get("content", "")
+        queries = _parse_queries(content, original_query, GAP_CLOSING_QUERY_LIMIT)
+    except Exception:
+        queries = []
+
+    if not queries:
+        anchor = next((source.title for source in reversed(evidence) if source.title), original_query)[:120]
+        queries = [f"{anchor} primary source verification"]
+    return queries[:GAP_CLOSING_QUERY_LIMIT]
+
+
+async def analyze_sources_separately(
+    llm: LLMClient, original_query: str, sources: list[ResearchSource],
+) -> list[str]:
+    """Create compact, source-attributed briefs before cross-source synthesis."""
+    semaphore = asyncio.Semaphore(2)
+
+    async def analyze(source: ResearchSource) -> str:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "/no_think\nAnalyze one research source for a later synthesis. Extract only facts relevant to the "
+                    "original question, distinguish claims from evidence, note limitations or uncertainty, and do not "
+                    "invent information. Keep it under 180 words."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Original question: {original_query}\n"
+                    f"Source: {source.title} ({source.url})\n\n"
+                    f"Source text:\n{source.content[:SOURCE_ANALYSIS_CHARS]}"
+                ),
+            },
+        ]
+        try:
+            async with semaphore:
+                response = await llm.chat(messages)
+            content = response["choices"][0]["message"].get("content", "").strip()
+        except Exception:
+            content = ""
+        if not content:
+            content = source.content[:900]
+        return f"=== {source.title} ({source.url}) ===\n{content}"
+
+    return await asyncio.gather(*(analyze(source) for source in sources))
+
+
+def analysis_context(analyses: list[str]) -> str:
+    return "\n\n".join(analyses)

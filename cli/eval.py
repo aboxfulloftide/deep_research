@@ -14,7 +14,7 @@ from rich.table import Table
 from deep_research.config import load_config
 from deep_research.evals import registry
 from deep_research.evals.report import compute_stats_for_source
-from deep_research.evals.server import start_server, stop_server
+from deep_research.evals.server import is_healthy, start_server, stop_server
 
 console = Console()
 
@@ -126,14 +126,22 @@ async def cmd_start_server(args):
     config = load_config()
     model = await registry.get_model(config, args.slug)
     if model is None:
-        console.print(f"[red]No registered model {args.slug!r} — run register-model first[/red]")
+        raise RuntimeError(f"No registered model {args.slug!r} — run register-model first")
+    if args.port is not None:
+        model = dict(model)
+        model["port"] = args.port
+    if args.systemd_detach:
+        model = dict(model)
+        model["systemd_detach"] = True
+    if await is_healthy(model["port"]):
+        console.print(f"[green]Server already ready[/green] on port {model['port']}")
         return
     console.print(f"Starting {model['display_name']} on port {model['port']}...")
     ready, log_path = await start_server(model)
     if ready:
         console.print(f"[green]Server ready[/green] (log: {log_path})")
     else:
-        console.print(f"[red]Server did not become healthy in time — check {log_path}[/red]")
+        raise RuntimeError(f"Server did not become healthy in time — check {log_path}")
 
 
 async def cmd_stop_server(args):
@@ -255,7 +263,7 @@ def main():
     p_reg.add_argument("--tensor-split", default="1,1")
     p_reg.add_argument("--devices", default="CUDA0,CUDA1")
     p_reg.add_argument("--split-mode", default="layer")
-    p_reg.add_argument("--parallel", type=int, default=2)
+    p_reg.add_argument("--parallel", type=int, default=3)
     p_reg.add_argument("--context", type=int, default=32768)
     p_reg.add_argument("--batch", type=int, default=4096)
     p_reg.add_argument("--ubatch", type=int, default=512)
@@ -269,6 +277,8 @@ def main():
 
     p_start = subparsers.add_parser("start-server", help="Start a registered model's llama-server")
     p_start.add_argument("slug")
+    p_start.add_argument("--port", type=int, help="Override the registered port (use 8080 for the production primary)")
+    p_start.add_argument("--systemd-detach", action="store_true", help=argparse.SUPPRESS)
     p_start.set_defaults(func=cmd_start_server)
 
     p_stop = subparsers.add_parser("stop-server", help="Stop a registered model's llama-server")

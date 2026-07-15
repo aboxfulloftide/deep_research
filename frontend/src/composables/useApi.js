@@ -118,6 +118,51 @@ export function useApi() {
     return controller
   }
 
+  function streamLlamaChat(message, messages, profileSlug, sessionId, callbacks) {
+    const controller = new AbortController()
+    fetch(`${API_BASE}/llama-chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, messages, profile_slug: profileSlug || 'current', session_id: sessionId || null }),
+      signal: controller.signal,
+    }).then(async (resp) => {
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let currentEvent = null
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        for (const line of lines) {
+          if (line.startsWith(':') || line.trim() === '') continue
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim()
+            continue
+          }
+          if (!line.startsWith('data: ')) continue
+          try {
+            const data = JSON.parse(line.slice(6))
+            if (currentEvent === 'session') callbacks.onSession?.(data)
+            else if (currentEvent === 'status') callbacks.onStatus?.(data)
+            else if (currentEvent === 'model') callbacks.onModel?.(data)
+            else if (currentEvent === 'token') callbacks.onToken?.(data)
+            else if (currentEvent === 'error') callbacks.onError?.(data)
+          } catch {
+            // Ignore malformed keepalive/data fragments.
+          }
+          currentEvent = null
+        }
+      }
+      callbacks.onDone?.()
+    }).catch((err) => {
+      if (err.name !== 'AbortError') callbacks.onError?.({ error: err.message })
+    })
+    return controller
+  }
+
   // --- Knowledge base (topics/timeline/reports) ---
 
   async function fetchTopics() {
@@ -586,7 +631,7 @@ export function useApi() {
   }
 
   return {
-    fetchModels, fetchSessions, fetchSession, deleteSession, streamResearch,
+    fetchModels, fetchSessions, fetchSession, deleteSession, streamResearch, streamLlamaChat,
     fetchTopics, createTopic, fetchTopic, fetchTimeline, fetchTopicClaims,
     fetchConversationTranscript,
     fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,

@@ -17,6 +17,8 @@ from deep_research.config import load_config
 from deep_research.db import Database
 from deep_research.llm import LLMClient
 from deep_research.model_backends import apply_backend, list_models as backend_list_models
+from deep_research.kb.extraction import detect_model
+from deep_research.model_switching import ModelSwitchUnavailable, switch_primary_profile
 from deep_research.tools.scrape import scrape_page
 from deep_research.tools.search import check_providers_now, web_search
 from deep_research.tools.search_usage import get_usage_summary
@@ -60,6 +62,18 @@ class QueryRequest(BaseModel):
     session_id: str | None = None
     prioritize_kb: bool = False
     research_mode: Literal["standard", "extra"] = "standard"
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+
+
+class LlamaChatRequest(BaseModel):
+    message: str
+    messages: list[ChatMessage] = []
+    profile_slug: str = "current"
+    session_id: str | None = None
 
 
 class SessionResponse(BaseModel):
@@ -148,6 +162,65 @@ async def research(req: QueryRequest):
     )
 
 
+@app.post("/api/llama-chat")
+async def llama_chat(req: LlamaChatRequest):
+    """Direct streamed chat with the loaded llama.cpp model.
+
+    A selected registered profile replaces the primary model only after the
+    worker queue and GPU are idle. ``current`` always chats with whichever
+    model is already loaded.
+    """
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(400, "A chat message is required")
+    if len(req.messages) > 100:
+        raise HTTPException(400, "Chat history is limited to 100 messages")
+
+    async def stream():
+        try:
+            if req.session_id:
+                session = await db.get_session(req.session_id)
+                if not session:
+                    raise ValueError("Session not found")
+                chat_session_id = req.session_id
+            else:
+                chat_session_id = await db.create_session()
+            await db.add_message(chat_session_id, "user", content=message)
+            session = await db.get_session(chat_session_id)
+            if not session.get("title"):
+                await db.update_session_title(chat_session_id, message[:80] + ("..." if len(message) > 80 else ""))
+            yield {"event": "session", "data": json.dumps({"session_id": chat_session_id})}
+            if req.profile_slug != "current":
+                if kb_routes.kb_db is None:
+                    raise RuntimeError("The knowledge-base worker is unavailable, so safe model switching is unavailable")
+                yield {"event": "status", "data": json.dumps({"detail": "Checking whether it is safe to switch models..."})}
+                loaded_model = await switch_primary_profile(kb_routes.kb_db, config, req.profile_slug)
+            else:
+                loaded_model = await detect_model(config.llm.llama_cpp_base_url)
+
+            yield {"event": "model", "data": json.dumps({"model": loaded_model})}
+            cfg = apply_backend(config.model_copy(deep=True), "llama_cpp")
+            cfg.llm.model = loaded_model
+            llm = LLMClient(cfg)
+            try:
+                history = [message.model_dump() for message in req.messages]
+                history.append({"role": "user", "content": message})
+                answer_parts = []
+                async for token in llm.chat_stream(history):
+                    answer_parts.append(token)
+                    yield {"event": "token", "data": json.dumps({"content": token})}
+            finally:
+                await llm.close()
+            await db.add_message(chat_session_id, "assistant", content="".join(answer_parts))
+            yield {"event": "done", "data": json.dumps({})}
+        except (ModelSwitchUnavailable, ValueError) as exc:
+            yield {"event": "error", "data": json.dumps({"error": str(exc)})}
+        except Exception as exc:
+            yield {"event": "error", "data": json.dumps({"error": str(exc)})}
+
+    return EventSourceResponse(stream(), media_type="text/event-stream")
+
+
 async def _stream_research(
     cfg, query: str, session_id: str | None, prioritize_kb: bool = False, research_mode: str = "standard",
 ):
@@ -202,7 +275,7 @@ async def _stream_research(
 
         if research_mode == "extra":
             answer = ""
-            async for event in _extra_research_answer(llm, query, cfg):
+            async for event in _extra_research_answer(llm, query, cfg, session_id):
                 if event.get("event") == "answer":
                     answer = event["data"]
                 else:
@@ -242,37 +315,61 @@ async def _stream_research(
         await llm.close()
 
 
-async def _extra_research_answer(llm: LLMClient, query: str, cfg):
-    """Run the bounded three-level Extra Research workflow and stream status."""
+async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: str | None = None):
+    """Run a bounded, source-preserving, four-level Extra Research workflow."""
     from deep_research.tools.extra_research import (
+        analysis_context,
+        analyze_sources_separately,
         collect_sources,
+        derive_gap_closing_query,
         derive_follow_up_queries,
+        derive_starting_queries,
         source_context,
     )
 
     seen_urls: set[str] = set()
     sources = []
-    queries = [query]
+    yield {
+        "event": "status",
+        "data": json.dumps({"step": "thinking", "detail": "Planning focused search questions with the local model..."}),
+    }
+    queries = [query, *await derive_starting_queries(llm, query)]
 
-    for level in range(1, 4):
+    for level in range(1, 5):
         detail = (
-            "Searching the original question and reading sources..."
+            "Searching the original question plus focused subquestions..."
             if level == 1
-            else "Following evidence into targeted sources..."
+            else "Following evidence into targeted sources..." if level < 4
+            else "Closing the most important remaining evidence gap..."
         )
         yield {
             "event": "status",
-            "data": json.dumps({"step": "researching", "detail": f"Level {level} of 3: {detail}"}),
+            "data": json.dumps({"step": "researching", "detail": f"Level {level} of 4: {detail}"}),
         }
-        level_sources = await collect_sources(queries, cfg, level, seen_urls)
+        level_sources = await collect_sources(
+            queries, cfg, level, seen_urls,
+            sources_per_query=1 if level == 4 else None,
+        )
         sources.extend(level_sources)
+        if session_id:
+            for source in level_sources:
+                await db.save_scraped_page(
+                    session_id, source.url, source.title, source.full_content or source.content,
+                    {"extra_research": {"level": source.level, "query": source.query}},
+                )
 
         if level < 3:
             yield {
                 "event": "status",
-                "data": json.dumps({"step": "thinking", "detail": f"Level {level} of 3: choosing follow-up questions from the evidence..."}),
+                "data": json.dumps({"step": "thinking", "detail": f"Level {level} of 4: choosing follow-up questions from the evidence..."}),
             }
             queries = await derive_follow_up_queries(llm, query, sources, level)
+        elif level == 3:
+            yield {
+                "event": "status",
+                "data": json.dumps({"step": "thinking", "detail": "Choosing one final source to corroborate the remaining evidence gap..."}),
+            }
+            queries = await derive_gap_closing_query(llm, query, sources)
 
     if not sources:
         yield {"event": "answer", "data": "I could not retrieve usable sources for this extra research run."}
@@ -280,14 +377,19 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg):
 
     yield {
         "event": "status",
-        "data": json.dumps({"step": "generating", "detail": f"Synthesizing {len(sources)} sources across three research levels..."}),
+        "data": json.dumps({"step": "thinking", "detail": f"Analyzing {len(sources)} sources separately before combining them..."}),
     }
-    evidence = source_context(sources)
+    analyses = await analyze_sources_separately(llm, query, sources)
+    yield {
+        "event": "status",
+        "data": json.dumps({"step": "generating", "detail": "Combining source analyses into a draft answer..."}),
+    }
+    briefs = analysis_context(analyses)
     messages = [
         {
             "role": "system",
             "content": (
-                "/no_think\nYou are a careful deep-research analyst. Synthesize the source material into a "
+                "/no_think\nYou are a careful deep-research analyst. Synthesize source-by-source analyses into a "
                 "direct, useful answer. Separate well-supported conclusions from tradeoffs, "
                 "uncertainty, and disagreement. Do not invent facts. Cite each important factual "
                 "claim with a Markdown link in the exact form [source title](URL), using the "
@@ -298,14 +400,36 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg):
         {
             "role": "user",
             "content": (
-                f"Research question: {query}\n\n"
-                f"Evidence gathered in three levels:\n\n{evidence}\n\n"
-                "Write the final research answer now."
+                f"Research question: {query}\n\nSource analyses:\n\n{briefs}\n\nWrite a draft research answer now."
             ),
         },
     ]
     response = await llm.chat(messages)
-    answer = response["choices"][0]["message"].get("content", "No answer produced.")
+    draft = response["choices"][0]["message"].get("content", "No answer produced.")
+    yield {
+        "event": "status",
+        "data": json.dumps({"step": "thinking", "detail": "Checking the draft against the original question and source evidence..."}),
+    }
+    evidence = source_context(sources, per_source_chars=900)
+    fact_check = [
+        {
+            "role": "system",
+            "content": (
+                "/no_think\nYou are a strict final fact checker. Correct the draft only where the supplied evidence "
+                "does not support it, it overstates certainty, or it misses the original question. Keep supported claims, "
+                "preserve or add exact Markdown source links, and return the corrected final answer only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Original question: {query}\n\nDraft answer:\n{draft}\n\n"
+                f"Source evidence for fact checking:\n{evidence}"
+            ),
+        },
+    ]
+    response = await llm.chat(fact_check)
+    answer = response["choices"][0]["message"].get("content", "").strip() or draft
     source_links = "\n".join(f"- [{source.title}]({source.url})" for source in sources)
     answer = f"{answer.rstrip()}\n\n### Sources consulted\n{source_links}"
     yield {"event": "answer", "data": answer}

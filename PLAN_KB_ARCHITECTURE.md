@@ -60,8 +60,10 @@ full-text and semantic search via Reciprocal Rank Fusion.
 **Local models:** llama.cpp (`llama-server`, OpenAI-compatible `/v1/*` plus native
 `/slots`/`/props`) runs extraction, verification, and report generation; Ollama runs
 embeddings (`nomic-embed-text`). Both can hold models on the same GPU — see
-`HARDWARE.md` for VRAM tradeoffs. `llama-server` runs with `--parallel 2 --ctx-size
-8192` (raised from `--parallel 1 --ctx-size 4096`) — measured, verified real ~2x
+`HARDWARE.md` for VRAM tradeoffs. `llama-server` starts with `--parallel 3`; its
+total context must be sized to retain enough context per slot. The earlier
+`--parallel 2 --ctx-size 8192` measurement (raised from `--parallel 1 --ctx-size 4096`)
+verified real ~2x
 concurrent throughput on the existing single 16 GB card with only ~600 MB extra VRAM;
 see HARDWARE.md's "Verification bottleneck measurement" section for the full
 timing breakdown (LLM extraction of freshly-scraped pages is 86-91% of a claim

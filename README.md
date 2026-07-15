@@ -23,6 +23,24 @@ python -m venv .venv
 Open the web app at `http://localhost:8000`. Configure local model endpoints
 in `config.yaml`; `config.example.yaml` documents every supported KB setting.
 
+## Start automatically at boot
+
+On this host, the app is installed as the `deep-research.service` systemd user
+service. It starts the registered Qwen3-14B primary llama.cpp server on port
+8080 and Docker's PostgreSQL/SearXNG dependencies before running the web app
+and durable knowledge-base worker. Check them with:
+
+```bash
+systemctl --user status deep-research.service
+systemctl --user status deep-research-llama.service
+journalctl --user -u deep-research.service -f
+```
+
+The checked-in units are in `systemd/`. The llama unit is boot-only on purpose:
+the app's experiment workflow can stop, swap, and restore the primary model
+without systemd racing to relaunch it. If the project is moved, update their
+`WorkingDirectory` and `ExecStart` paths before linking them.
+
 ## Normal workflow
 
 1. Create a topic.
@@ -37,14 +55,22 @@ No manual chunk/extract/verify sequence is needed for ordinary use.
 ## Interactive research modes
 
 The Research page defaults to **Standard** mode: a fast web-first answer with
-full text from the strongest available sources. Choose **Extra · 3 levels**
-when a question needs deeper investigation. It reads independent starting
-sources, uses that evidence to run two bounded follow-up levels, then writes a
-cited synthesis from up to six source excerpts. Progress is shown while each
-level runs; if a local model is slow at planning follow-up queries, the app
-continues with evidence-focused fallback queries instead of stalling.
+full text from the strongest available sources. Choose **Extra · 4 levels**
+when a question needs deeper investigation. It asks the local model to plan
+two complementary starting searches alongside the original question, follows
+the evidence through two bounded follow-up levels, then closes one remaining
+evidence gap with an extra source. Pages are saved to the research session,
+analyzed separately, combined into a draft, and checked against the original
+source excerpts before the cited answer is returned. Progress is shown while
+each level runs; if a local model is slow at planning follow-up queries, the
+app continues with evidence-focused fallback queries instead of stalling.
 
 Research-answer links open in a new browser tab.
+
+The Research page also has a **Chat · llama.cpp** mode for direct streamed
+conversation with the currently loaded model. Selecting a registered alternate
+profile changes the primary model only when normal processing work is drained
+and the GPU is idle; the selected model then remains loaded for later chat.
 
 ### llama.cpp model experiments
 

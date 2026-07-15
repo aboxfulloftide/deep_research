@@ -1,0 +1,19 @@
+[Unit]
+Description=Deep Research web application and knowledge-base worker
+Wants=network-online.target
+Wants=deep-research-llama.service
+After=network-online.target deep-research-llama.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/matheau/code/deep_research
+# Start the persistent PostgreSQL and SearXNG dependencies if Docker has not
+# restored them yet. A failed early boot attempt is retried by systemd.
+ExecStartPre=/usr/bin/docker compose up -d
+ExecStart=/home/matheau/code/deep_research/.venv/bin/uvicorn web.app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

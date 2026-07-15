@@ -1,0 +1,18 @@
+[Unit]
+Description=Deep Research primary llama.cpp server (Qwen3-14B)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# The application deliberately owns later model swaps/restores. This unit
+# only launches the primary model at boot and does not supervise its detached
+# process, so it cannot race an experiment that temporarily stops it.
+Type=oneshot
+WorkingDirectory=/home/matheau/code/deep_research
+ExecStart=/home/matheau/code/deep_research/.venv/bin/python -m cli.eval start-server qwen3-14b --port 8080 --systemd-detach
+ExecStop=/home/matheau/code/deep_research/.venv/bin/python -m cli.eval stop-server qwen3-14b
+RemainAfterExit=yes
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=default.target

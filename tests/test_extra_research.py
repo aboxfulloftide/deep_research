@@ -59,22 +59,50 @@ async def test_collect_sources_skips_syndicated_title_copies(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_extra_research_runs_three_levels_and_returns_synthesis(monkeypatch):
+async def test_gap_closing_level_can_cap_a_single_query_to_one_source(monkeypatch):
+    async def fake_search(query, config):
+        return [
+            SearchResult(title="First", url="https://example.test/one", snippet="first"),
+            SearchResult(title="Second", url="https://example.test/two", snippet="second"),
+        ]
+
+    async def fake_scrape(url, config):
+        return ScrapedPage(url=url, title=url, text_content="source text")
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+    sources = await extra.collect_sources(
+        ["one gap-closing query"], Config(), 4, set(), sources_per_query=1,
+    )
+
+    assert len(sources) == 1
+    assert sources[0].full_content == "source text"
+
+
+@pytest.mark.asyncio
+async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check(monkeypatch):
     calls = []
 
-    async def fake_collect(queries, config, level, seen_urls):
+    async def fake_collect(queries, config, level, seen_urls, **kwargs):
         calls.append((level, queries))
         return [extra.ResearchSource("Source", f"https://example.test/{level}", "evidence", level, queries[0])]
 
     async def fake_follow_ups(llm, query, sources, level):
         return [f"level {level} first", f"level {level} second"]
 
+    async def fake_starting_queries(llm, query):
+        return ["first factual branch", "second factual branch"]
+
     monkeypatch.setattr(extra, "collect_sources", fake_collect)
     monkeypatch.setattr(extra, "derive_follow_up_queries", fake_follow_ups)
+    monkeypatch.setattr(extra, "derive_starting_queries", fake_starting_queries)
+    monkeypatch.setattr(extra, "derive_gap_closing_query", lambda *_: __import__("asyncio").sleep(0, result=["gap-closing source"]))
     events = [event async for event in app._extra_research_answer(_FakeLLM(), "question", Config())]
 
-    assert [level for level, _ in calls] == [1, 2, 3]
-    assert len([event for event in events if event["event"] == "status"]) == 6
+    assert [level for level, _ in calls] == [1, 2, 3, 4]
+    assert calls[0][1] == ["question", "first factual branch", "second factual branch"]
+    assert calls[-1][1] == ["gap-closing source"]
+    assert len([event for event in events if event["event"] == "status"]) == 11
     assert events[-1] == {
         "event": "answer",
         "data": (
@@ -82,7 +110,8 @@ async def test_extra_research_runs_three_levels_and_returns_synthesis(monkeypatc
             "### Sources consulted\n"
             "- [Source](https://example.test/1)\n"
             "- [Source](https://example.test/2)\n"
-            "- [Source](https://example.test/3)"
+            "- [Source](https://example.test/3)\n"
+            "- [Source](https://example.test/4)"
         ),
     }
 
@@ -104,3 +133,14 @@ async def test_follow_up_query_planning_falls_back_to_evidence_title():
         "Qwen coding guide official documentation technical details",
         "Qwen coding guide independent comparison limitations benchmarks",
     ]
+
+
+@pytest.mark.asyncio
+async def test_starting_query_planning_keeps_original_out_of_derived_queries():
+    class PlanningLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": "original question\nprimary data source\nindependent comparison"}}]}
+
+    queries = await extra.derive_starting_queries(PlanningLLM(), "original question")
+
+    assert queries == ["primary data source", "independent comparison"]

@@ -14,9 +14,12 @@ def build_launch_command(model_path: str, port: int, args: dict | None = None) -
         local_build = Path.home() / "llama" / "llama.cpp" / "build" / "bin" / "llama-server"
         if local_build.exists():
             server_bin = str(local_build)
+    # Three slots are the machine-wide policy, shared by the boot primary,
+    # registered evaluation profiles, and temporary model swaps. Do not let a
+    # stale profile silently lower it for a different model.
     cmd = [server_bin, "-m", model_path, "--host", "127.0.0.1", "--port", str(port),
            "-ngl", str(args.get("gpu_layers", 99)), "-c", str(args.get("context", 32768)),
-           "-b", str(args.get("batch", 4096)), "-ub", str(args.get("ubatch", 512)), "--parallel", str(args.get("parallel", 2))]
+           "-b", str(args.get("batch", 4096)), "-ub", str(args.get("ubatch", 512)), "--parallel", "3"]
     if args.get("flash_attn", True): cmd += ["-fa", "on"]
     # --jinja renders prompts with the model's own embedded chat template and
     # is what unlocks native OpenAI-style tool calling (without it,

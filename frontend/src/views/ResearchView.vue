@@ -13,6 +13,8 @@ const query = ref('')
 const model = ref('')
 const models = ref([])
 const modelDropdownOpen = ref(false)
+const interactionMode = ref('research')
+const chatProfile = ref('current')
 const messages = ref([])
 const status = ref(null)
 const isResearching = ref(false)
@@ -23,7 +25,7 @@ const messagesContainer = ref(null)
 // Persisted the same way dark mode is, since it's a standing preference.
 const prioritizeKb = ref(localStorage.getItem('prioritizeKb') === 'true')
 // Extra Research is intentionally per-question. It takes longer and uses a
-// bounded three-level search, so the next question returns to Standard mode.
+// bounded four-level search, so the next question returns to Standard mode.
 const researchMode = ref('standard')
 const experimentProfiles = ref([])
 const experimentProfile = ref('current')
@@ -108,6 +110,11 @@ function selectModel(m) {
   modelDropdownOpen.value = false
 }
 
+function displayProfileName(slug) {
+  if (slug === 'current') return 'Loaded model'
+  return experimentProfiles.value.find(profile => profile.slug === slug)?.display_name || slug
+}
+
 async function queueExperiment() {
   const prompt = experimentPrompt.value.trim() || query.value.trim()
   if (!prompt || queueingExperiment.value) return
@@ -162,7 +169,37 @@ async function submitQuery() {
   messages.value.push({ role: 'user', content: q })
   query.value = ''
   isResearching.value = true
-  status.value = { step: 'starting', detail: 'Initializing...' }
+  status.value = { step: 'starting', detail: interactionMode.value === 'chat' ? 'Connecting to llama.cpp...' : 'Initializing...' }
+
+  if (interactionMode.value === 'chat') {
+    const reply = { role: 'assistant', content: '' }
+    const history = messages.value.slice(0, -1).map(({ role, content }) => ({ role, content }))
+    messages.value.push(reply)
+    abortController = api.streamLlamaChat(q, history, chatProfile.value, sessionId.value, {
+      onSession(data) {
+        sessionId.value = data.session_id
+      },
+      onStatus(data) {
+        status.value = { step: 'starting', detail: data.detail }
+      },
+      onModel(data) {
+        status.value = { step: 'generating', detail: `Chatting with ${displayModelName(data.model)}...` }
+      },
+      onToken(data) {
+        reply.content += data.content
+      },
+      onError(data) {
+        reply.content = reply.content || `Error: ${data.error}`
+        status.value = null
+        isResearching.value = false
+      },
+      onDone() {
+        status.value = null
+        isResearching.value = false
+      },
+    })
+    return
+  }
 
   abortController = api.streamResearch(q, model.value, sessionId.value, {
     onSession(data) {
@@ -244,7 +281,7 @@ const statusText = computed(() => {
         <Bot class="w-12 h-12 text-gray-400 dark:text-gray-600 mb-4" :stroke-width="1.5" />
         <h2 class="text-xl font-bold text-gray-900 dark:text-white mb-2">Deep Research</h2>
         <p class="text-sm text-gray-500 dark:text-gray-400 max-w-md">
-          Ask a question, search the web, or paste a URL to scrape and analyze.
+          Research the web and saved sources, or switch to a direct llama.cpp chat.
         </p>
       </div>
 
@@ -285,8 +322,24 @@ const statusText = computed(() => {
     <div class="border-t border-gray-200 dark:border-gray-700 pt-4">
       <!-- Model selector -->
       <div class="flex items-center gap-2 mb-3">
+        <div class="flex items-center rounded-md bg-gray-200 dark:bg-gray-700 text-xs overflow-hidden">
+          <button
+            @click="interactionMode = 'research'"
+            :class="['px-2.5 py-1.5 transition-colors', interactionMode === 'research' ? 'bg-blue-600 text-white' : 'hover:bg-gray-300 dark:hover:bg-gray-600']"
+          >
+            Research
+          </button>
+          <button
+            @click="interactionMode = 'chat'"
+            :class="['px-2.5 py-1.5 transition-colors', interactionMode === 'chat' ? 'bg-emerald-600 text-white' : 'hover:bg-gray-300 dark:hover:bg-gray-600']"
+          >
+            Chat · llama.cpp
+          </button>
+        </div>
+
         <div class="relative">
           <button
+            v-if="interactionMode === 'research'"
             @click="modelDropdownOpen = !modelDropdownOpen"
             class="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors"
             :title="model"
@@ -295,8 +348,17 @@ const statusText = computed(() => {
             {{ displayModelName(model) || 'Select model' }}
             <ChevronDown class="w-3 h-3" />
           </button>
+          <select
+            v-else
+            v-model="chatProfile"
+            class="px-3 py-1.5 text-xs rounded-md bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors"
+            title="Loaded model chats immediately. Choosing another profile switches only when the processing queue and GPU are idle."
+          >
+            <option value="current">Loaded model</option>
+            <option v-for="profile in experimentProfiles" :key="profile.slug" :value="profile.slug">{{ profile.display_name }}</option>
+          </select>
           <div
-            v-if="modelDropdownOpen"
+            v-if="interactionMode === 'research' && modelDropdownOpen"
             class="absolute bottom-full left-0 mb-1 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg z-50 min-w-48"
           >
             <button
@@ -315,6 +377,7 @@ const statusText = computed(() => {
         </div>
 
         <label
+          v-if="interactionMode === 'research'"
           class="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors cursor-pointer select-none"
           title="When enabled, check saved sources before searching the web. Leave it off to start with a web search."
         >
@@ -323,7 +386,7 @@ const statusText = computed(() => {
           Use saved sources first
         </label>
 
-        <div class="flex items-center rounded-md bg-gray-200 dark:bg-gray-700 text-xs overflow-hidden" title="Extra Research follows evidence through three bounded search levels before writing an answer">
+        <div v-if="interactionMode === 'research'" class="flex items-center rounded-md bg-gray-200 dark:bg-gray-700 text-xs overflow-hidden" title="Extra Research follows evidence through three bounded search levels before writing an answer">
           <button
             @click="researchMode = 'standard'"
             :class="['px-2.5 py-1.5 transition-colors', researchMode === 'standard' ? 'bg-blue-600 text-white' : 'hover:bg-gray-300 dark:hover:bg-gray-600']"
@@ -335,12 +398,16 @@ const statusText = computed(() => {
             :class="['flex items-center gap-1 px-2.5 py-1.5 transition-colors', researchMode === 'extra' ? 'bg-violet-600 text-white' : 'hover:bg-gray-300 dark:hover:bg-gray-600']"
           >
             <Layers class="w-3.5 h-3.5" :stroke-width="1.5" />
-            Extra · 3 levels
+            Extra · 4 levels
           </button>
         </div>
       </div>
 
-      <details class="mb-3 text-xs rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 p-3">
+      <p v-if="interactionMode === 'chat'" class="mb-3 text-xs text-gray-500 dark:text-gray-400">
+        Chat uses the loaded llama.cpp model. Selecting another profile switches the primary model only when processing work is drained and the GPU is idle.
+      </p>
+
+      <details v-if="interactionMode === 'research'" class="mb-3 text-xs rounded-md border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 p-3">
         <summary class="cursor-pointer font-medium text-gray-700 dark:text-gray-200 flex items-center gap-1.5">
           <FlaskConical class="w-3.5 h-3.5" :stroke-width="1.5" />
           Queue a llama.cpp model experiment
@@ -384,7 +451,7 @@ const statusText = computed(() => {
           v-model="query"
           @keydown="handleKeydown"
           :disabled="isResearching"
-          placeholder="Ask a question, search the web, or paste a URL to analyze..."
+          :placeholder="interactionMode === 'chat' ? `Message ${displayProfileName(chatProfile)}...` : 'Ask a question, search the web, or paste a URL to analyze...'"
           rows="2"
           class="flex-1 resize-none rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50 placeholder-gray-400"
         />
