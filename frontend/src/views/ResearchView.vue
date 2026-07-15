@@ -139,6 +139,22 @@ function displayModelName(m) {
   return m.includes('/') ? m.slice(m.lastIndexOf('/') + 1) : m
 }
 
+function experimentSummary(job) {
+  const progress = job.progress || {}
+  const parts = []
+  if (progress.display_name || progress.profile || job.payload?.profile_slug) {
+    parts.push(progress.display_name || progress.profile || job.payload.profile_slug)
+  }
+  if (progress.context_size || job.payload?.context_size) {
+    parts.push(`${progress.context_size || job.payload.context_size} context`)
+  }
+  if (typeof (progress.reasoning ?? job.payload?.reasoning) === 'boolean') {
+    parts.push((progress.reasoning ?? job.payload.reasoning) ? 'reasoning on' : 'reasoning off')
+  }
+  if (progress.elapsed_seconds) parts.push(`${Math.round(progress.elapsed_seconds)}s`)
+  return parts.join(' · ')
+}
+
 async function submitQuery() {
   const q = query.value.trim()
   if (!q || isResearching.value) return
@@ -342,10 +358,22 @@ const statusText = computed(() => {
         </div>
         <p v-if="experimentMessage" class="mt-2" :class="experimentMessage.startsWith('Queued') ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'">{{ experimentMessage }}</p>
         <div v-if="experimentJobs.length" class="mt-3 space-y-2 text-gray-600 dark:text-gray-300">
-          <div v-for="job in experimentJobs" :key="job.id" class="rounded border border-gray-200 dark:border-gray-700 p-2">
-            <span class="font-medium">{{ job.status }} · {{ job.stage }}</span>
-            <span class="ml-1 text-gray-500">{{ job.progress?.display_name || job.progress?.profile || job.payload?.profile_slug || 'current' }}</span>
-            <details v-if="job.progress?.answer" class="mt-1"><summary class="cursor-pointer">View result</summary><div class="markdown-content mt-2" v-html="renderMarkdown(job.progress.answer)" /></details>
+          <div v-for="job in experimentJobs" :key="job.id" class="rounded-md border border-gray-200 bg-white p-3 text-sm dark:border-gray-700 dark:bg-gray-900/40">
+            <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+              <span class="font-medium text-gray-900 dark:text-white">{{ job.status }} · {{ job.stage }}</span>
+              <span class="font-mono text-[11px] text-gray-400 dark:text-gray-500">{{ job.id.slice(0, 8) }}</span>
+            </div>
+            <p v-if="experimentSummary(job)" class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ experimentSummary(job) }}</p>
+            <details v-if="job.progress?.answer" class="group mt-3 rounded-md border border-gray-200 bg-gray-50 dark:border-gray-700 dark:bg-gray-800/70">
+              <summary class="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-sm font-medium text-blue-700 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/30">
+                <span>View full experiment result</span>
+                <span class="text-xs font-normal text-gray-500 group-open:hidden dark:text-gray-400">Expand</span>
+                <span class="hidden text-xs font-normal text-gray-500 group-open:inline dark:text-gray-400">Collapse</span>
+              </summary>
+              <div class="max-h-[32rem] overflow-auto border-t border-gray-200 dark:border-gray-700">
+                <article class="markdown-content min-w-0 break-words px-4 py-4 text-sm leading-6 text-gray-800 dark:text-gray-100" v-html="renderMarkdown(job.progress.answer)" />
+              </div>
+            </details>
           </div>
         </div>
       </details>
