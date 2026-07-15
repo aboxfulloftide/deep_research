@@ -333,11 +333,15 @@ and `verification.py`. Plan:
   source that has a chunked version but no completed extraction run,
   sequentially (single llama-server, no concurrent GPU contention),
   continuing past any single source's failure.
-- **Shared server-lifecycle helper**: pull the generic
-  subprocess-launch/health-check logic (`build_launch_command`,
-  `is_healthy`, `wait_ready`) out of `deep_research/evals/server.py` into a
-  registry-agnostic module (e.g. `deep_research/tools/llama_server.py`), so
-  both the eval CLI and the nightly-swap script share one implementation.
+- **Shared server-lifecycle helper — DONE (2026-07-14/15)**:
+  `deep_research/tools/llama_server.py` now holds the registry-agnostic
+  launch/health-check logic (`build_launch_command`, `is_healthy`,
+  `wait_ready`, `start_server`); `deep_research/evals/server.py` wraps it.
+  The nightly-swap script should call this same helper. As of 2026-07-15
+  it launches every server with `--jinja` by default (embedded chat
+  template + native tool calling; per-model `{"jinja": false}` /
+  `{"chat_template_file": ...}` escape hatches) — see HANDOFF.md's
+  comparability note about pre-`--jinja` eval baselines.
 - **New nightly cron wrapper** (replacing today's single-line
   `verify-unverified` cron entry) sequencing, in order: start 30B -> run
   `extract-pending` -> stop 30B (wait for full VRAM release, not just

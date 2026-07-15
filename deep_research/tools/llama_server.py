@@ -18,6 +18,18 @@ def build_launch_command(model_path: str, port: int, args: dict | None = None) -
            "-ngl", str(args.get("gpu_layers", 99)), "-c", str(args.get("context", 32768)),
            "-b", str(args.get("batch", 4096)), "-ub", str(args.get("ubatch", 512)), "--parallel", str(args.get("parallel", 2))]
     if args.get("flash_attn", True): cmd += ["-fa", "on"]
+    # --jinja renders prompts with the model's own embedded chat template and
+    # is what unlocks native OpenAI-style tool calling (without it,
+    # llama-server 400s the `tools` param and LLMClient silently downgrades
+    # the research agent to its no-native-tools path). Default on since
+    # 2026-07-15 -- eval rounds 1-4 / cross-verify baselines predate this,
+    # so their numbers aren't strictly comparable to runs made with it. Opt
+    # out per model ({"jinja": false}) for a GGUF whose embedded template is
+    # broken or uses Jinja features llama.cpp's minja engine doesn't
+    # support; {"chat_template_file": path} overrides the template while
+    # keeping --jinja on.
+    if args.get("jinja", True): cmd += ["--jinja"]
+    if args.get("chat_template_file"): cmd += ["--chat-template-file", args["chat_template_file"]]
     for key, flag in (("tensor_split", "-ts"), ("devices", "-dev"), ("split_mode", "-sm")):
         if args.get(key): cmd += [flag, args[key]]
     return cmd

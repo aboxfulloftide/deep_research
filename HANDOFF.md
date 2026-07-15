@@ -453,12 +453,23 @@ also swallow the nested package, which it did on the first attempt.
 
 Use llama.cpp on a free port such as `18080`, because `8080` was occupied by Open WebUI internals.
 
+> **`--jinja` (added 2026-07-15):** all servers now launch with `--jinja`
+> (the model's own embedded chat template + native tool-calling support) —
+> it's the default in `deep_research/tools/llama_server.py`'s
+> `build_launch_command`, which every start path (eval `start-server`,
+> model experiments) flows through. **Comparability note:** every number in
+> this document (Rounds 1-4, cross-verify) was measured *without* `--jinja`;
+> the rendered prompt differs slightly, so don't compare new eval runs
+> against these baselines without re-running them. Per-model opt-out for a
+> broken/unsupported embedded template: `{"jinja": false}` in the model's
+> server args, or `{"chat_template_file": ...}` to override the template.
+
 Example 14B server:
 
 ```bash
 /home/matheau/llama/llama.cpp/build/bin/llama-server \
   -m /home/matheau/.cache/llama.cpp/Qwen_Qwen3-14B-GGUF_Qwen3-14B-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 18080 -ngl 99 -fa on -c 32768 -b 4096 -ub 512 \
+  --host 127.0.0.1 --port 18080 -ngl 99 -fa on --jinja -c 32768 -b 4096 -ub 512 \
   -dev CUDA0,CUDA1 -sm layer -ts 1,1 --parallel 2
 ```
 
@@ -467,7 +478,7 @@ Example 30B server:
 ```bash
 /home/matheau/llama/llama.cpp/build/bin/llama-server \
   -m /home/matheau/llama/models/gguf-large/Qwen3-30B-A3B-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 18080 -ngl 99 -fa on -c 32768 -b 4096 -ub 512 \
+  --host 127.0.0.1 --port 18080 -ngl 99 -fa on --jinja -c 32768 -b 4096 -ub 512 \
   -dev CUDA0,CUDA1 -sm layer -ts 1,1 --parallel 2
 ```
 
