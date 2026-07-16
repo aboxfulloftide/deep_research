@@ -25,6 +25,8 @@ from deep_research.tools.extra_research import (
 )
 from deep_research.tools.llama_server import is_healthy
 
+PARALLEL_REQUEST_SLOTS = 3
+
 
 def _serialize_source(source) -> dict:
     """Keep a research source JSON-safe when it is attached to queued jobs."""
@@ -182,7 +184,12 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
         profile = dict(profile)
         server_args = json.loads(profile["server_args_json"])
         if requested_context:
-            server_args["context"] = int(requested_context)
+            # llama.cpp splits -c across --parallel slots.  Experiment/UI
+            # context is a per-request value, so preserve it by allocating
+            # the corresponding total server context.  Without this, a
+            # nominal 11,008-token run with parallel=3 only accepts ~3,669
+            # tokens and rejects a normal evidence bundle with HTTP 400.
+            server_args["context"] = int(requested_context) * PARALLEL_REQUEST_SLOTS
         profile["server_args_json"] = json.dumps(server_args)
         # The web worker can be restarted while an experiment runs. Put the
         # temporary server in its own user unit so a web-service restart does
@@ -217,7 +224,8 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
         try:
             base_url = f"http://127.0.0.1:{profile['port']}/v1"
             model = await detect_model(base_url)
-            context_size = await detect_context_size(base_url)
+            detected_context = await detect_context_size(base_url)
+            context_size = int(requested_context) if requested_context else detected_context
         except Exception:
             if started_profile is not None:
                 await stop_server(started_profile)
