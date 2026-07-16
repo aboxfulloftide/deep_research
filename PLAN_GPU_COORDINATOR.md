@@ -3,9 +3,9 @@
 ## Purpose
 
 Provide one local, host-level coordinator for **cooperating GPU consumers**.
-It gives a tool a way to inspect GPU availability, reserve exclusive GPU time,
-wait fairly in a shared queue, move an important request to the next position,
-and release its reservation when finished.
+It gives a tool a way to inspect GPU availability, reserve the GPU resources it
+actually needs, wait fairly in a shared queue, move an important request to the
+next position, and release its reservation when finished.
 
 The coordinator is intentionally independent of Deep Research's PostgreSQL
 database, model registry, and process lifecycle. Deep Research is one client;
@@ -35,9 +35,13 @@ changing the protocol). Any tool may call it:
 local-gpu status
 local-gpu queue
 
-# Request exclusive time. `--wait` blocks until granted and renews the lease.
-local-gpu acquire --owner deep-research --purpose 'Qwen3-32B experiment' --wait
-local-gpu acquire --owner comfyui --purpose 'image batch' --wait
+# Request a declared resource envelope. `--wait` blocks until granted and
+# renews the lease. A request can fit on one GPU while another tool uses the
+# remaining capacity of the other GPU.
+local-gpu acquire --owner deep-research --purpose 'Qwen3-14B research' \
+  --vram-mib 12000 --gpus 1 --wait
+local-gpu acquire --owner comfyui --purpose 'image batch' \
+  --vram-mib 14000 --gpus 1 --wait
 
 # A user-approved request can move from fifth place to the next runnable spot.
 local-gpu move-next <request-id>
@@ -49,7 +53,8 @@ local-gpu release <lease-id>
 `status` must clearly distinguish:
 
 - **available** — no active lease and no blocking unmanaged GPU work;
-- **leased** — owner, purpose, start time, heartbeat age, and queue length;
+- **leased** — owner, purpose, GPU indices, reserved VRAM, start time,
+  heartbeat age, and queue length;
 - **external-busy** — process detected but not managed by the coordinator;
 - **unavailable** — detection failed, so exclusive work is not started.
 
@@ -75,14 +80,28 @@ Core records:
 
 | Record | Required fields | Meaning |
 | --- | --- | --- |
-| `requests` | id, owner, purpose, priority, state, requested_at, moved_next_at | FIFO queue entry; states include waiting, granted, cancelled, expired, completed. |
-| `leases` | id, request_id, owner, acquired_at, heartbeat_at, expires_at | One active exclusive reservation per configured GPU group. |
+| `requests` | id, owner, purpose, resource request, priority, state, requested_at, moved_next_at | FIFO queue entry; states include waiting, granted, cancelled, expired, completed. |
+| `leases` | id, request_id, owner, GPU allocation, reserved VRAM, acquired_at, heartbeat_at, expires_at | A granted reservation; several leases may coexist only when their declared allocations fit safely. |
 | `events` | timestamp, request_id, action, actor, detail | Auditable acquire, release, expiry, cancellation, and move-next actions. |
 | `runtimes` | owner, name, GPU group, optional endpoint/unit/PID, heartbeat | Informational registration of resident services such as llama.cpp, Ollama, or ComfyUI. It does not grant exclusive time. |
 
 All queue mutations use one SQLite transaction (`BEGIN IMMEDIATE`). Leases use
 a short TTL (for example 60 seconds) and a client heartbeat every 15 seconds.
 Expired leases are reclaimed atomically before granting the next request.
+
+Each request declares a resource envelope rather than merely "the GPU":
+
+- acceptable GPU count or an explicit GPU set;
+- per-GPU VRAM reservation, including model weights, KV cache, and a safety
+  margin;
+- workload class (`latency-sensitive`, `interactive`, or `batch`);
+- whether it can share a GPU with another managed workload;
+- optional launch variants, such as one-GPU and two-GPU forms of the same
+  model.
+
+The coordinator measures total VRAM and current process allocations per GPU.
+It subtracts active managed reservations and an unallocatable safety reserve;
+observed memory alone is never treated as guaranteed free capacity.
 
 ## Detection Model
 
@@ -95,8 +114,9 @@ The coordinator separates **physical observation** from **permission**:
 3. Let a registered runtime expose an optional health/idle probe. For llama.cpp
    that is `/slots`; for a future tool it may be an HTTP endpoint, Unix socket,
    or no probe at all.
-4. An unknown compute process yields `external-busy` for an exclusive request.
-   The coordinator does not kill it.
+4. An unknown compute process yields `external-busy` for the affected GPU. The
+   coordinator may still grant a request that explicitly fits on other known,
+   safe GPUs; it never kills the unknown process.
 5. A resident but idle service (for example an unloaded ComfyUI worker or an
    idle llama.cpp server) is visible in status but does not hold the exclusive
    lease.
@@ -104,6 +124,53 @@ The coordinator separates **physical observation** from **permission**:
 This fixes the present ambiguity where checking only llama.cpp port 8080 misses
 an alternate server on port 18080, and where GPU memory residency is confused
 with active GPU work.
+
+## Capacity Packing and Automatic Backfill
+
+The scheduler is resource-aware. It evaluates the queue in FIFO order, but may
+grant a later **backfillable** request when the earlier request cannot fit and
+the later one safely fits the currently unused capacity. This is the automatic
+version of "jumping in line": a small Ollama embedding job or ComfyUI request
+can use a free GPU while a larger dual-GPU request waits for both GPUs.
+
+Backfill rules:
+
+- Never interrupt or shrink an active lease.
+- Never allocate beyond declared reservations plus the per-GPU safety margin.
+- Do not bypass an earlier request that already fits.
+- Record every bypass event and show it in `queue` output.
+- Apply starvation protection: after a configurable number of bypasses or
+  maximum wait time, reserve compatible capacity for the oldest blocked job.
+- `move-next` remains a user action; resource backfill is automatic only when
+  it uses otherwise unusable capacity.
+
+The result is not a simplistic global FIFO queue: it is fair FIFO with safe
+capacity packing.
+
+## Deep Research Resource-Aware Launching
+
+Deep Research currently launches registered llama.cpp profiles across both
+GPUs by default. Its coordinator adapter must add resource variants for each
+profile, for example:
+
+| Profile variant | Coordinator request | llama.cpp launch intent |
+| --- | --- | --- |
+| Qwen3-14B / single GPU | one GPU, model+KV safety envelope | all layers on the granted GPU; no two-GPU tensor split |
+| Qwen3-14B / dual GPU | two GPUs, split envelope | current `-ts 1,1 -dev CUDA0,CUDA1` launch |
+| Qwen3-30B / dual GPU | two GPUs, larger split envelope | split across both GPUs |
+
+When a Deep Research job reaches the head of the queue, it asks for its
+preferred variant first. If the dual-GPU variant is blocked but the single-GPU
+variant fits and leaving the second GPU available would admit useful queued
+work, the coordinator returns a single-GPU grant and the Deep Research adapter
+launches that registered single-GPU variant. The adapter, not the coordinator,
+still owns the actual llama.cpp stop/start command.
+
+This decision must be made at a safe lifecycle boundary: before loading a
+model, between jobs, or after an idle server has been deliberately swapped.
+The coordinator must never force a running dual-GPU llama.cpp process to
+change topology mid-generation. A user-visible status should state which
+variant was selected and why.
 
 ## Fairness and Priority
 
@@ -120,7 +187,8 @@ with active GPU work.
 Deep Research becomes a normal client:
 
 1. Before a model experiment, model swap, source extraction, verification
-   batch, or direct llama.cpp chat generation, acquire the appropriate lease.
+   batch, or direct llama.cpp chat generation, request the appropriate
+   resource envelope and honour the granted launch variant.
 2. Register managed runtimes for the primary llama.cpp server and temporary
    evaluation servers, including port and systemd unit for observability.
 3. Keep all existing llama.cpp start/stop logic in Deep Research. The
@@ -147,12 +215,14 @@ queues, and APIs remain their responsibility.
 
 ## Delivery Phases
 
-1. **Coordinator core:** SQLite state, CLI, FIFO acquire/release/wait, TTL,
-   `status`, `queue`, `move-next`, and tests with a fake clock/probe.
+1. **Coordinator core:** SQLite state, CLI, resource-envelope acquire/release/
+   wait, TTL, `status`, `queue`, `move-next`, and tests with a fake
+   clock/probe.
 2. **Host service and API:** user systemd service, Unix socket API, GPU process
    probe, runtime registration, and human-readable status.
-3. **Deep Research adoption:** wrap experiments, model switching, and queued
-   GPU phases; expose coordinator status and move-next in the web UI.
+3. **Deep Research adoption:** register one- and two-GPU profile variants;
+   wrap experiments, model switching, and queued GPU phases; expose
+   coordinator status, selected variant, and move-next in the web UI.
 4. **Other-tool adapters:** small optional wrappers/examples for Ollama and
    ComfyUI. They remain opt-in and do not become dependencies of Deep Research.
 5. **Operational hardening:** audit view, lease-duration metrics, starvation
@@ -160,8 +230,13 @@ queues, and APIs remain their responsibility.
 
 ## Acceptance Criteria
 
-- Two independent local tools requesting exclusive time run in one visible
-  queue and never receive a lease concurrently for the same GPU group.
+- Two independent local tools requesting GPU resources run in one visible
+  queue and never receive allocations exceeding any GPU's safe capacity.
+- A small one-GPU request behind a blocked two-GPU request can be granted when
+  it uses otherwise unused capacity; the bypass and its reason are visible.
+- Deep Research can choose a registered single-GPU model variant when that
+  enables another compatible request to use the second GPU, without changing
+  a running model mid-generation.
 - A user can move a waiting request from fifth to next; the action is visible
   in queue history and does not interrupt active work.
 - A crashed client no longer blocks the queue after its lease TTL.
