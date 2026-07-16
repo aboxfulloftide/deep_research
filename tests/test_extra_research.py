@@ -18,8 +18,8 @@ class _FakeLLM:
 async def test_collect_sources_reads_unique_sources_and_keeps_context_bounded(monkeypatch):
     async def fake_search(query, config):
         return [
-            SearchResult(title=f"{query} first", url="https://example.test/one", snippet="first"),
-            SearchResult(title=f"{query} second", url="https://example.test/two", snippet="second"),
+            SearchResult(title=f"{query} first", url="https://huggingface.co/one", snippet="first"),
+            SearchResult(title=f"{query} second", url="https://github.com/two", snippet="second"),
         ]
 
     async def fake_scrape(url, config):
@@ -42,9 +42,9 @@ async def test_collect_sources_reads_unique_sources_and_keeps_context_bounded(mo
 async def test_collect_sources_skips_syndicated_title_copies(monkeypatch):
     async def fake_search(query, config):
         return [
-            SearchResult(title="One article", url="https://first.test/article", snippet="first"),
-            SearchResult(title="One article", url="https://copy.test/article", snippet="copy"),
-            SearchResult(title="Independent article", url="https://second.test/article", snippet="second"),
+            SearchResult(title="One article", url="https://huggingface.co/first", snippet="first"),
+            SearchResult(title="One article", url="https://github.com/copy", snippet="copy"),
+            SearchResult(title="Independent article", url="https://arxiv.org/second", snippet="second"),
         ]
 
     async def fake_scrape(url, config):
@@ -56,8 +56,8 @@ async def test_collect_sources_skips_syndicated_title_copies(monkeypatch):
     sources = await extra.collect_sources(["question"], Config(), 1, set())
 
     assert [source.url for source in sources] == [
-        "https://first.test/article",
-        "https://second.test/article",
+        "https://huggingface.co/first",
+        "https://arxiv.org/second",
     ]
 
 
@@ -65,8 +65,8 @@ async def test_collect_sources_skips_syndicated_title_copies(monkeypatch):
 async def test_gap_closing_level_can_cap_a_single_query_to_one_source(monkeypatch):
     async def fake_search(query, config):
         return [
-            SearchResult(title="First", url="https://example.test/one", snippet="first"),
-            SearchResult(title="Second", url="https://example.test/two", snippet="second"),
+            SearchResult(title="First", url="https://huggingface.co/one", snippet="first"),
+            SearchResult(title="Second", url="https://github.com/two", snippet="second"),
         ]
 
     async def fake_scrape(url, config):
@@ -88,7 +88,7 @@ async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check
 
     async def fake_collect(queries, config, level, seen_urls, **kwargs):
         calls.append((level, queries))
-        return [extra.ResearchSource("Source", f"https://example.test/{level}", "source evidence text", level, queries[0])]
+        return [extra.ResearchSource("Source", f"https://huggingface.co/{level}", "source evidence text", level, queries[0], quality_score=5)]
 
     async def fake_follow_ups(llm, query, sources, level):
         return [f"level {level} first", f"level {level} second"]
@@ -111,10 +111,10 @@ async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check
         "data": (
             "primary source comparison\nindependent benchmark analysis\n\n"
             "### Sources consulted\n"
-            "- [Source](https://example.test/1)\n"
-            "- [Source](https://example.test/2)\n"
-            "- [Source](https://example.test/3)\n"
-            "- [Source](https://example.test/4)"
+                "- [Source](https://huggingface.co/1)\n"
+                "- [Source](https://huggingface.co/2)\n"
+                "- [Source](https://huggingface.co/3)\n"
+                "- [Source](https://huggingface.co/4)"
         ),
     }
 
@@ -151,7 +151,7 @@ async def test_starting_query_planning_keeps_original_out_of_derived_queries():
 
 @pytest.mark.asyncio
 async def test_claim_ledger_rejects_a_claim_without_a_verbatim_quote():
-    source = extra.ResearchSource("Source", "https://example.test", "the supported fact is here", 1, "query")
+    source = extra.ResearchSource("Source", "https://huggingface.co/example", "the supported fact is here", 1, "query", quality_score=5)
     claims = extra._parse_ledger(
         '[{"statement":"Unsupported statement", "quote":"not present", "confidence":0.9}]', source,
     )
@@ -160,9 +160,9 @@ async def test_claim_ledger_rejects_a_claim_without_a_verbatim_quote():
 
 @pytest.mark.asyncio
 async def test_claim_ledger_keeps_source_attributed_verbatim_evidence():
-    source = extra.ResearchSource("Source", "https://example.test", "The supported fact is here.", 1, "query")
+    source = extra.ResearchSource("Source", "https://huggingface.co/example", "The supported fact is here.", 1, "query", quality_score=5)
     claims = extra._parse_ledger(
         '[{"statement":"A supported fact exists.", "quote":"supported fact is here", "confidence":0.9}]', source,
     )
-    assert claims[0].source_url == "https://example.test"
-    assert "[Source](https://example.test)" in extra.claim_ledger_context(claims)
+    assert claims[0].source_url == "https://huggingface.co/example"
+    assert "[Source](https://huggingface.co/example)" in extra.claim_ledger_context(claims)

@@ -1,5 +1,6 @@
 """Safe, queued experiments for comparing local llama.cpp configurations."""
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -21,6 +22,18 @@ from deep_research.tools.extra_research import (
     source_context,
 )
 from deep_research.tools.llama_server import is_healthy
+
+
+async def _start_with_retry(profile: dict, attempts: int = 3) -> tuple[bool, object]:
+    """Transient systemd units can still be retiring when a swap restores a model."""
+    log_path = None
+    for attempt in range(attempts):
+        ready, log_path = await start_server(profile)
+        if ready:
+            return True, log_path
+        if attempt + 1 < attempts:
+            await asyncio.sleep(2 * (attempt + 1))
+    return False, log_path
 
 
 async def available_profiles(config: Config) -> dict:
@@ -132,7 +145,7 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
             ready, log_path = await start_server(profile)
             if not ready:
                 if primary_to_restore is not None:
-                    await start_server(primary_to_restore)
+                    await _start_with_retry(primary_to_restore)
                 raise RuntimeError(f"Experiment server did not become ready; see {log_path}")
             started_profile = profile
         try:
@@ -143,7 +156,7 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
             if started_profile is not None:
                 await stop_server(started_profile)
             if primary_to_restore is not None:
-                ready, log_path = await start_server(primary_to_restore)
+                ready, log_path = await _start_with_retry(primary_to_restore)
                 if not ready:
                     raise RuntimeError(f"Could not restore the primary llama.cpp server; see {log_path}")
             raise
@@ -185,7 +198,8 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                 "You are evaluating a local research assistant. Write a concise decision memo using ONLY the supplied "
                 "claim ledger. Do not add facts from general knowledge or from the source analyses. Every factual or "
                 "numerical sentence must contain an exact Markdown link from the ledger. Separate official specifications, "
-                "estimates, and unknowns. Never use [citation: N] or a source not in the ledger."
+                "estimates, and unknowns. Call a finding official only when its ledger tier is primary or paper; otherwise "
+                "label it technical-reference evidence. Never use [citation: N] or a source not in the ledger."
             )
             if not reasoning:
                 system = "/no_think\n" + system
@@ -197,7 +211,8 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
             fact_check_system = (
                 "You are a strict final fact checker. Check the draft against the original question and the supplied "
                 "claim ledger. Remove unsupported, overstated, or uncited claims instead of guessing. Return only the "
-                "corrected evidence-grounded answer with Markdown source links from the ledger. Never output [citation: N]."
+                "corrected evidence-grounded answer with Markdown source links from the ledger. Never output [citation: N] "
+                "or label secondary/technical-reference evidence as official."
             )
             if not reasoning:
                 fact_check_system = "/no_think\n" + fact_check_system
@@ -231,6 +246,6 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
             await kb_db.update_processing_job_progress(
                 job["id"], "restoring_model", {"profile": primary_to_restore["slug"]}, lease_seconds=900,
             )
-            ready, log_path = await start_server(primary_to_restore)
+            ready, log_path = await _start_with_retry(primary_to_restore)
             if not ready:
                 raise RuntimeError(f"Could not restore the primary llama.cpp server; see {log_path}")

@@ -405,7 +405,9 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
                 "from the source analyses. Separate verified specifications, reproducible estimates, and unknowns. "
                 "Every factual or numerical sentence must include an exact Markdown source link from the ledger. "
                 "Never use [citation: N], a bare citation number, or a source not in the ledger. If evidence is "
-                "insufficient, say so. Prefer a ranked shortlist and concise tradeoffs over an encyclopedia."
+                "insufficient, say so. Never call a finding official unless its ledger tier is primary or paper; "
+                "otherwise label it as technical-reference evidence. Prefer a ranked shortlist and concise tradeoffs "
+                "over an encyclopedia."
             ),
         },
         {
@@ -430,7 +432,8 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
                 "/no_think\nYou are a strict final fact checker. Correct the draft only where the supplied evidence "
                 "does not support it, it overstates certainty, has an uncited number, or uses a citation not present in "
                 "the ledger. Remove a claim rather than guessing. Keep only facts that map to a ledger row, preserve exact "
-                "Markdown source links, and return the corrected final answer only. Never output [citation: N]."
+                "Markdown source links, and return the corrected final answer only. Never output [citation: N] or "
+                "label secondary/technical-reference evidence as official."
             ),
         },
         {

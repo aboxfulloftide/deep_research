@@ -36,7 +36,7 @@ async def test_current_model_experiment_uses_active_server_without_starting_prof
     from deep_research.tools.extra_research import ResearchSource
 
     async def sources(queries, config, level, seen_urls, **kwargs):
-        return [ResearchSource("Source", "https://example.test", "Evidence text", level, queries[0])]
+        return [ResearchSource("Source", "https://huggingface.co/example", "Evidence text", level, queries[0], quality_score=5)]
 
     monkeypatch.setattr(experiments, "detect_model", fake_model)
     monkeypatch.setattr(experiments, "detect_context_size", fake_context)
@@ -75,7 +75,7 @@ async def test_larger_profile_safely_swaps_and_restores_primary_model(monkeypatc
 
     async def fake_sources(queries, config, level, seen_urls, **kwargs):
         from deep_research.tools.extra_research import ResearchSource
-        return [ResearchSource("Source", "https://example.test", "Evidence text", level, queries[0])]
+        return [ResearchSource("Source", "https://huggingface.co/example", "Evidence text", level, queries[0], quality_score=5)]
 
     async def fake_get_model(config, slug):
         return alternate if slug == "qwen3-30b" else None

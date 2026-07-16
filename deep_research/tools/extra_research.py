@@ -18,6 +18,7 @@ from deep_research.tools.scrape import scrape_page
 from deep_research.tools.search import web_search
 
 SOURCES_PER_QUERY = 1
+MIN_EVIDENCE_QUALITY = 3
 SOURCE_EXCERPT_CHARS = 3_000
 FOLLOW_UP_QUERY_LIMIT = 2
 INITIAL_QUERY_LIMIT = 2
@@ -64,14 +65,12 @@ def classify_source(url: str) -> tuple[str, int]:
     host = (urlparse(url).hostname or "").lower().removeprefix("www.")
     if host in {"arxiv.org", "openreview.net"}:
         return "paper", 5
-    if host in {"github.com", "huggingface.co"} or host.endswith(".ai") or host.endswith(".org") and any(
-        marker in host for marker in ("mistral", "qwen", "meta", "tii", "allenai")
-    ):
+    if host in {"huggingface.co", "qwenlm.github.io", "mistral.ai", "docs.mistral.ai", "llama.com", "ai.meta.com"}:
         return "primary", 5
-    if any(marker in host for marker in ("docs.", "developer.", "benchmark", "lmarena", "lmsys")):
+    if host in {"github.com", "paperswithcode.com", "swebench.com", "livecodebench.github.io"}:
         return "technical_reference", 4
-    if host in {"paperswithcode.com", "swebench.com"}:
-        return "benchmark", 4
+    if host.startswith(("docs.", "developer.")) or any(marker in host for marker in ("benchmark", "lmarena", "lmsys")):
+        return "technical_reference", 4
     if host in {"reddit.com", "news.ycombinator.com", "medium.com"}:
         return "community", 1
     return "secondary", 2
@@ -99,6 +98,9 @@ async def collect_sources(
         added = 0
         ranked_results = sorted(results, key=lambda result: classify_source(result.url)[1], reverse=True)
         for result in ranked_results:
+            _, quality_score = classify_source(result.url)
+            if quality_score < MIN_EVIDENCE_QUALITY:
+                continue
             title_key = _title_key(result.title)
             if (
                 result.url in seen_urls
@@ -367,6 +369,8 @@ async def build_claim_ledger(
     semaphore = asyncio.Semaphore(2)
 
     async def extract(source: ResearchSource) -> list[EvidenceClaim]:
+        if source.quality_score < MIN_EVIDENCE_QUALITY:
+            return []
         messages = [
             {
                 "role": "system",
@@ -393,6 +397,6 @@ async def build_claim_ledger(
 def claim_ledger_context(claims: list[EvidenceClaim]) -> str:
     return "\n".join(
         f"- {claim.statement}\n  Evidence: {claim.quote}\n  Source: [{claim.source_title}]({claim.source_url}) "
-        f"({claim.source_kind}; confidence {claim.confidence:.2f})"
+        f"(evidence tier: {claim.source_kind}; confidence {claim.confidence:.2f})"
         for claim in claims
     )
