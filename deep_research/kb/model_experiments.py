@@ -19,6 +19,7 @@ from deep_research.tools.extra_research import (
     derive_gap_closing_query,
     derive_follow_up_queries,
     derive_starting_queries,
+    has_authoritative_source,
     source_context,
 )
 from deep_research.tools.llama_server import is_healthy
@@ -183,8 +184,8 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                     queries = await derive_follow_up_queries(llm, prompt, sources, level)
                 elif level == 3:
                     queries = await derive_gap_closing_query(llm, prompt, sources)
-            if not sources:
-                raise RuntimeError("Could not collect source context for model experiment")
+            if not sources or not has_authoritative_source(sources):
+                raise RuntimeError("Could not collect an authoritative model card or paper for the experiment")
 
             await kb_db.update_processing_job_progress(
                 job["id"], "evaluate", {"source_count": len(sources), "context_size": context_size}, lease_seconds=900,

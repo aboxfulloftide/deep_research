@@ -322,6 +322,7 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
         analyze_sources_separately,
         build_claim_ledger,
         claim_ledger_context,
+        has_authoritative_source,
         collect_sources,
         derive_gap_closing_query,
         derive_follow_up_queries,
@@ -373,7 +374,7 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
             }
             queries = await derive_gap_closing_query(llm, query, sources)
 
-    if not sources:
+    if not sources or not has_authoritative_source(sources):
         yield {"event": "answer", "data": "I could not retrieve usable sources for this extra research run."}
         return
 

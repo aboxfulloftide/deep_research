@@ -88,7 +88,7 @@ async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check
 
     async def fake_collect(queries, config, level, seen_urls, **kwargs):
         calls.append((level, queries))
-        return [extra.ResearchSource("Source", f"https://huggingface.co/{level}", "source evidence text", level, queries[0], quality_score=5)]
+        return [extra.ResearchSource("Source", f"https://huggingface.co/{level}", "source evidence text", level, queries[0], quality_score=5, source_kind="primary")]
 
     async def fake_follow_ups(llm, query, sources, level):
         return [f"level {level} first", f"level {level} second"]
@@ -146,7 +146,10 @@ async def test_starting_query_planning_keeps_original_out_of_derived_queries():
 
     queries = await extra.derive_starting_queries(PlanningLLM(), "original question")
 
-    assert queries == ["primary data source", "independent comparison"]
+    assert queries == [
+        "site:huggingface.co Qwen coding model card context window",
+        "site:arxiv.org local LLM coding benchmark technical report",
+    ]
 
 
 @pytest.mark.asyncio

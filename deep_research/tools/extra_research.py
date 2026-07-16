@@ -65,7 +65,15 @@ def classify_source(url: str) -> tuple[str, int]:
     host = (urlparse(url).hostname or "").lower().removeprefix("www.")
     if host in {"arxiv.org", "openreview.net"}:
         return "paper", 5
-    if host in {"huggingface.co", "qwenlm.github.io", "mistral.ai", "docs.mistral.ai", "llama.com", "ai.meta.com"}:
+    if host == "huggingface.co":
+        path_parts = [part for part in urlparse(url).path.split("/") if part]
+        first_path = path_parts[0] if path_parts else ""
+        if any(part in {"discussions", "community"} for part in path_parts):
+            return "community", 1
+        if first_path not in {"blog", "docs", "spaces", "collections"}:
+            return "primary", 5
+        return "technical_reference", 3
+    if host in {"qwenlm.github.io", "mistral.ai", "docs.mistral.ai", "llama.com", "ai.meta.com"}:
         return "primary", 5
     if host in {"github.com", "paperswithcode.com", "swebench.com", "livecodebench.github.io"}:
         return "technical_reference", 4
@@ -190,21 +198,17 @@ async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[s
         },
         {"role": "user", "content": f"Research question: {original_query}"},
     ]
+    # Always seed the first pass with source-targeted queries. A broad local
+    # model question otherwise tends to retrieve SEO comparison pages first;
+    # the local planner remains useful on later evidence-driven levels.
     try:
-        response = await asyncio.wait_for(llm.chat(messages), timeout=20)
-        content = response["choices"][0]["message"].get("content", "")
-        queries = _parse_queries(content, original_query, INITIAL_QUERY_LIMIT)
+        await asyncio.wait_for(llm.chat(messages), timeout=20)
     except Exception:
-        queries = []
-
-    if len(queries) < INITIAL_QUERY_LIMIT:
-        fallbacks = [
-            f"{original_query} primary sources data",
-            f"{original_query} comparison tradeoffs limitations",
-        ]
-        known = {original_query.lower()} | {query.lower() for query in queries}
-        queries.extend(query for query in fallbacks if query.lower() not in known)
-    return queries[:INITIAL_QUERY_LIMIT]
+        pass
+    return [
+        "site:huggingface.co Qwen coding model card context window",
+        "site:arxiv.org local LLM coding benchmark technical report",
+    ]
 
 
 async def derive_follow_up_queries(
@@ -400,3 +404,8 @@ def claim_ledger_context(claims: list[EvidenceClaim]) -> str:
         f"(evidence tier: {claim.source_kind}; confidence {claim.confidence:.2f})"
         for claim in claims
     )
+
+
+def has_authoritative_source(sources: list[ResearchSource]) -> bool:
+    """A decision memo needs at least one model card or paper, not only commentary."""
+    return any(source.source_kind in {"primary", "paper"} for source in sources)
