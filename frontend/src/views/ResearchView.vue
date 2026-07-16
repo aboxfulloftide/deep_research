@@ -51,13 +51,13 @@ async function loadModels() {
   models.value = data.models || []
   model.value = data.default || (models.value[0] ?? '')
   experimentProfiles.value = profileData.profiles || []
-  experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment').slice(0, 5)
+  experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment')
 }
 
 async function refreshExperimentJobs() {
   try {
     const jobsData = await api.fetchProcessingJobs()
-    experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment').slice(0, 5)
+    experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment')
   } catch {
     // The main research flow remains usable if the optional job feed is down.
   }
@@ -130,7 +130,7 @@ async function queueExperiment() {
     experimentMessage.value = `Queued experiment ${result.job.id.slice(0, 8)}. It will wait for ingestion and verification work to finish.`
     experimentPrompt.value = ''
     const jobsData = await api.fetchProcessingJobs()
-    experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment').slice(0, 5)
+    experimentJobs.value = (jobsData.jobs || []).filter(job => job.job_type === 'model_experiment')
   } catch (err) {
     experimentMessage.value = err.message
   } finally {
