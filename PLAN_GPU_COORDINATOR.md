@@ -91,7 +91,7 @@ Expired leases are reclaimed atomically before granting the next request.
 
 Each request declares a resource envelope rather than merely "the GPU":
 
-- acceptable GPU count or an explicit GPU set;
+- minimum and preferred GPU counts or an explicit GPU set;
 - per-GPU VRAM reservation, including model weights, KV cache, and a safety
   margin;
 - workload class (`latency-sensitive`, `interactive`, or `batch`);
@@ -102,6 +102,12 @@ Each request declares a resource envelope rather than merely "the GPU":
 The coordinator measures total VRAM and current process allocations per GPU.
 It subtracts active managed reservations and an unallocatable safety reserve;
 observed memory alone is never treated as guaranteed free capacity.
+
+A range alone is insufficient for correct placement: one GPU versus two GPUs
+can have different VRAM layouts, context limits, and throughput. Therefore a
+request may provide several **viable variants**, each with a concrete resource
+shape and optional launch hint. The coordinator chooses the best fitting
+variant; the requesting tool owns what that hint means operationally.
 
 ## Detection Model
 
@@ -159,12 +165,23 @@ profile, for example:
 | Qwen3-14B / dual GPU | two GPUs, split envelope | current `-ts 1,1 -dev CUDA0,CUDA1` launch |
 | Qwen3-30B / dual GPU | two GPUs, larger split envelope | split across both GPUs |
 
-When a Deep Research job reaches the head of the queue, it asks for its
-preferred variant first. If the dual-GPU variant is blocked but the single-GPU
-variant fits and leaving the second GPU available would admit useful queued
-work, the coordinator returns a single-GPU grant and the Deep Research adapter
-launches that registered single-GPU variant. The adapter, not the coordinator,
-still owns the actual llama.cpp stop/start command.
+When a Deep Research job reaches the head of the queue, it submits a capability
+contract rather than trying to inspect machine capacity itself. For example,
+Qwen3-14B can declare **minimum: one GPU** and **preferred: two GPUs**, with
+the concrete one- and two-GPU variants in the table above.
+
+The coordinator selects the preferred two-GPU grant when there is no active or
+waiting request that needs the remaining capacity. This lets an otherwise idle
+machine use all available resources. If the dual-GPU variant is blocked, or if
+choosing one GPU leaves the other GPU available for useful queued work, the
+coordinator returns the single-GPU grant and the Deep Research adapter launches
+that registered single-GPU variant. The adapter, not the coordinator, still
+owns the actual llama.cpp stop/start command.
+
+When new work enters the queue during an already-running dual-GPU job, the
+coordinator does not shrink or interrupt that job by default. It applies the
+smarter allocation decision at the next safe job boundary. This preserves
+current work while making subsequent jobs maximize aggregate queue throughput.
 
 This decision must be made at a safe lifecycle boundary: before loading a
 model, between jobs, or after an idle server has been deliberately swapped.
@@ -237,6 +254,8 @@ queues, and APIs remain their responsibility.
 - Deep Research can choose a registered single-GPU model variant when that
   enables another compatible request to use the second GPU, without changing
   a running model mid-generation.
+- When the queue is otherwise empty, a request declaring minimum one GPU and
+  preferred two GPUs receives the two-GPU variant when it safely fits.
 - A user can move a waiting request from fifth to next; the action is visible
   in queue history and does not interrupt active work.
 - A crashed client no longer blocks the queue after its lease TTL.
