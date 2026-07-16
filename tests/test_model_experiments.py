@@ -182,3 +182,5 @@ async def test_collection_only_returns_raw_sources_without_synthesis(monkeypatch
     assert result["mode"] == "source_collection"
     assert result["source_count"] == 4
     assert result["sources"][0]["title"] == "Official model card"
+    assert result["has_authoritative_source"] is True
+    assert len(result["collection_attempts"]) == 4
