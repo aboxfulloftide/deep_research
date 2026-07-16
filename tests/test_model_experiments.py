@@ -152,3 +152,33 @@ async def test_frozen_evidence_skips_search_and_reports_shared_bundle(monkeypatc
 
     assert result["evidence_bundle_id"] == "bundle-1"
     assert [stage for stage, _ in db.progress] == ["load_frozen_evidence", "evaluate"]
+
+
+@pytest.mark.asyncio
+async def test_collection_only_returns_raw_sources_without_synthesis(monkeypatch):
+    async def fake_model(base_url):
+        return "current.gguf"
+
+    async def fake_context(base_url):
+        return 32768
+
+    from deep_research.tools.extra_research import ResearchSource
+
+    async def sources(queries, config, level, seen_urls, **kwargs):
+        return [ResearchSource(
+            "Official model card", "https://huggingface.co/Qwen/example", "Evidence text " * 30,
+            level, queries[0], quality_score=5, source_kind="primary",
+        )]
+
+    monkeypatch.setattr(experiments, "detect_model", fake_model)
+    monkeypatch.setattr(experiments, "detect_context_size", fake_context)
+    monkeypatch.setattr(experiments, "collect_sources", sources)
+    monkeypatch.setattr(experiments, "LLMClient", _FakeLLM)
+
+    result = await experiments.run_model_experiment(_FakeDB(), Config(), {
+        "id": "job-1", "payload": {"prompt": "Test prompt", "profile_slug": "current", "collection_only": True},
+    })
+
+    assert result["mode"] == "source_collection"
+    assert result["source_count"] == 4
+    assert result["sources"][0]["title"] == "Official model card"

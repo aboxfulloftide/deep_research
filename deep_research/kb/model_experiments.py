@@ -269,6 +269,24 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
             if not sources or not has_authoritative_source(sources):
                 raise RuntimeError("Could not collect an authoritative model card or paper for the experiment")
 
+            if payload.get("collection_only"):
+                # Keep collection benchmarking separate from extraction and
+                # synthesis.  The saved raw bundle is the artifact to review
+                # and later freeze for a fair analysis comparison.
+                return {
+                    "mode": "source_collection",
+                    "profile": profile_slug,
+                    "display_name": display_name,
+                    "model": model,
+                    "context_size": context_size,
+                    "reasoning": reasoning,
+                    "source_count": len(sources),
+                    "source_urls": [source.url for source in sources],
+                    "sources": [_serialize_source(source) for source in sources],
+                    "elapsed_seconds": round(time.monotonic() - started_at, 1),
+                    "answer": "Source collection complete; review this bundle before analysis.",
+                }
+
             await kb_db.update_processing_job_progress(
                 job["id"], "evaluate", {"source_count": len(sources), "context_size": context_size}, lease_seconds=900,
             )
