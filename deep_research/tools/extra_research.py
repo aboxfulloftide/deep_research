@@ -24,6 +24,11 @@ FOLLOW_UP_QUERY_LIMIT = 2
 INITIAL_QUERY_LIMIT = 2
 GAP_CLOSING_QUERY_LIMIT = 1
 SOURCE_ANALYSIS_CHARS = 2_500
+OFFICIAL_HF_ORGANIZATIONS = {
+    "qwen", "mistralai", "meta-llama", "google", "microsoft", "deepseek-ai",
+    "nvidia", "ibm-granite", "tiiuae", "allenai", "cohereforai", "openai",
+}
+BAD_SCRAPE_MARKERS = ("found 2 products:", "found 1 product:", "did you describe any potential participant risks")
 
 
 @dataclass
@@ -60,6 +65,30 @@ def _title_key(title: str) -> str:
     return "title:" + re.sub(r"\W+", " ", article_title.lower()).strip()
 
 
+def _model_family_key(title: str, url: str) -> str | None:
+    """Collapse FP8/AWQ/GGUF repacks into the base model's evidence slot."""
+    if (urlparse(url).hostname or "").lower().removeprefix("www.") != "huggingface.co":
+        return None
+    name = title.split("·", 1)[0].strip().lower().rsplit("/", 1)[-1]
+    name = re.sub(r"[-_ ](?:fp\d+|awq|gptq|gguf|exl2|iq\d+|q\d+(?:_[a-z]+)*)$", "", name)
+    return f"model-family:{re.sub(r'\s+', ' ', name)}" if name else None
+
+
+def _canonical_source_key(url: str) -> str | None:
+    """Recognize the arXiv abstract and HTML rendering as the same paper."""
+    parsed = urlparse(url)
+    if parsed.hostname and parsed.hostname.lower() == "arxiv.org":
+        match = re.match(r"/(?:abs|html)/(\d{4}\.\d{4,5})", parsed.path)
+        if match:
+            return f"arxiv:{match.group(1)}"
+    return None
+
+
+def _usable_scrape(content: str) -> bool:
+    normalised = _normalise(content)
+    return len(normalised) >= 240 and not any(marker in normalised for marker in BAD_SCRAPE_MARKERS)
+
+
 def classify_source(url: str) -> tuple[str, int]:
     """Give primary technical material priority without silently excluding corroboration."""
     host = (urlparse(url).hostname or "").lower().removeprefix("www.")
@@ -70,8 +99,10 @@ def classify_source(url: str) -> tuple[str, int]:
         first_path = path_parts[0] if path_parts else ""
         if any(part in {"discussions", "community"} for part in path_parts):
             return "community", 1
-        if first_path not in {"blog", "docs", "spaces", "collections"}:
+        if first_path.lower() in OFFICIAL_HF_ORGANIZATIONS:
             return "primary", 5
+        if first_path not in {"blog", "docs", "spaces", "collections"}:
+            return "technical_reference", 3
         return "technical_reference", 3
     if host in {"qwenlm.github.io", "mistral.ai", "docs.mistral.ai", "llama.com", "ai.meta.com"}:
         return "primary", 5
@@ -110,17 +141,26 @@ async def collect_sources(
             if quality_score < MIN_EVIDENCE_QUALITY:
                 continue
             title_key = _title_key(result.title)
+            family_key = _model_family_key(result.title, result.url)
+            canonical_key = _canonical_source_key(result.url)
             if (
                 result.url in seen_urls
                 or title_key in seen_urls
+                or (family_key is not None and family_key in seen_urls)
+                or (canonical_key is not None and canonical_key in seen_urls)
                 or result.url in pending_urls
                 or title_key in pending_titles
+                or (canonical_key is not None and canonical_key in pending_titles)
                 or not _is_html_result(result)
             ):
                 continue
             selections.append((query, result))
             pending_urls.add(result.url)
             pending_titles.add(title_key)
+            if family_key is not None:
+                pending_titles.add(family_key)
+            if canonical_key is not None:
+                pending_titles.add(canonical_key)
             added += 1
             if added >= per_query_limit:
                 break
@@ -145,10 +185,16 @@ async def collect_sources(
             quality_score=quality_score,
         )
 
-    sources = await asyncio.gather(*(read(query, result) for query, result in selections))
+    sources = [source for source in await asyncio.gather(*(read(query, result) for query, result in selections)) if _usable_scrape(source.content)]
     for source in sources:
         seen_urls.add(source.url)
         seen_urls.add(_title_key(source.title))
+        family_key = _model_family_key(source.title, source.url)
+        if family_key is not None:
+            seen_urls.add(family_key)
+        canonical_key = _canonical_source_key(source.url)
+        if canonical_key is not None:
+            seen_urls.add(canonical_key)
     return sources
 
 
@@ -198,16 +244,21 @@ async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[s
         },
         {"role": "user", "content": f"Research question: {original_query}"},
     ]
-    # Always seed the first pass with source-targeted queries. A broad local
-    # model question otherwise tends to retrieve SEO comparison pages first;
-    # the local planner remains useful on later evidence-driven levels.
     try:
-        await asyncio.wait_for(llm.chat(messages), timeout=20)
+        response = await asyncio.wait_for(llm.chat(messages), timeout=20)
+        queries = _parse_queries(
+            response["choices"][0]["message"].get("content", ""), original_query, INITIAL_QUERY_LIMIT,
+        )
+        if len(queries) == INITIAL_QUERY_LIMIT:
+            return queries
     except Exception:
         pass
+    # Never silently steer arbitrary research toward one model vendor. This
+    # fallback retains the user's actual constraints while asking for sources
+    # that can support a later evidence gate.
     return [
-        "site:huggingface.co Qwen coding model card context window",
-        "site:arxiv.org local LLM coding benchmark technical report",
+        f"{original_query} official model card specifications context hardware requirements",
+        f"{original_query} benchmark owner methodology results",
     ]
 
 

@@ -48,17 +48,16 @@ async def test_collect_sources_skips_syndicated_title_copies(monkeypatch):
         ]
 
     async def fake_scrape(url, config):
-        return ScrapedPage(url=url, title="", text_content="source text")
+        return ScrapedPage(url=url, title="", text_content="source text " * 30)
 
     monkeypatch.setattr(extra, "web_search", fake_search)
     monkeypatch.setattr(extra, "scrape_page", fake_scrape)
 
     sources = await extra.collect_sources(["question"], Config(), 1, set())
 
-    assert [source.url for source in sources] == [
-        "https://huggingface.co/first",
-        "https://arxiv.org/second",
-    ]
+    assert len(sources) == 2
+    assert "https://arxiv.org/second" in [source.url for source in sources]
+    assert sum(source.title == "One article" for source in sources) == 1
 
 
 @pytest.mark.asyncio
@@ -70,7 +69,7 @@ async def test_gap_closing_level_can_cap_a_single_query_to_one_source(monkeypatc
         ]
 
     async def fake_scrape(url, config):
-        return ScrapedPage(url=url, title=url, text_content="source text")
+        return ScrapedPage(url=url, title=url, text_content="source text " * 30)
 
     monkeypatch.setattr(extra, "web_search", fake_search)
     monkeypatch.setattr(extra, "scrape_page", fake_scrape)
@@ -79,7 +78,7 @@ async def test_gap_closing_level_can_cap_a_single_query_to_one_source(monkeypatc
     )
 
     assert len(sources) == 1
-    assert sources[0].full_content == "source text"
+    assert sources[0].full_content == "source text " * 30
 
 
 @pytest.mark.asyncio
@@ -139,17 +138,32 @@ async def test_follow_up_query_planning_falls_back_to_evidence_title():
 
 
 @pytest.mark.asyncio
-async def test_starting_query_planning_keeps_original_out_of_derived_queries():
+async def test_starting_query_planning_uses_the_topic_aware_plan():
     class PlanningLLM:
         async def chat(self, messages):
             return {"choices": [{"message": {"content": "original question\nprimary data source\nindependent comparison"}}]}
 
     queries = await extra.derive_starting_queries(PlanningLLM(), "original question")
 
-    assert queries == [
-        "site:huggingface.co Qwen coding model card context window",
-        "site:arxiv.org local LLM coding benchmark technical report",
-    ]
+    assert queries == ["primary data source", "independent comparison"]
+
+
+def test_huggingface_quantization_is_not_labeled_primary_and_family_is_deduplicated():
+    assert extra.classify_source("https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct")[0] == "primary"
+    assert extra.classify_source("https://huggingface.co/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ")[0] == "technical_reference"
+    base = extra._model_family_key(
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct · Hugging Face",
+        "https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct",
+    )
+    awq = extra._model_family_key(
+        "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ · Hugging Face",
+        "https://huggingface.co/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ",
+    )
+    assert base == awq
+
+
+def test_broken_marketplace_scrape_is_not_usable_evidence():
+    assert not extra._usable_scrape("Found 2 products: participant risks " * 30)
 
 
 @pytest.mark.asyncio
