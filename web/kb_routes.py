@@ -21,7 +21,8 @@ from deep_research.kb.decision_log import record_decision, record_undo
 from deep_research.kb.embeddings import backfill_embeddings, embed_texts
 from deep_research.kb.ingest import ingest_file, ingest_pasted_text, ingest_web_page, ingest_youtube_video
 from deep_research.kb.jobs import (
-    ProcessingJobWorker, enqueue_manual_job, enqueue_model_experiment, enqueue_playlist_poll, enqueue_source_pipeline,
+    ProcessingJobWorker, enqueue_manual_job, enqueue_model_experiment, enqueue_model_experiment_comparison,
+    enqueue_playlist_poll, enqueue_source_pipeline,
 )
 from deep_research.kb.merge import review_and_execute
 from deep_research.kb.playlists import track_youtube_playlist
@@ -119,6 +120,18 @@ class ModelExperimentRequest(BaseModel):
     profile_slug: str = "current"
     context_size: int | None = None
     reasoning: bool = True
+
+
+class ModelExperimentComparisonProfile(BaseModel):
+    profile_slug: str = "current"
+    context_size: int | None = None
+    reasoning: bool = True
+
+
+class ModelExperimentComparisonRequest(BaseModel):
+    prompt: str
+    profiles: list[ModelExperimentComparisonProfile]
+    run_after_current: bool = False
 
 
 class MoveJobRequest(BaseModel):
@@ -867,6 +880,27 @@ async def queue_model_experiment(req: ModelExperimentRequest):
         "profile_slug": req.profile_slug,
         "context_size": req.context_size,
         "reasoning": req.reasoning,
+    })
+    return {"job": _serialize(job)}
+
+
+@router.post("/model-experiments/comparisons")
+async def queue_model_experiment_comparison(req: ModelExperimentComparisonRequest):
+    """Collect sources once, then evaluate every selected model on that snapshot."""
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "A comparison prompt is required")
+    if len(req.profiles) < 2:
+        raise HTTPException(400, "A comparison needs at least two model profiles")
+    if len(req.profiles) > 8:
+        raise HTTPException(400, "A comparison is limited to eight model profiles")
+    profiles = []
+    for profile in req.profiles:
+        if profile.context_size is not None and not 4096 <= profile.context_size <= 131072:
+            raise HTTPException(400, "Context size must be between 4,096 and 131,072 tokens")
+        profiles.append(profile.model_dump())
+    job = await enqueue_model_experiment_comparison(kb_db, {
+        "prompt": prompt, "profiles": profiles, "run_after_current": req.run_after_current,
     })
     return {"job": _serialize(job)}
 

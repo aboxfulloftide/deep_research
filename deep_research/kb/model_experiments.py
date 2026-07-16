@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+import uuid
 from pathlib import Path
 
 from deep_research.config import Config, LLMConfig
@@ -23,6 +24,70 @@ from deep_research.tools.extra_research import (
     source_context,
 )
 from deep_research.tools.llama_server import is_healthy
+
+
+def _serialize_source(source) -> dict:
+    """Keep a research source JSON-safe when it is attached to queued jobs."""
+    return {
+        "title": source.title, "url": source.url, "content": source.content,
+        "full_content": source.full_content, "level": source.level, "query": source.query,
+        "source_kind": source.source_kind, "quality_score": source.quality_score,
+    }
+
+
+def _deserialize_sources(rows: list[dict]):
+    from deep_research.tools.extra_research import ResearchSource
+
+    return [ResearchSource(
+        title=str(row["title"]), url=str(row["url"]), content=str(row["content"]),
+        full_content=str(row.get("full_content") or row["content"]), level=int(row["level"]),
+        query=str(row["query"]), source_kind=str(row.get("source_kind") or "secondary"),
+        quality_score=int(row.get("quality_score") or 0),
+    ) for row in rows]
+
+
+async def build_frozen_evidence_bundle(kb_db, config: Config, job: dict) -> dict:
+    """Gather one auditable source set to be reused by every comparison run.
+
+    Search/query planning is deliberately performed once, using the currently
+    loaded server.  Child experiments then only evaluate the supplied sources;
+    their results are comparable even if the web changes while they wait.
+    """
+    payload = job.get("payload") or {}
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("model comparison needs a prompt")
+    base_url = config.llm.llama_cpp_base_url
+    model = await detect_model(base_url)
+    llm = LLMClient(Config(llm=LLMConfig(base_url=base_url, model=model, api_key="not-needed")))
+    try:
+        await kb_db.update_processing_job_progress(
+            job["id"], "gather_sources", {"bundle_model": model}, lease_seconds=900,
+        )
+        seen_urls: set[str] = set()
+        sources = []
+        queries = [prompt, *await derive_starting_queries(llm, prompt)]
+        for level in range(1, 5):
+            sources.extend(await collect_sources(
+                queries, config, level, seen_urls, sources_per_query=1 if level == 4 else None,
+            ))
+            if level < 3:
+                queries = await derive_follow_up_queries(llm, prompt, sources, level)
+            elif level == 3:
+                queries = await derive_gap_closing_query(llm, prompt, sources)
+        if not sources or not has_authoritative_source(sources):
+            raise RuntimeError("Could not collect an authoritative model card or paper for the comparison bundle")
+    finally:
+        await llm.close()
+
+    bundle_id = str(uuid.uuid4())
+    return {
+        "id": bundle_id,
+        "created_with_model": model,
+        "source_count": len(sources),
+        "source_urls": [source.url for source in sources],
+        "sources": [_serialize_source(source) for source in sources],
+    }
 
 
 async def _start_with_retry(profile: dict, attempts: int = 3) -> tuple[bool, object]:
@@ -167,23 +232,32 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
         llm = LLMClient(Config(llm=LLMConfig(base_url=base_url, model=model, api_key="not-needed")))
         started_at = time.monotonic()
         try:
-            await kb_db.update_processing_job_progress(
-                job["id"], "gather_sources",
-                {"profile": profile_slug, "model": model, "context_size": context_size, "reasoning": reasoning},
-                lease_seconds=900,
-            )
-            seen_urls: set[str] = set()
-            sources = []
-            queries = [prompt, *await derive_starting_queries(llm, prompt)]
-            for level in range(1, 5):
-                sources.extend(await collect_sources(
-                    queries, config, level, seen_urls,
-                    sources_per_query=1 if level == 4 else None,
-                ))
-                if level < 3:
-                    queries = await derive_follow_up_queries(llm, prompt, sources, level)
-                elif level == 3:
-                    queries = await derive_gap_closing_query(llm, prompt, sources)
+            frozen_bundle = payload.get("evidence_bundle")
+            if frozen_bundle:
+                sources = _deserialize_sources(frozen_bundle.get("sources") or [])
+                await kb_db.update_processing_job_progress(
+                    job["id"], "load_frozen_evidence",
+                    {"bundle_id": frozen_bundle.get("id"), "source_count": len(sources), "profile": profile_slug},
+                    lease_seconds=900,
+                )
+            else:
+                await kb_db.update_processing_job_progress(
+                    job["id"], "gather_sources",
+                    {"profile": profile_slug, "model": model, "context_size": context_size, "reasoning": reasoning},
+                    lease_seconds=900,
+                )
+                seen_urls: set[str] = set()
+                sources = []
+                queries = [prompt, *await derive_starting_queries(llm, prompt)]
+                for level in range(1, 5):
+                    sources.extend(await collect_sources(
+                        queries, config, level, seen_urls,
+                        sources_per_query=1 if level == 4 else None,
+                    ))
+                    if level < 3:
+                        queries = await derive_follow_up_queries(llm, prompt, sources, level)
+                    elif level == 3:
+                        queries = await derive_gap_closing_query(llm, prompt, sources)
             if not sources or not has_authoritative_source(sources):
                 raise RuntimeError("Could not collect an authoritative model card or paper for the experiment")
 
@@ -236,6 +310,7 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
             "model": model,
             "context_size": context_size,
             "reasoning": reasoning,
+            "evidence_bundle_id": frozen_bundle.get("id") if frozen_bundle else None,
             "source_count": len(sources),
             "elapsed_seconds": round(time.monotonic() - started_at, 1),
             "answer": answer,

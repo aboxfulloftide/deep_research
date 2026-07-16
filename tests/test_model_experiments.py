@@ -117,3 +117,38 @@ async def test_larger_profile_safely_swaps_and_restores_primary_model(monkeypatc
         ("start", "qwen3-14b", 8080),
     ]
     assert [stage for stage, _ in db.progress] == ["swapping_model", "gather_sources", "evaluate", "restoring_model"]
+
+
+@pytest.mark.asyncio
+async def test_frozen_evidence_skips_search_and_reports_shared_bundle(monkeypatch):
+    async def fake_model(base_url):
+        return "current.gguf"
+
+    async def fake_context(base_url):
+        return 32768
+
+    async def should_not_search(*args, **kwargs):
+        raise AssertionError("a frozen comparison must not search again")
+
+    monkeypatch.setattr(experiments, "detect_model", fake_model)
+    monkeypatch.setattr(experiments, "detect_context_size", fake_context)
+    monkeypatch.setattr(experiments, "collect_sources", should_not_search)
+    monkeypatch.setattr(experiments, "LLMClient", _FakeLLM)
+
+    db = _FakeDB()
+    result = await experiments.run_model_experiment(db, Config(), {
+        "id": "job-1",
+        "payload": {
+            "prompt": "Test prompt", "profile_slug": "current", "reasoning": False,
+            "evidence_bundle": {
+                "id": "bundle-1",
+                "sources": [{
+                    "title": "Model card", "url": "https://huggingface.co/example", "content": "Evidence text",
+                    "level": 1, "query": "Test prompt", "source_kind": "primary", "quality_score": 5,
+                }],
+            },
+        },
+    })
+
+    assert result["evidence_bundle_id"] == "bundle-1"
+    assert [stage for stage, _ in db.progress] == ["load_frozen_evidence", "evaluate"]

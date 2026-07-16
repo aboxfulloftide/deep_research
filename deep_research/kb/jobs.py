@@ -88,6 +88,16 @@ async def enqueue_model_experiment(kb_db: KBDatabase, payload: dict) -> dict:
     return job
 
 
+async def enqueue_model_experiment_comparison(kb_db: KBDatabase, payload: dict) -> dict:
+    """Queue a one-time evidence collection job followed by comparable runs."""
+    job, _ = await kb_db.enqueue_processing_job(
+        "model_experiment_comparison", "model_experiment_comparison", subject_id=str(uuid.uuid4()),
+        idempotency_key=f"model_experiment_comparison:{uuid.uuid4()}", priority=-1000,
+        is_speculative=True, payload=payload, stage="waiting_for_idle",
+    )
+    return job
+
+
 class ProcessingJobWorker:
     """Single logical worker for durable KB work.
 
@@ -143,12 +153,13 @@ class ProcessingJobWorker:
                 job = await self.kb_db.claim_next_processing_job(self.worker_id)
                 if job is None:
                     return False
-                if job["job_type"] == "model_experiment":
+                if job["job_type"] in {"model_experiment", "model_experiment_comparison"}:
                     normal_work = []
                     for status in ("queued", "running"):
                         normal_work.extend(await self.kb_db.list_processing_jobs(status=status, limit=1000))
                     run_after_current = bool((job.get("payload") or {}).get("run_after_current"))
-                    if not run_after_current and any(other["id"] != job["id"] and other["job_type"] != "model_experiment" for other in normal_work):
+                    experiment_types = {"model_experiment", "model_experiment_comparison"}
+                    if not run_after_current and any(other["id"] != job["id"] and other["job_type"] not in experiment_types for other in normal_work):
                         await self.kb_db.release_processing_job(job["id"])
                         return False
                 if job["is_speculative"] and not await gpu_is_idle():
@@ -206,6 +217,9 @@ class ProcessingJobWorker:
             return
         if job["job_type"] == "model_experiment":
             await self._run_model_experiment(job)
+            return
+        if job["job_type"] == "model_experiment_comparison":
+            await self._run_model_experiment_comparison(job)
             return
         else:
             await self.kb_db.finish_processing_job(
@@ -445,3 +459,31 @@ class ProcessingJobWorker:
 
         result = await run_model_experiment(self.kb_db, self.config, job)
         await self.kb_db.finish_processing_job(job["id"], "completed", stage="complete", progress=result)
+
+    async def _run_model_experiment_comparison(self, job: dict) -> None:
+        from deep_research.kb.model_experiments import build_frozen_evidence_bundle
+
+        payload = job.get("payload") or {}
+        profiles = payload.get("profiles") or []
+        if not profiles:
+            raise ValueError("model comparison needs at least one profile")
+        bundle = await build_frozen_evidence_bundle(self.kb_db, self.config, job)
+        children = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                raise ValueError("model comparison profiles must be objects")
+            child = await enqueue_model_experiment(self.kb_db, {
+                "prompt": payload["prompt"], "profile_slug": profile.get("profile_slug") or "current",
+                "context_size": profile.get("context_size"), "reasoning": bool(profile.get("reasoning", True)),
+                "evidence_bundle": bundle,
+                "comparison_parent_id": job["id"],
+                "run_after_current": bool(payload.get("run_after_current", False)),
+            })
+            children.append(child["id"])
+        await self.kb_db.finish_processing_job(
+            job["id"], "completed", stage="complete",
+            progress={
+                "evidence_bundle_id": bundle["id"], "source_count": bundle["source_count"],
+                "source_urls": bundle["source_urls"], "child_job_ids": children,
+            },
+        )
