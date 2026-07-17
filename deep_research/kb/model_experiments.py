@@ -264,7 +264,7 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                     "collection_attempts": collection_attempts,
                     "research_plan": {
                         "ambiguities": research_bundle.plan.ambiguities,
-                        "facets": [{"id": facet.id, "question": facet.question, "purpose": facet.purpose, "capabilities": facet.capabilities} for facet in research_bundle.plan.facets],
+                        "facets": [{"id": facet.id, "question": facet.question, "search_query": facet.search_query, "purpose": facet.purpose, "capabilities": facet.capabilities} for facet in research_bundle.plan.facets],
                     },
                     "coverage": research_bundle.coverage,
                     "source_assessments": research_bundle.assessments,

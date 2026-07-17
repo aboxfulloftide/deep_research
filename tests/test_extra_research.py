@@ -153,7 +153,7 @@ def test_broken_marketplace_scrape_is_not_usable_evidence():
 async def test_research_bundle_routes_facets_and_records_fitness(monkeypatch):
     class Planner:
         async def chat(self, messages):
-            return {"choices": [{"message": {"content": '{"ambiguities":[],"facets":[{"id":"spec","question":"official requirements for example software","purpose":"constraints","capabilities":["official_documentation","repository"]},{"id":"evidence","question":"independent evidence for example software","purpose":"corroboration","capabilities":["scholarly"]}]}'}}]}
+            return {"choices": [{"message": {"content": '{"ambiguities":[],"facets":[{"id":"spec","question":"official requirements for example software","search_query":"example software official requirements","purpose":"constraints","capabilities":["official_documentation","repository"]},{"id":"evidence","question":"independent evidence for example software","search_query":"example software independent evidence","purpose":"corroboration","capabilities":["scholarly"]}]}'}}]}
 
     calls = []
     async def fake_collect(queries, config, level, seen_urls, **kwargs):
@@ -166,6 +166,19 @@ async def test_research_bundle_routes_facets_and_records_fitness(monkeypatch):
     assert len(bundle.sources) == 3
     assert {attempt["adapter"] for attempt in bundle.collection_attempts} == {"official_documentation", "repository", "scholarly"}
     assert all("directness" in assessment for assessment in bundle.assessments)
+
+
+@pytest.mark.asyncio
+async def test_research_plan_rejects_a_facet_that_searches_the_raw_user_question():
+    class BadPlanner:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": '{"ambiguities":[],"facets":[{"id":"repeat","question":"direct evidence","search_query":"What local LLM should I use for coding?","purpose":"answer","capabilities":["web"]},{"id":"other","question":"other evidence","search_query":"What local LLM should I use for coding?","purpose":"corroborate","capabilities":["web"]}]}'}}]}
+
+    question = "What local LLM should I use for coding?"
+    plan = await extra.plan_research(BadPlanner(), question)
+
+    assert all(facet.search_query.lower() != question.lower() for facet in plan.facets)
+    assert all(facet.search_query for facet in plan.facets)
 
 
 @pytest.mark.asyncio

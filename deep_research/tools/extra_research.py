@@ -63,6 +63,7 @@ class ResearchFacet:
     question: str
     purpose: str
     capabilities: list[str] = field(default_factory=lambda: ["web"])
+    search_query: str = ""
 
 
 @dataclass(frozen=True)
@@ -287,10 +288,14 @@ def _parse_queries(content: str, original_query: str, limit: int = FOLLOW_UP_QUE
 
 def _fallback_research_plan(question: str) -> ResearchPlan:
     """Safe generic plan when the local planner cannot return structured JSON."""
+    keywords = " ".join(
+        word for word in re.findall(r"[a-zA-Z0-9]+", question.lower())
+        if word not in {"research", "deeply", "best", "that", "with", "from", "this", "should", "would", "could", "usable", "main", "also", "used", "less", "than", "under"}
+    )[:180]
     return ResearchPlan(question, [], [
-        ResearchFacet("core", question, "Direct evidence that answers the central question.", ["web", "primary"]),
-        ResearchFacet("constraints", f"{question} definitions constraints requirements", "Definitions, limits, and assumptions.", ["official_documentation", "web"]),
-        ResearchFacet("corroboration", f"{question} primary sources independent corroboration", "Independent or primary corroboration.", ["scholarly", "repository"]),
+        ResearchFacet("core", question, "Direct evidence that answers the central question.", ["web", "primary"], f"{keywords} official specifications"),
+        ResearchFacet("constraints", "Definitions, limits, and assumptions relevant to the question.", "Definitions, limits, and assumptions.", ["official_documentation", "web"], f"{keywords} requirements limitations"),
+        ResearchFacet("corroboration", "Independent corroboration relevant to the question.", "Independent or primary corroboration.", ["scholarly", "repository"], f"{keywords} independent benchmark evidence"),
     ])
 
 
@@ -304,7 +309,7 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
     messages = [
         {"role": "system", "content": (
             "/no_think\nPlan research for any question. Return ONLY JSON: "
-            '{"ambiguities":["..."],"facets":[{"id":"short_slug","question":"searchable evidence question","purpose":"why this evidence matters","capabilities":["web","primary"]}]}. '
+            '{"ambiguities":["..."],"facets":[{"id":"short_slug","question":"evidence need","search_query":"short search-engine query, not a restatement of the user question","purpose":"why this evidence matters","capabilities":["web","primary"]}]}. '
             "Return 2-4 complementary facets. Facets must cover the central answer, constraints/definitions where relevant, "
             "and corroboration or tradeoffs where relevant. Do not assume a domain or answer the question."
         )},
@@ -320,12 +325,13 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
                 if not isinstance(row, dict):
                     continue
                 facet_question = str(row.get("question") or "").strip()
+                search_query = str(row.get("search_query") or "").strip()
                 purpose = str(row.get("purpose") or "").strip()
                 facet_id = re.sub(r"[^a-z0-9_-]+", "-", str(row.get("id") or f"facet-{index}").lower()).strip("-")
                 raw_capabilities = row.get("capabilities", ["web"])
                 capabilities = [str(capability) for capability in raw_capabilities if str(capability) in SOURCE_CAPABILITIES] if isinstance(raw_capabilities, list) else []
-                if len(facet_question) >= 12 and len(purpose) >= 8 and facet_id:
-                    facets.append(ResearchFacet(facet_id, facet_question[:260], purpose[:260], capabilities or ["web"]))
+                if len(facet_question) >= 12 and len(purpose) >= 8 and facet_id and _normalise(search_query) != _normalise(question) and 12 <= len(search_query) <= 220:
+                    facets.append(ResearchFacet(facet_id, facet_question[:260], purpose[:260], capabilities or ["web"], search_query))
         if len(facets) >= 2:
             ambiguities = payload.get("ambiguities", [])
             return ResearchPlan(question, [str(item)[:240] for item in ambiguities if str(item).strip()][:4], facets)
@@ -355,7 +361,7 @@ def _coverage_for(plan: ResearchPlan, sources: list[ResearchSource], assessments
         matching = [source for source in sources if source.query == facet.question]
         facet_assessments = [assessment for assessment in assessments if assessment["facet_id"] == facet.id]
         facets.append({
-            "id": facet.id, "purpose": facet.purpose, "question": facet.question,
+            "id": facet.id, "purpose": facet.purpose, "question": facet.question, "search_query": facet.search_query,
             "source_count": len(matching), "best_quality": max((source.quality_score for source in matching), default=0),
             "best_directness": max((assessment["directness"] for assessment in facet_assessments), default=0),
             "source_urls": [source.url for source in matching],
@@ -398,7 +404,7 @@ async def collect_research_bundle(llm: LLMClient, question: str, config: Config,
 
     for facet in plan.facets:
         for capability in facet.capabilities[:budget.max_adapters_per_facet]:
-            await collect_for(facet, 1, capability, _adapter_query(capability, facet.question))
+            await collect_for(facet, 1, capability, _adapter_query(capability, facet.search_query))
 
     coverage = _coverage_for(plan, sources, assessments)
     for _ in range(budget.max_gap_rounds):
@@ -407,7 +413,7 @@ async def collect_research_bundle(llm: LLMClient, question: str, config: Config,
             break
         for facet in missing:
             recovery = "primary" if "primary" not in facet.capabilities else "web"
-            await collect_for(facet, 2, recovery, _adapter_query(recovery, f"{facet.question} independent corroboration"))
+            await collect_for(facet, 2, recovery, _adapter_query(recovery, f"{facet.search_query} independent corroboration"))
         coverage = _coverage_for(plan, sources, assessments)
 
     return ResearchBundle(plan, sources, attempts, coverage, assessments)
