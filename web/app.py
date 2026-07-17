@@ -76,6 +76,10 @@ class LlamaChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class ResearchPlanRequest(BaseModel):
+    query: str
+
+
 class SessionResponse(BaseModel):
     id: str
     title: str | None
@@ -115,6 +119,39 @@ async def search_usage_check():
     whether it's actually responding -- the historical log above can be
     stale if nothing's called a given provider in a while."""
     return await check_providers_now(config)
+
+
+@app.post("/api/research-plan")
+async def preview_research_plan(request: ResearchPlanRequest):
+    """Create a research plan without calling a search or scrape provider."""
+    question = request.query.strip()
+    if not question:
+        raise HTTPException(400, "A research question is required")
+    from deep_research.tools.extra_research import plan_research
+
+    cfg = config.model_copy(deep=True)
+    try:
+        cfg.llm.model = await detect_model(cfg.llm.llama_cpp_base_url)
+    except Exception:
+        pass
+    llm = LLMClient(cfg)
+    try:
+        plan = await plan_research(llm, question)
+    finally:
+        await llm.close()
+    return {
+        "question": plan.question,
+        "ambiguities": plan.ambiguities,
+        "facets": [
+            {
+                "id": facet.id, "evidence_question": facet.question,
+                "search_query": facet.search_query, "purpose": facet.purpose,
+                "capabilities": facet.capabilities,
+            }
+            for facet in plan.facets
+        ],
+        "searches_performed": 0,
+    }
 
 
 @app.get("/api/sessions")
