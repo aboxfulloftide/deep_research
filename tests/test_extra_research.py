@@ -150,6 +150,25 @@ def test_broken_marketplace_scrape_is_not_usable_evidence():
 
 
 @pytest.mark.asyncio
+async def test_research_bundle_routes_facets_and_records_fitness(monkeypatch):
+    class Planner:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": '{"ambiguities":[],"facets":[{"id":"spec","question":"official requirements for example software","purpose":"constraints","capabilities":["official_documentation","repository"]},{"id":"evidence","question":"independent evidence for example software","purpose":"corroboration","capabilities":["scholarly"]}]}'}}]}
+
+    calls = []
+    async def fake_collect(queries, config, level, seen_urls, **kwargs):
+        calls.append((level, queries[0]))
+        return [extra.ResearchSource("Example software official requirements", f"https://example.test/{len(calls)}", "official requirements for example software " * 20, level, queries[0], quality_score=5, source_kind="primary")]
+
+    monkeypatch.setattr(extra, "collect_sources", fake_collect)
+    bundle = await extra.collect_research_bundle(Planner(), "example question", Config(), extra.ResearchBudget(max_sources=3, max_gap_rounds=0))
+
+    assert len(bundle.sources) == 3
+    assert {attempt["adapter"] for attempt in bundle.collection_attempts} == {"official_documentation", "repository", "scholarly"}
+    assert all("directness" in assessment for assessment in bundle.assessments)
+
+
+@pytest.mark.asyncio
 async def test_claim_ledger_rejects_a_claim_without_a_verbatim_quote():
     source = extra.ResearchSource("Source", "https://huggingface.co/example", "the supported fact is here", 1, "query", quality_score=5)
     claims = extra._parse_ledger(

@@ -8,7 +8,7 @@ for a practical local model to synthesize.
 import asyncio
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from deep_research.config import Config
@@ -62,6 +62,7 @@ class ResearchFacet:
     id: str
     question: str
     purpose: str
+    capabilities: list[str] = field(default_factory=lambda: ["web"])
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,40 @@ class ResearchBundle:
     sources: list[ResearchSource]
     collection_attempts: list[dict]
     coverage: dict
+    assessments: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ResearchBudget:
+    """Bounded, user-configurable collection budget for any question."""
+
+    max_facets: int = 4
+    max_adapters_per_facet: int = 2
+    max_sources: int = 10
+    max_gap_rounds: int = 1
+
+
+SOURCE_CAPABILITIES = {
+    "web", "primary", "scholarly", "official_documentation", "repository", "news", "local_knowledge",
+}
+
+
+def _adapter_query(capability: str, question: str) -> str:
+    """Route a generic evidence capability through the available web adapter.
+
+    The adapter boundary is intentional: domain-specific APIs can replace
+    these query constraints later without changing plans or coverage logic.
+    """
+    suffixes = {
+        "primary": "primary source official",
+        "scholarly": "site:arxiv.org OR site:openreview.net research paper",
+        "official_documentation": "official documentation specifications",
+        "repository": "site:github.com repository documentation",
+        "news": "reputable news publication date",
+        "local_knowledge": "",  # No local-KB adapter is registered yet; web remains transparent fallback.
+        "web": "",
+    }
+    return f"{question} {suffixes.get(capability, '')}".strip()
 
 
 def _is_html_result(result: SearchResult) -> bool:
@@ -253,9 +288,9 @@ def _parse_queries(content: str, original_query: str, limit: int = FOLLOW_UP_QUE
 def _fallback_research_plan(question: str) -> ResearchPlan:
     """Safe generic plan when the local planner cannot return structured JSON."""
     return ResearchPlan(question, [], [
-        ResearchFacet("core", question, "Direct evidence that answers the central question."),
-        ResearchFacet("constraints", f"{question} definitions constraints requirements", "Definitions, limits, and assumptions."),
-        ResearchFacet("corroboration", f"{question} primary sources independent corroboration", "Independent or primary corroboration."),
+        ResearchFacet("core", question, "Direct evidence that answers the central question.", ["web", "primary"]),
+        ResearchFacet("constraints", f"{question} definitions constraints requirements", "Definitions, limits, and assumptions.", ["official_documentation", "web"]),
+        ResearchFacet("corroboration", f"{question} primary sources independent corroboration", "Independent or primary corroboration.", ["scholarly", "repository"]),
     ])
 
 
@@ -269,7 +304,7 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
     messages = [
         {"role": "system", "content": (
             "/no_think\nPlan research for any question. Return ONLY JSON: "
-            '{"ambiguities":["..."],"facets":[{"id":"short_slug","question":"searchable evidence question","purpose":"why this evidence matters"}]}. '
+            '{"ambiguities":["..."],"facets":[{"id":"short_slug","question":"searchable evidence question","purpose":"why this evidence matters","capabilities":["web","primary"]}]}. '
             "Return 2-4 complementary facets. Facets must cover the central answer, constraints/definitions where relevant, "
             "and corroboration or tradeoffs where relevant. Do not assume a domain or answer the question."
         )},
@@ -287,8 +322,10 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
                 facet_question = str(row.get("question") or "").strip()
                 purpose = str(row.get("purpose") or "").strip()
                 facet_id = re.sub(r"[^a-z0-9_-]+", "-", str(row.get("id") or f"facet-{index}").lower()).strip("-")
+                raw_capabilities = row.get("capabilities", ["web"])
+                capabilities = [str(capability) for capability in raw_capabilities if str(capability) in SOURCE_CAPABILITIES] if isinstance(raw_capabilities, list) else []
                 if len(facet_question) >= 12 and len(purpose) >= 8 and facet_id:
-                    facets.append(ResearchFacet(facet_id, facet_question[:260], purpose[:260]))
+                    facets.append(ResearchFacet(facet_id, facet_question[:260], purpose[:260], capabilities or ["web"]))
         if len(facets) >= 2:
             ambiguities = payload.get("ambiguities", [])
             return ResearchPlan(question, [str(item)[:240] for item in ambiguities if str(item).strip()][:4], facets)
@@ -297,16 +334,33 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
     return _fallback_research_plan(question)
 
 
-def _coverage_for(plan: ResearchPlan, sources: list[ResearchSource]) -> dict:
+def _source_assessment(source: ResearchSource, facet: ResearchFacet) -> dict:
+    """Deterministic source-fitness signal; semantic scoring can refine it later."""
+    terms = {term for term in re.findall(r"[a-z0-9]{4,}", facet.question.lower()) if term not in {"with", "that", "this", "from", "under", "what", "which"}}
+    haystack = f"{source.title} {source.content}".lower()
+    overlap = sum(term in haystack for term in terms) / max(1, len(terms))
+    directness = round(min(1.0, 0.25 + overlap * 1.5), 2)
+    return {
+        "url": source.url, "facet_id": facet.id, "authority": source.quality_score,
+        "directness": directness, "independent": True,
+        "extractable": len(_normalise(source.content)) >= 240,
+        "accepted": source.quality_score >= MIN_EVIDENCE_QUALITY and directness >= 0.45,
+    }
+
+
+def _coverage_for(plan: ResearchPlan, sources: list[ResearchSource], assessments: list[dict] | None = None) -> dict:
+    assessments = assessments or []
     facets = []
     for facet in plan.facets:
         matching = [source for source in sources if source.query == facet.question]
+        facet_assessments = [assessment for assessment in assessments if assessment["facet_id"] == facet.id]
         facets.append({
             "id": facet.id, "purpose": facet.purpose, "question": facet.question,
             "source_count": len(matching), "best_quality": max((source.quality_score for source in matching), default=0),
+            "best_directness": max((assessment["directness"] for assessment in facet_assessments), default=0),
             "source_urls": [source.url for source in matching],
         })
-    covered = [facet["id"] for facet in facets if facet["source_count"] and facet["best_quality"] >= MIN_EVIDENCE_QUALITY]
+    covered = [facet["id"] for facet in facets if facet["source_count"] and facet["best_quality"] >= MIN_EVIDENCE_QUALITY and facet["best_directness"] >= 0.45]
     return {
         "facets": facets, "covered_facet_ids": covered,
         "missing_facet_ids": [facet.id for facet in plan.facets if facet.id not in covered],
@@ -314,39 +368,49 @@ def _coverage_for(plan: ResearchPlan, sources: list[ResearchSource]) -> dict:
     }
 
 
-async def collect_research_bundle(llm: LLMClient, question: str, config: Config) -> ResearchBundle:
+async def collect_research_bundle(llm: LLMClient, question: str, config: Config, budget: ResearchBudget | None = None) -> ResearchBundle:
     """Collect diverse evidence by research facet, then close uncovered facets.
 
     This is the common source-collection stage used before any analysis. Its
     output is intentionally preserved so users and evaluators can reject a
     weak bundle rather than mistaking a polished synthesis for research.
     """
+    budget = budget or ResearchBudget()
     plan = await plan_research(llm, question)
+    plan = ResearchPlan(plan.question, plan.ambiguities, plan.facets[:budget.max_facets])
     seen_urls: set[str] = set()
     sources: list[ResearchSource] = []
     attempts: list[dict] = []
+    assessments: list[dict] = []
 
-    async def collect_for(facet: ResearchFacet, level: int, query: str) -> None:
+    async def collect_for(facet: ResearchFacet, level: int, capability: str, query: str) -> None:
+        if len(sources) >= budget.max_sources:
+            return
         found = await collect_sources([query], config, level, seen_urls, sources_per_query=1)
+        found = found[:max(0, budget.max_sources - len(sources))]
         sources.extend(found)
         # Attribute retrieved evidence to its facet even if a recovery query
         # supplied the wording, so coverage remains inspectable.
         for source in found:
             source.query = facet.question
-        attempts.append({"level": level, "facet_id": facet.id, "queries": [query], "source_count": len(found), "source_urls": [source.url for source in found]})
+            assessments.append(_source_assessment(source, facet))
+        attempts.append({"level": level, "facet_id": facet.id, "adapter": capability, "queries": [query], "source_count": len(found), "source_urls": [source.url for source in found]})
 
     for facet in plan.facets:
-        await collect_for(facet, 1, facet.question)
+        for capability in facet.capabilities[:budget.max_adapters_per_facet]:
+            await collect_for(facet, 1, capability, _adapter_query(capability, facet.question))
 
-    coverage = _coverage_for(plan, sources)
-    for facet in plan.facets:
-        if facet.id not in coverage["missing_facet_ids"]:
-            continue
-        recovery_query = f"{facet.question} primary source official documentation independent evidence"
-        await collect_for(facet, 2, recovery_query)
+    coverage = _coverage_for(plan, sources, assessments)
+    for _ in range(budget.max_gap_rounds):
+        missing = [facet for facet in plan.facets if facet.id in coverage["missing_facet_ids"]]
+        if not missing:
+            break
+        for facet in missing:
+            recovery = "primary" if "primary" not in facet.capabilities else "web"
+            await collect_for(facet, 2, recovery, _adapter_query(recovery, f"{facet.question} independent corroboration"))
+        coverage = _coverage_for(plan, sources, assessments)
 
-    coverage = _coverage_for(plan, sources)
-    return ResearchBundle(plan, sources, attempts, coverage)
+    return ResearchBundle(plan, sources, attempts, coverage, assessments)
 
 
 async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[str]:
