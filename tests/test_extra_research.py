@@ -182,6 +182,25 @@ async def test_research_plan_rejects_a_facet_that_searches_the_raw_user_question
 
 
 @pytest.mark.asyncio
+async def test_research_plan_repairs_malformed_json_with_simple_lines():
+    class LinePlanner:
+        calls = 0
+        async def chat(self, messages):
+            self.calls += 1
+            content = "not json" if self.calls == 1 else (
+                "specs | official capabilities and limits | product official specifications limits | primary,official_documentation\n"
+                "evidence | independent evaluation | independent benchmark methodology results | scholarly,repository\n"
+                "constraints | practical constraints | deployment requirements tradeoffs | web"
+            )
+            return {"choices": [{"message": {"content": content}}]}
+
+    plan = await extra.plan_research(LinePlanner(), "Which option is best for a constrained deployment?")
+
+    assert [facet.id for facet in plan.facets] == ["specs", "evidence", "constraints"]
+    assert plan.facets[0].search_query == "product official specifications limits"
+
+
+@pytest.mark.asyncio
 async def test_claim_ledger_rejects_a_claim_without_a_verbatim_quote():
     source = extra.ResearchSource("Source", "https://huggingface.co/example", "the supported fact is here", 1, "query", quality_score=5)
     claims = extra._parse_ledger(

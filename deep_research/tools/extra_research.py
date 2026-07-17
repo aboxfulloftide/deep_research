@@ -290,7 +290,7 @@ def _fallback_research_plan(question: str) -> ResearchPlan:
     """Safe generic plan when the local planner cannot return structured JSON."""
     keywords = " ".join(
         word for word in re.findall(r"[a-zA-Z0-9]+", question.lower())
-        if word not in {"research", "deeply", "best", "that", "with", "from", "this", "should", "would", "could", "usable", "main", "also", "used", "less", "than", "under"}
+        if word not in {"research", "deeply", "best", "that", "with", "from", "this", "should", "would", "could", "usable", "main", "also", "used", "less", "than", "under", "the", "and", "for", "are", "can", "run", "into", "what", "which", "where", "when", "how", "its", "their", "then", "only"}
     )[:180]
     return ResearchPlan(question, [], [
         ResearchFacet("core", question, "Direct evidence that answers the central question.", ["web", "primary"], f"{keywords} official specifications"),
@@ -335,6 +335,34 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
         if len(facets) >= 2:
             ambiguities = payload.get("ambiguities", [])
             return ResearchPlan(question, [str(item)[:240] for item in ambiguities if str(item).strip()][:4], facets)
+    except Exception:
+        pass
+
+    # Smaller local models frequently produce useful prose but malformed JSON.
+    # Repair with a deliberately simple line protocol before falling back to
+    # keyword heuristics. This remains plan-only and never issues a search.
+    repair_messages = [
+        {"role": "system", "content": (
+            "/no_think\nCreate exactly three research-plan lines. Each line must be: "
+            "short-id | evidence need | short search query | comma-separated capabilities. "
+            "Capabilities may be web, primary, scholarly, official_documentation, repository, or news. "
+            "Do not repeat the user's full question as a search query and do not answer it."
+        )},
+        {"role": "user", "content": question},
+    ]
+    try:
+        response = await asyncio.wait_for(llm.chat(repair_messages), timeout=20)
+        facets = []
+        for line in response["choices"][0]["message"].get("content", "").splitlines():
+            fields = [field.strip() for field in line.split("|")]
+            if len(fields) != 4:
+                continue
+            facet_id = re.sub(r"[^a-z0-9_-]+", "-", fields[0].lower()).strip("-")
+            capabilities = [item.strip() for item in fields[3].split(",") if item.strip() in SOURCE_CAPABILITIES]
+            if facet_id and len(fields[1]) >= 12 and 12 <= len(fields[2]) <= 220 and _normalise(fields[2]) != _normalise(question):
+                facets.append(ResearchFacet(facet_id, fields[1][:260], "Evidence required for this research facet.", capabilities or ["web"], fields[2]))
+        if len(facets) >= 2:
+            return ResearchPlan(question, [], facets[:4])
     except Exception:
         pass
     return _fallback_research_plan(question)
