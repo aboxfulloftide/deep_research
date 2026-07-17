@@ -103,24 +103,33 @@ async def get_usage_summary(config: Config, recent_limit: int = 50) -> dict:
 
         providers = {}
         for provider in provider_names:
-            rows = await db.execute_fetchall(
+            # Aggregate in SQLite.  The old implementation fetched the last
+            # 500 rows and counted in Python, which made every busy provider
+            # look permanently capped at exactly 500 calls this month.
+            summary_rows = await db.execute_fetchall(
+                "SELECT "
+                "COUNT(*) FILTER (WHERE created_at LIKE ?) AS calls_today, "
+                "COUNT(*) FILTER (WHERE created_at LIKE ?) AS calls_month, "
+                "COUNT(*) FILTER (WHERE created_at LIKE ? AND status = 'ok') AS ok_count, "
+                "COUNT(*) FILTER (WHERE created_at LIKE ? AND status = 'empty') AS empty_count, "
+                "COUNT(*) FILTER (WHERE created_at LIKE ? AND status = 'error') AS error_count "
+                "FROM search_calls WHERE provider = ?",
+                (f"{today}%", f"{month}%", f"{month}%", f"{month}%", f"{month}%", provider),
+            )
+            summary = summary_rows[0]
+            last_rows = await db.execute_fetchall(
                 "SELECT status, result_count, error_message, elapsed_ms, created_at, mode "
-                "FROM search_calls WHERE provider = ? ORDER BY created_at DESC LIMIT 500",
+                "FROM search_calls WHERE provider = ? ORDER BY created_at DESC LIMIT 1",
                 (provider,),
             )
-            total_today = sum(1 for r in rows if r["created_at"].startswith(today))
-            total_month = sum(1 for r in rows if r["created_at"].startswith(month))
-            ok = sum(1 for r in rows if r["status"] == "ok")
-            empty = sum(1 for r in rows if r["status"] == "empty")
-            error = sum(1 for r in rows if r["status"] == "error")
-            last = rows[0] if rows else None
+            last = last_rows[0] if last_rows else None
             providers[provider] = {
                 "mode": last["mode"] if last else ("scrape" if provider in PROVIDERS[:1] else "api"),
-                "calls_today": total_today,
-                "calls_month": total_month,
-                "ok_count": ok,
-                "empty_count": empty,
-                "error_count": error,
+                "calls_today": summary["calls_today"],
+                "calls_month": summary["calls_month"],
+                "ok_count": summary["ok_count"],
+                "empty_count": summary["empty_count"],
+                "error_count": summary["error_count"],
                 "last_call_at": last["created_at"] if last else None,
                 "last_status": last["status"] if last else None,
                 "last_error": last["error_message"] if last else None,
