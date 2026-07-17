@@ -83,37 +83,20 @@ async def test_gap_closing_level_can_cap_a_single_query_to_one_source(monkeypatc
 
 @pytest.mark.asyncio
 async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check(monkeypatch):
-    calls = []
-
-    async def fake_collect(queries, config, level, seen_urls, **kwargs):
-        calls.append((level, queries))
-        return [extra.ResearchSource("Source", f"https://huggingface.co/{level}", "source evidence text", level, queries[0], quality_score=5, source_kind="primary")]
-
-    async def fake_follow_ups(llm, query, sources, level):
-        return [f"level {level} first", f"level {level} second"]
-
-    async def fake_starting_queries(llm, query):
-        return ["first factual branch", "second factual branch"]
-
-    monkeypatch.setattr(extra, "collect_sources", fake_collect)
-    monkeypatch.setattr(extra, "derive_follow_up_queries", fake_follow_ups)
-    monkeypatch.setattr(extra, "derive_starting_queries", fake_starting_queries)
-    monkeypatch.setattr(extra, "derive_gap_closing_query", lambda *_: __import__("asyncio").sleep(0, result=["gap-closing source"]))
+    source = extra.ResearchSource("Source", "https://huggingface.co/Qwen/example", "source evidence text", 1, "core evidence", quality_score=5, source_kind="primary")
+    plan = extra.ResearchPlan("question", [], [extra.ResearchFacet("core", "core evidence", "Direct evidence")])
+    async def fake_bundle(*args):
+        return extra.ResearchBundle(plan, [source], [], extra._coverage_for(plan, [source]))
+    monkeypatch.setattr(extra, "collect_research_bundle", fake_bundle)
     events = [event async for event in app._extra_research_answer(_FakeLLM(), "question", Config())]
 
-    assert [level for level, _ in calls] == [1, 2, 3, 4]
-    assert calls[0][1] == ["question", "first factual branch", "second factual branch"]
-    assert calls[-1][1] == ["gap-closing source"]
-    assert len([event for event in events if event["event"] == "status"]) == 12
+    assert len([event for event in events if event["event"] == "status"]) == 6
     assert events[-1] == {
         "event": "answer",
         "data": (
             "primary source comparison\nindependent benchmark analysis\n\n"
             "### Sources consulted\n"
-                "- [Source](https://huggingface.co/1)\n"
-                "- [Source](https://huggingface.co/2)\n"
-                "- [Source](https://huggingface.co/3)\n"
-                "- [Source](https://huggingface.co/4)"
+                "- [Source](https://huggingface.co/Qwen/example)"
         ),
     }
 

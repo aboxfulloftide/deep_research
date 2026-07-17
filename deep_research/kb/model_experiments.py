@@ -16,10 +16,7 @@ from deep_research.tools.extra_research import (
     analyze_sources_separately,
     build_claim_ledger,
     claim_ledger_context,
-    collect_sources,
-    derive_gap_closing_query,
-    derive_follow_up_queries,
-    derive_starting_queries,
+    collect_research_bundle,
     has_authoritative_source,
     source_context,
 )
@@ -66,17 +63,8 @@ async def build_frozen_evidence_bundle(kb_db, config: Config, job: dict) -> dict
         await kb_db.update_processing_job_progress(
             job["id"], "gather_sources", {"bundle_model": model}, lease_seconds=900,
         )
-        seen_urls: set[str] = set()
-        sources = []
-        queries = [prompt, *await derive_starting_queries(llm, prompt)]
-        for level in range(1, 5):
-            sources.extend(await collect_sources(
-                queries, config, level, seen_urls, sources_per_query=1 if level == 4 else None,
-            ))
-            if level < 3:
-                queries = await derive_follow_up_queries(llm, prompt, sources, level)
-            elif level == 3:
-                queries = await derive_gap_closing_query(llm, prompt, sources)
+        research_bundle = await collect_research_bundle(llm, prompt, config)
+        sources = research_bundle.sources
         if not sources or not has_authoritative_source(sources):
             raise RuntimeError("Could not collect an authoritative model card or paper for the comparison bundle")
     finally:
@@ -255,23 +243,9 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                     {"profile": profile_slug, "model": model, "context_size": context_size, "reasoning": reasoning},
                     lease_seconds=900,
                 )
-                seen_urls: set[str] = set()
-                sources = []
-                queries = [prompt, *await derive_starting_queries(llm, prompt)]
-                for level in range(1, 5):
-                    level_sources = await collect_sources(
-                        queries, config, level, seen_urls,
-                        sources_per_query=1 if level == 4 else None,
-                    )
-                    sources.extend(level_sources)
-                    collection_attempts.append({
-                        "level": level, "queries": list(queries), "source_count": len(level_sources),
-                        "source_urls": [source.url for source in level_sources],
-                    })
-                    if level < 3:
-                        queries = await derive_follow_up_queries(llm, prompt, sources, level)
-                    elif level == 3:
-                        queries = await derive_gap_closing_query(llm, prompt, sources)
+                research_bundle = await collect_research_bundle(llm, prompt, config)
+                sources = research_bundle.sources
+                collection_attempts = research_bundle.collection_attempts
 
             if payload.get("collection_only"):
                 # Keep collection benchmarking separate from extraction and
@@ -288,6 +262,11 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                     "source_urls": [source.url for source in sources],
                     "sources": [_serialize_source(source) for source in sources],
                     "collection_attempts": collection_attempts,
+                    "research_plan": {
+                        "ambiguities": research_bundle.plan.ambiguities,
+                        "facets": [{"id": facet.id, "question": facet.question, "purpose": facet.purpose} for facet in research_bundle.plan.facets],
+                    },
+                    "coverage": research_bundle.coverage,
                     "has_authoritative_source": has_authoritative_source(sources),
                     "elapsed_seconds": round(time.monotonic() - started_at, 1),
                     "answer": "Source collection complete; review this bundle before analysis.",

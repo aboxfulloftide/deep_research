@@ -55,6 +55,32 @@ class EvidenceClaim:
     confidence: float
 
 
+@dataclass(frozen=True)
+class ResearchFacet:
+    """One question-specific evidence need, independent of any domain."""
+
+    id: str
+    question: str
+    purpose: str
+
+
+@dataclass(frozen=True)
+class ResearchPlan:
+    question: str
+    ambiguities: list[str]
+    facets: list[ResearchFacet]
+
+
+@dataclass
+class ResearchBundle:
+    """An inspectable pre-synthesis research artifact."""
+
+    plan: ResearchPlan
+    sources: list[ResearchSource]
+    collection_attempts: list[dict]
+    coverage: dict
+
+
 def _is_html_result(result: SearchResult) -> bool:
     return not result.url.lower().split("?", 1)[0].endswith(".pdf")
 
@@ -222,6 +248,105 @@ def _parse_queries(content: str, original_query: str, limit: int = FOLLOW_UP_QUE
         if len(queries) == limit:
             break
     return queries
+
+
+def _fallback_research_plan(question: str) -> ResearchPlan:
+    """Safe generic plan when the local planner cannot return structured JSON."""
+    return ResearchPlan(question, [], [
+        ResearchFacet("core", question, "Direct evidence that answers the central question."),
+        ResearchFacet("constraints", f"{question} definitions constraints requirements", "Definitions, limits, and assumptions."),
+        ResearchFacet("corroboration", f"{question} primary sources independent corroboration", "Independent or primary corroboration."),
+    ])
+
+
+async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
+    """Turn any research question into evidence needs before searching.
+
+    The plan is deliberately domain-neutral: it describes what must be shown,
+    rather than assuming that all questions need model cards, papers, prices,
+    or a particular source type.
+    """
+    messages = [
+        {"role": "system", "content": (
+            "/no_think\nPlan research for any question. Return ONLY JSON: "
+            '{"ambiguities":["..."],"facets":[{"id":"short_slug","question":"searchable evidence question","purpose":"why this evidence matters"}]}. '
+            "Return 2-4 complementary facets. Facets must cover the central answer, constraints/definitions where relevant, "
+            "and corroboration or tradeoffs where relevant. Do not assume a domain or answer the question."
+        )},
+        {"role": "user", "content": question},
+    ]
+    try:
+        response = await asyncio.wait_for(llm.chat(messages), timeout=25)
+        payload = json.loads(response["choices"][0]["message"].get("content", "").strip())
+        rows = payload.get("facets") if isinstance(payload, dict) else None
+        facets = []
+        if isinstance(rows, list):
+            for index, row in enumerate(rows[:4], 1):
+                if not isinstance(row, dict):
+                    continue
+                facet_question = str(row.get("question") or "").strip()
+                purpose = str(row.get("purpose") or "").strip()
+                facet_id = re.sub(r"[^a-z0-9_-]+", "-", str(row.get("id") or f"facet-{index}").lower()).strip("-")
+                if len(facet_question) >= 12 and len(purpose) >= 8 and facet_id:
+                    facets.append(ResearchFacet(facet_id, facet_question[:260], purpose[:260]))
+        if len(facets) >= 2:
+            ambiguities = payload.get("ambiguities", [])
+            return ResearchPlan(question, [str(item)[:240] for item in ambiguities if str(item).strip()][:4], facets)
+    except Exception:
+        pass
+    return _fallback_research_plan(question)
+
+
+def _coverage_for(plan: ResearchPlan, sources: list[ResearchSource]) -> dict:
+    facets = []
+    for facet in plan.facets:
+        matching = [source for source in sources if source.query == facet.question]
+        facets.append({
+            "id": facet.id, "purpose": facet.purpose, "question": facet.question,
+            "source_count": len(matching), "best_quality": max((source.quality_score for source in matching), default=0),
+            "source_urls": [source.url for source in matching],
+        })
+    covered = [facet["id"] for facet in facets if facet["source_count"] and facet["best_quality"] >= MIN_EVIDENCE_QUALITY]
+    return {
+        "facets": facets, "covered_facet_ids": covered,
+        "missing_facet_ids": [facet.id for facet in plan.facets if facet.id not in covered],
+        "has_high_authority_source": any(source.quality_score >= 5 for source in sources),
+    }
+
+
+async def collect_research_bundle(llm: LLMClient, question: str, config: Config) -> ResearchBundle:
+    """Collect diverse evidence by research facet, then close uncovered facets.
+
+    This is the common source-collection stage used before any analysis. Its
+    output is intentionally preserved so users and evaluators can reject a
+    weak bundle rather than mistaking a polished synthesis for research.
+    """
+    plan = await plan_research(llm, question)
+    seen_urls: set[str] = set()
+    sources: list[ResearchSource] = []
+    attempts: list[dict] = []
+
+    async def collect_for(facet: ResearchFacet, level: int, query: str) -> None:
+        found = await collect_sources([query], config, level, seen_urls, sources_per_query=1)
+        sources.extend(found)
+        # Attribute retrieved evidence to its facet even if a recovery query
+        # supplied the wording, so coverage remains inspectable.
+        for source in found:
+            source.query = facet.question
+        attempts.append({"level": level, "facet_id": facet.id, "queries": [query], "source_count": len(found), "source_urls": [source.url for source in found]})
+
+    for facet in plan.facets:
+        await collect_for(facet, 1, facet.question)
+
+    coverage = _coverage_for(plan, sources)
+    for facet in plan.facets:
+        if facet.id not in coverage["missing_facet_ids"]:
+            continue
+        recovery_query = f"{facet.question} primary source official documentation independent evidence"
+        await collect_for(facet, 2, recovery_query)
+
+    coverage = _coverage_for(plan, sources)
+    return ResearchBundle(plan, sources, attempts, coverage)
 
 
 async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[str]:

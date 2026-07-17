@@ -2,6 +2,17 @@ import pytest
 
 from deep_research.config import Config
 from deep_research.kb import model_experiments as experiments
+from deep_research.tools import extra_research as extra
+
+
+def _bundle(question="Test prompt"):
+    source = extra.ResearchSource("Source", "https://huggingface.co/Qwen/example", "Evidence text " * 30, 1, question, quality_score=5, source_kind="primary")
+    plan = extra.ResearchPlan(question, [], [extra.ResearchFacet("core", question, "Direct evidence")])
+    return extra.ResearchBundle(plan, [source], [{"level": 1, "facet_id": "core", "queries": [question], "source_count": 1, "source_urls": [source.url]}], extra._coverage_for(plan, [source]))
+
+
+async def _fake_bundle(llm, question, config):
+    return _bundle(question)
 
 
 class _FakeDB:
@@ -33,14 +44,9 @@ async def test_current_model_experiment_uses_active_server_without_starting_prof
     async def fake_context(base_url):
         return 32768
 
-    from deep_research.tools.extra_research import ResearchSource
-
-    async def sources(queries, config, level, seen_urls, **kwargs):
-        return [ResearchSource("Source", "https://huggingface.co/example", "Evidence text", level, queries[0], quality_score=5, source_kind="primary")]
-
     monkeypatch.setattr(experiments, "detect_model", fake_model)
     monkeypatch.setattr(experiments, "detect_context_size", fake_context)
-    monkeypatch.setattr(experiments, "collect_sources", sources)
+    monkeypatch.setattr(experiments, "collect_research_bundle", _fake_bundle)
     monkeypatch.setattr(experiments, "LLMClient", _FakeLLM)
 
     db = _FakeDB()
@@ -73,10 +79,6 @@ async def test_larger_profile_safely_swaps_and_restores_primary_model(monkeypatc
     async def fake_context(base_url):
         return 16384
 
-    async def fake_sources(queries, config, level, seen_urls, **kwargs):
-        from deep_research.tools.extra_research import ResearchSource
-        return [ResearchSource("Source", "https://huggingface.co/example", "Evidence text", level, queries[0], quality_score=5, source_kind="primary")]
-
     async def fake_get_model(config, slug):
         return alternate if slug == "qwen3-30b" else None
 
@@ -96,7 +98,7 @@ async def test_larger_profile_safely_swaps_and_restores_primary_model(monkeypatc
 
     monkeypatch.setattr(experiments, "detect_model", fake_model)
     monkeypatch.setattr(experiments, "detect_context_size", fake_context)
-    monkeypatch.setattr(experiments, "collect_sources", fake_sources)
+    monkeypatch.setattr(experiments, "collect_research_bundle", _fake_bundle)
     monkeypatch.setattr(experiments, "LLMClient", _FakeLLM)
     monkeypatch.setattr(experiments.registry, "get_model", fake_get_model)
     monkeypatch.setattr(experiments.registry, "list_models", fake_list_models)
@@ -127,12 +129,11 @@ async def test_frozen_evidence_skips_search_and_reports_shared_bundle(monkeypatc
     async def fake_context(base_url):
         return 32768
 
-    async def should_not_search(*args, **kwargs):
-        raise AssertionError("a frozen comparison must not search again")
-
     monkeypatch.setattr(experiments, "detect_model", fake_model)
     monkeypatch.setattr(experiments, "detect_context_size", fake_context)
-    monkeypatch.setattr(experiments, "collect_sources", should_not_search)
+    async def should_not_collect(*args, **kwargs):
+        raise AssertionError("a frozen comparison must not collect again")
+    monkeypatch.setattr(experiments, "collect_research_bundle", should_not_collect)
     monkeypatch.setattr(experiments, "LLMClient", _FakeLLM)
 
     db = _FakeDB()
@@ -162,17 +163,9 @@ async def test_collection_only_returns_raw_sources_without_synthesis(monkeypatch
     async def fake_context(base_url):
         return 32768
 
-    from deep_research.tools.extra_research import ResearchSource
-
-    async def sources(queries, config, level, seen_urls, **kwargs):
-        return [ResearchSource(
-            "Official model card", "https://huggingface.co/Qwen/example", "Evidence text " * 30,
-            level, queries[0], quality_score=5, source_kind="primary",
-        )]
-
     monkeypatch.setattr(experiments, "detect_model", fake_model)
     monkeypatch.setattr(experiments, "detect_context_size", fake_context)
-    monkeypatch.setattr(experiments, "collect_sources", sources)
+    monkeypatch.setattr(experiments, "collect_research_bundle", _fake_bundle)
     monkeypatch.setattr(experiments, "LLMClient", _FakeLLM)
 
     result = await experiments.run_model_experiment(_FakeDB(), Config(), {
@@ -180,7 +173,7 @@ async def test_collection_only_returns_raw_sources_without_synthesis(monkeypatch
     })
 
     assert result["mode"] == "source_collection"
-    assert result["source_count"] == 4
-    assert result["sources"][0]["title"] == "Official model card"
+    assert result["source_count"] == 1
+    assert result["sources"][0]["title"] == "Source"
     assert result["has_authoritative_source"] is True
-    assert len(result["collection_attempts"]) == 4
+    assert len(result["collection_attempts"]) == 1

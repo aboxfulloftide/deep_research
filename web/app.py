@@ -323,56 +323,23 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
         build_claim_ledger,
         claim_ledger_context,
         has_authoritative_source,
-        collect_sources,
-        derive_gap_closing_query,
-        derive_follow_up_queries,
-        derive_starting_queries,
+        collect_research_bundle,
         source_context,
     )
 
-    seen_urls: set[str] = set()
-    sources = []
     yield {
         "event": "status",
-        "data": json.dumps({"step": "thinking", "detail": "Planning focused search questions with the local model..."}),
+        "data": json.dumps({"step": "thinking", "detail": "Planning question-specific evidence facets with the local model..."}),
     }
-    queries = [query, *await derive_starting_queries(llm, query)]
-
-    for level in range(1, 5):
-        detail = (
-            "Searching the original question plus focused subquestions..."
-            if level == 1
-            else "Following evidence into targeted sources..." if level < 4
-            else "Closing the most important remaining evidence gap..."
-        )
-        yield {
-            "event": "status",
-            "data": json.dumps({"step": "researching", "detail": f"Level {level} of 4: {detail}"}),
-        }
-        level_sources = await collect_sources(
-            queries, cfg, level, seen_urls,
-            sources_per_query=1 if level == 4 else None,
-        )
-        sources.extend(level_sources)
-        if session_id:
-            for source in level_sources:
-                await db.save_scraped_page(
-                    session_id, source.url, source.title, source.full_content or source.content,
-                    {"extra_research": {"level": source.level, "query": source.query}},
-                )
-
-        if level < 3:
-            yield {
-                "event": "status",
-                "data": json.dumps({"step": "thinking", "detail": f"Level {level} of 4: choosing follow-up questions from the evidence..."}),
-            }
-            queries = await derive_follow_up_queries(llm, query, sources, level)
-        elif level == 3:
-            yield {
-                "event": "status",
-                "data": json.dumps({"step": "thinking", "detail": "Choosing one final source to corroborate the remaining evidence gap..."}),
-            }
-            queries = await derive_gap_closing_query(llm, query, sources)
+    yield {"event": "status", "data": json.dumps({"step": "researching", "detail": "Collecting evidence for each facet, then closing uncovered facets..."})}
+    research_bundle = await collect_research_bundle(llm, query, cfg)
+    sources = research_bundle.sources
+    if session_id:
+        for source in sources:
+            await db.save_scraped_page(
+                session_id, source.url, source.title, source.full_content or source.content,
+                {"extra_research": {"level": source.level, "query": source.query, "research_facets": research_bundle.coverage}},
+            )
 
     if not sources or not has_authoritative_source(sources):
         yield {"event": "answer", "data": "I could not retrieve usable sources for this extra research run."}
