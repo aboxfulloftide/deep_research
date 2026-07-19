@@ -96,6 +96,16 @@ deep-research-kb extract-pending
 deep-research-kb verify-unverified --trigger cron
 ```
 
+The production host schedules that verification command at 11:00 PM with
+`systemd/deep-research-nightly-verification.timer`. The timer is persistent,
+so a run missed while the machine is asleep starts after the next wake instead
+of being silently skipped like an ordinary cron entry.
+
+After a successful cron-triggered verification sweep, the worker also queues
+counter-view checks for up to 50 supported claims that have never been checked.
+These are low-priority, idempotent jobs and drain while the local model is idle;
+set `DEEP_RESEARCH_KB_NIGHTLY_COUNTER_EVIDENCE_LIMIT` to change the batch size.
+
 For registered local model profiles, `deep-research-kb nightly-role-split`
 runs the configured extraction model, then the verifier model, and leaves the
 verifier loaded for daytime use.

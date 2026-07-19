@@ -10,7 +10,7 @@ scope, and search usage isn't conceptually tied to either of those anyway.
 
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -34,9 +34,14 @@ CREATE INDEX IF NOT EXISTS idx_search_calls_provider_created ON search_calls(pro
 """
 
 # Seed list shown even before any calls are logged. SearXNG can surface
-# other engines too (bing, mojeek, wikipedia, ...) -- get_usage_summary
+# other engines too (bing, mojeek, ...) -- get_usage_summary
 # discovers those dynamically from the log rather than hardcoding them here.
 PROVIDERS = ("duckduckgo", "brave", "tavily", "serper")
+
+# These unreliable SearXNG scrape engines were replaced by the direct
+# wikipedia_api and wikidata_api providers. Keep their old log rows for audit
+# history, but do not expose them as current providers or recent calls.
+RETIRED_PROVIDERS = ("wikipedia", "wikidata")
 
 
 def usage_db_path(config: Config) -> Path:
@@ -78,6 +83,52 @@ async def log_search_call(
         pass
 
 
+async def providers_allowed_by_circuit_breaker(
+    config: Config, providers: tuple[str, ...], *, max_attempts: int | None, cooldown_hours: int,
+) -> set[str]:
+    """Return providers safe to include in a deliberately limited trial.
+
+    The usage log makes this durable across web-worker restarts. A provider
+    is withheld after its first error for the full cooldown, or once it has
+    reached the rolling attempt cap even if every call was successful. This
+    is for scrape engines with undocumented bot thresholds, not metered APIs.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)).isoformat()
+    allowed: set[str] = set()
+    async with _connect(config) as db:
+        for provider in providers:
+            row = await db.execute_fetchall(
+                "SELECT COUNT(*) AS attempts, "
+                "MAX(CASE WHEN status = 'error' THEN created_at END) AS last_error "
+                "FROM search_calls WHERE provider = ? AND created_at >= ?",
+                (provider, cutoff),
+            )
+            attempts, last_error = row[0]
+            if last_error is None and (max_attempts is None or attempts < max_attempts):
+                allowed.add(provider)
+    return allowed
+
+
+async def provider_monthly_quota_exhausted(config: Config, provider: str) -> bool:
+    """Return whether a metered provider has exhausted this month's quota.
+
+    A Brave per-second 429 is retried before it is logged, so a stored 429
+    means that retry also failed. Treat that as monthly exhaustion and keep
+    the decision durable across worker restarts. The calendar-month query
+    naturally makes the provider eligible again on the first day of the next
+    UTC month without a cleanup job or mutable cooldown record.
+    """
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    async with _connect(config) as db:
+        rows = await db.execute_fetchall(
+            "SELECT 1 FROM search_calls "
+            "WHERE provider = ? AND status = 'error' AND created_at LIKE ? "
+            "AND error_message LIKE '%429%' LIMIT 1",
+            (provider, f"{month}%"),
+        )
+    return bool(rows)
+
+
 class _Timer:
     def __init__(self):
         self.start = time.monotonic()
@@ -99,7 +150,10 @@ async def get_usage_summary(config: Config, recent_limit: int = 50) -> dict:
     async with _connect(config) as db:
         db.row_factory = aiosqlite.Row
         known = await db.execute_fetchall("SELECT DISTINCT provider FROM search_calls")
-        provider_names = sorted({r["provider"] for r in known} | set(PROVIDERS))
+        provider_names = sorted(
+            ({r["provider"] for r in known} | set(PROVIDERS))
+            - set(RETIRED_PROVIDERS)
+        )
 
         providers = {}
         for provider in provider_names:
@@ -138,8 +192,9 @@ async def get_usage_summary(config: Config, recent_limit: int = 50) -> dict:
 
         recent = await db.execute_fetchall(
             "SELECT provider, mode, status, result_count, error_message, elapsed_ms, query, created_at "
-            "FROM search_calls ORDER BY created_at DESC LIMIT ?",
-            (recent_limit,),
+            "FROM search_calls WHERE provider NOT IN (?, ?) "
+            "ORDER BY created_at DESC LIMIT ?",
+            (*RETIRED_PROVIDERS, recent_limit),
         )
         recent_calls = [dict(r) for r in recent]
 

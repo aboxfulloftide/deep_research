@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
-import { Check, X, GitMerge } from 'lucide-vue-next'
+import { Check, X, GitMerge, Trash2 } from 'lucide-vue-next'
 import { useApi } from '../composables/useApi.js'
 
 const api = useApi()
@@ -14,6 +14,8 @@ const TYPES = [
 
 const activeType = ref('all')
 const candidates = ref([])
+const candidateCounts = ref({})
+const total = ref(0)
 const loading = ref(true)
 const reviewingId = ref(null)
 const lastOutcome = ref(null)
@@ -37,12 +39,28 @@ async function load() {
   const result = await api.fetchResolutionCandidates(type)
   if (thisRequest !== requestSeq) return
   candidates.value = result.candidates || []
+  candidateCounts.value = result.counts || {}
+  total.value = result.total ?? candidates.value.length
   loading.value = false
 }
 
 function switchType(key) {
   activeType.value = key
   load()
+}
+
+function typeCount(type) {
+  if (!type.apiType) return Object.values(candidateCounts.value).reduce((sum, count) => sum + count, 0)
+  return candidateCounts.value[type.apiType] || 0
+}
+
+function decrementCount(candidate) {
+  const type = candidate.candidate_type
+  candidateCounts.value = {
+    ...candidateCounts.value,
+    [type]: Math.max(0, (candidateCounts.value[type] || 0) - 1),
+  }
+  total.value = Math.max(0, total.value - 1)
 }
 
 const allSelected = computed(() =>
@@ -85,6 +103,23 @@ async function review(candidate, decision) {
     const result = await api.reviewResolutionCandidate(candidate.id, decision)
     lastOutcome.value = describeOutcome(result)
     candidates.value = candidates.value.filter(c => c.id !== candidate.id)
+    decrementCount(candidate)
+  } finally {
+    reviewingId.value = null
+  }
+}
+
+async function removeClaim(candidate, claimId, claimText) {
+  const ok = window.confirm(
+    `Remove this invalid or irrelevant claim?\n\n“${claimText}”\n\n` +
+    'This removes the claim and all of its review items, but keeps the underlying source and its other claims.'
+  )
+  if (!ok) return
+  reviewingId.value = candidate.id
+  try {
+    await api.removeClaim(claimId, 'invalid_or_irrelevant_extraction')
+    lastOutcome.value = 'Removed claim and its related review items.'
+    await load()
   } finally {
     reviewingId.value = null
   }
@@ -124,9 +159,10 @@ async function bulkReview(decision) {
         outcomes.failed = (outcomes.failed || 0) + 1
       }
     }
-    candidates.value = candidates.value.filter(c => !selectedIds.value.has(c.id))
-    selectedIds.value = new Set()
     lastOutcome.value = summarizeBulkOutcome(decision, ids, outcomes)
+    // Re-fetch instead of assuming every request succeeded. This keeps both
+    // the list and the database-backed counts honest when a bulk item fails.
+    await load()
   } finally {
     bulkProcessing.value = false
   }
@@ -203,7 +239,15 @@ const methodExplanations = {
           ? 'border-blue-600 text-blue-600 dark:text-blue-400'
           : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'"
       >
-        {{ t.label }}
+        <span>{{ t.label }}</span>
+        <span
+          class="ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] tabular-nums"
+          :class="activeType === t.key
+            ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300'
+            : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400'"
+        >
+          {{ typeCount(t) }}
+        </span>
       </button>
     </div>
 
@@ -228,6 +272,12 @@ const methodExplanations = {
 
     <template v-else>
       <div class="flex items-center gap-3 mb-3 text-sm">
+        <span class="font-medium text-gray-700 dark:text-gray-300">
+          {{ total }} pending {{ total === 1 ? 'item' : 'items' }}
+        </span>
+        <span v-if="candidates.length < total" class="text-gray-400 dark:text-gray-500">
+          showing first {{ candidates.length }}
+        </span>
         <label class="flex items-center gap-1.5 cursor-pointer select-none text-gray-600 dark:text-gray-300">
           <input type="checkbox" :checked="allSelected" @change="toggleSelectAll" class="accent-blue-600" />
           {{ allSelected ? 'Select none' : 'Select all' }}
@@ -304,22 +354,64 @@ const methodExplanations = {
         </div>
 
         <div class="text-sm text-gray-900 dark:text-white space-y-2.5">
-          <div v-for="side in [{ label: 'A', text: c.left_label, type: c.left_entity_type, evidence: c.left_evidence },
-                                 { label: 'B', text: c.right_label, type: c.right_entity_type, evidence: c.right_evidence }]"
+          <div v-for="side in [{ label: 'A', id: c.left_claim_id, text: c.left_label, type: c.left_entity_type, evidence: c.left_evidence },
+                                 { label: 'B', id: c.right_claim_id, text: c.right_label, type: c.right_entity_type, evidence: c.right_evidence }]"
                :key="side.label">
             <p>
               <span class="text-gray-400 dark:text-gray-500">{{ side.label }}:</span>
               {{ side.text }}
               <span v-if="side.type" class="text-xs text-gray-400 dark:text-gray-500">({{ side.type }})</span>
             </p>
-            <div v-if="side.evidence?.length" class="mt-1 ml-4 space-y-1">
+            <button
+              v-if="side.id"
+              @click="removeClaim(c, side.id, side.text)"
+              :disabled="reviewingId === c.id"
+              class="mt-1 ml-4 inline-flex items-center gap-1 text-[11px] text-orange-600 dark:text-orange-400 hover:underline disabled:opacity-50"
+              title="Remove an invalid, irrelevant, or promotional claim"
+            >
+              <Trash2 class="w-3 h-3" />
+              Remove claim
+            </button>
+            <div v-if="side.evidence?.length" class="mt-1.5 ml-4 space-y-2">
               <div
                 v-for="(ev, i) in side.evidence"
                 :key="i"
-                class="text-xs border-l-2 border-gray-200 dark:border-gray-600 pl-2"
+                class="text-xs border-l-2 border-gray-200 dark:border-gray-600 pl-2.5"
               >
-                <span class="font-medium text-gray-500 dark:text-gray-400">{{ ev.source_title }}</span>
-                <span v-if="ev.excerpt" class="text-gray-500 dark:text-gray-400 italic"> — "{{ ev.excerpt }}"</span>
+                <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  <RouterLink
+                    v-if="ev.source_id"
+                    :to="{ name: 'source', params: { id: ev.source_id } }"
+                    class="font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                    title="Open this source in the app"
+                  >
+                    {{ ev.source_title }}
+                  </RouterLink>
+                  <span v-else class="font-medium text-gray-500 dark:text-gray-400">{{ ev.source_title }}</span>
+                  <a
+                    v-if="ev.canonical_uri"
+                    :href="ev.canonical_uri"
+                    target="_blank"
+                    rel="noopener"
+                    class="text-[11px] text-gray-400 dark:text-gray-500 hover:text-blue-600 dark:hover:text-blue-400 hover:underline"
+                  >
+                    original
+                  </a>
+                  <span v-if="ev.section_label" class="text-[11px] text-gray-400 dark:text-gray-500">
+                    {{ ev.section_label }}
+                  </span>
+                </div>
+                <p v-if="ev.excerpt" class="mt-0.5 text-gray-500 dark:text-gray-400 italic">
+                  “{{ ev.excerpt }}”
+                </p>
+                <details v-if="ev.context && ev.context !== ev.excerpt" class="mt-1">
+                  <summary class="cursor-pointer select-none text-blue-600 dark:text-blue-400 hover:underline">
+                    Show surrounding context
+                  </summary>
+                  <p class="mt-1.5 p-2 rounded bg-gray-50 dark:bg-gray-900/60 text-gray-600 dark:text-gray-300 leading-relaxed whitespace-pre-wrap">
+                    {{ ev.context }}
+                  </p>
+                </details>
               </div>
             </div>
           </div>

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 from deep_research.config import Config, LLMConfig
+from deep_research.kb.claim_filters import is_review_excluded_claim
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import embed_texts
 from deep_research.kb.extraction import detect_model
@@ -66,6 +67,48 @@ Return ONLY a JSON object: {"relationship": "same"|"different", "confidence": 0.
 # entity-duplicate and claim-duplicate vetting below.
 ENTITY_LLM_CONFIDENCE_THRESHOLD = 0.75
 CLAIM_LLM_CONFIDENCE_THRESHOLD = 0.75
+
+# High-precision rule for a common extraction artifact: one source preserves
+# the attribution ("Adam Smith wrote that X") while another stores the quoted
+# fact itself ("X"). This is safe to resolve without the model only when
+# exactly one side consists of a leading attribution plus the other side's
+# complete text. Broader entailment/substring matches still go through the
+# LLM because an extra clause can materially change a claim.
+_CLAIM_ATTRIBUTION_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"according\s+to\s+[^,;:]{1,120},\s*|"
+    r"[^,;:]{1,120}?\s+"
+    r"(?:wrote|writes|said|says|stated|states|argued|argues|claimed|claims|"
+    r"reported|reports|found|finds|noted|notes|observed|observes|concluded|concludes)"
+    r"\s+(?:that\s+)?"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _claim_text_key(text: str) -> str:
+    text = text.strip().lower().replace("’", "'")
+    text = re.sub(r"\s+", " ", text)
+    return text.rstrip(" .!?;:")
+
+
+def claims_differ_only_by_attribution(claim_a: str, claim_b: str) -> bool:
+    """True only for `attribution + exact claim` versus the bare claim.
+
+    If both sides carry an attribution, even around the same words, the
+    identity of the speaker/author remains a fact that must not be erased.
+    """
+    key_a = _claim_text_key(claim_a)
+    key_b = _claim_text_key(claim_b)
+    stripped_a = _claim_text_key(_CLAIM_ATTRIBUTION_PREFIX_RE.sub("", key_a, count=1))
+    stripped_b = _claim_text_key(_CLAIM_ATTRIBUTION_PREFIX_RE.sub("", key_b, count=1))
+    a_had_attribution = stripped_a != key_a
+    b_had_attribution = stripped_b != key_b
+    return (
+        a_had_attribution and not b_had_attribution and stripped_a == key_b
+    ) or (
+        b_had_attribution and not a_had_attribution and stripped_b == key_a
+    )
 
 
 def _parse_same_different_classification(content: str) -> dict:
@@ -216,7 +259,18 @@ def _entity_similarity(norm_a: str, norm_b: str, entity_type: str) -> tuple[floa
         return None
     if norm_a in norm_b or norm_b in norm_a:
         shorter, longer = sorted([norm_a, norm_b], key=len)
-        if entity_type != "person":
+        if entity_type == "person" and " " not in shorter:
+            # A bare first name ("Samuel" / "Samuel Travers") is not useful
+            # identity evidence, and a partial-token hit ("Gray" / "Grayson
+            # John") is weaker still. These used to create a steady stream
+            # of person-review noise. Keep the narrower bare-surname case
+            # ("Clayton" / "Christopher Clayton") eligible because it at
+            # least matches a complete final name token; the local model still
+            # makes the actual merge/drop decision when available.
+            longer_words = longer.split()
+            if shorter != longer_words[-1]:
+                return None
+        elif entity_type != "person":
             if _is_trivial_plural(shorter, longer) or _is_trivial_qualifier(shorter, longer):
                 return None
             if len(shorter) / len(longer) < FUZZY_SUBSTRING_MIN_LENGTH_RATIO:
@@ -339,14 +393,34 @@ async def generate_claim_resolution_candidates(
     candidate_count = 0
     for claim_id in new_claim_ids:
         claim = await kb_db.get_claim(claim_id)
-        if claim is None or claim.get("embedding") is None:
+        if claim is None or claim.get("embedding") is None or claim.get("merged_into_claim_id"):
             continue  # embedding failed best-effort at creation time; backfill will cover it
+        if is_review_excluded_claim(claim["canonical_text"]):
+            continue
         embedding = claim["embedding"].to_list()
         claim_numbers = _extract_numbers(claim["canonical_text"])
         neighbors = await kb_db.find_similar_claims(claim_id, embedding, limit=20)
         for other in neighbors:
             if other["similarity"] < threshold:
                 break  # find_similar_claims orders nearest-first (similarity descending)
+            if is_review_excluded_claim(other["canonical_text"]):
+                continue
+            if claims_differ_only_by_attribution(claim["canonical_text"], other["canonical_text"]):
+                merged = await merge_claims(
+                    kb_db, claim_id, other["id"],
+                    automation={
+                        "confidence": 1.0,
+                        "reasoning": "Claims differ only by a leading attribution.",
+                        "model": None,
+                        "parse_success": True,
+                    },
+                )
+                # Once the claim being processed loses a merge, its cached
+                # neighbor list and identity are stale. The winner will be
+                # considered normally on its own pass or by the backlog sweep.
+                if merged["winner_id"] != claim_id:
+                    break
+                continue
             other_numbers = _extract_numbers(other["canonical_text"])
             if claim_numbers and other_numbers and claim_numbers.isdisjoint(other_numbers):
                 continue  # both claims cite numbers, but share none -- not the same fact
@@ -360,11 +434,13 @@ async def generate_claim_resolution_candidates(
                 confidence = verdict.get("confidence") or 0.0
                 if confidence >= CLAIM_LLM_CONFIDENCE_THRESHOLD:
                     if relationship == "same":
-                        await merge_claims(
+                        merged = await merge_claims(
                             kb_db, claim_id, other["id"],
                             automation={"confidence": confidence, "reasoning": verdict.get("reasoning"),
                                         "model": getattr(llm, "model", None), "parse_success": True},
                         )
+                        if merged["winner_id"] != claim_id:
+                            break
                         continue
                     if relationship == "different":
                         continue
@@ -376,6 +452,193 @@ async def generate_claim_resolution_candidates(
             if created:
                 candidate_count += 1
     return candidate_count
+
+
+async def resolve_open_entity_duplicates(
+    kb_db: KBDatabase,
+    config: Config,
+    *,
+    limit: int = 200,
+    llm: LLMClient | None = None,
+) -> dict:
+    """Retry old entity candidates with whichever local model is loaded.
+
+    Candidate generation already performs this classification for newly
+    extracted entities. The sweep exists for backlog created by older code or
+    a transient model outage. Confident matches merge, confident non-matches
+    are removed from review, and uncertain pairs remain open.
+    """
+    candidates = await kb_db.list_resolution_candidates(
+        candidate_type="entity_duplicate", status="open", limit=limit,
+    )
+    result = {"checked": 0, "merged": 0, "rejected": 0, "uncertain": 0, "failed": 0, "remaining": 0}
+    owned_llm = llm is None
+    if owned_llm:
+        base_url = config.kb.extraction_llm_base_url
+        # A configured model remains an explicit override. With the normal
+        # null/default setting, detect the model actually loaded right now so
+        # this sweep never requires or triggers a profile swap.
+        model = config.kb.extraction_llm_model or await detect_model(base_url)
+        llm = LLMClient(Config(llm=LLMConfig(base_url=base_url, model=model, api_key="not-needed")))
+
+    try:
+        for snapshot in candidates:
+            candidate = await kb_db.get_resolution_candidate(snapshot["id"])
+            if candidate is None or candidate["status"] != "open":
+                continue
+            left = await kb_db.get_entity(candidate["left_entity_id"])
+            right = await kb_db.get_entity(candidate["right_entity_id"])
+            if left is None or right is None or left["id"] == right["id"]:
+                continue
+
+            try:
+                verdict = await _classify_entity_duplicate(
+                    llm, left["name"], right["name"], left["entity_type"],
+                )
+                result["checked"] += 1
+                relationship = verdict.get("relationship")
+                confidence = float(verdict.get("confidence") or 0.0)
+                reasoning = str(verdict.get("reasoning") or "No reasoning supplied.")
+                if confidence < ENTITY_LLM_CONFIDENCE_THRESHOLD:
+                    result["uncertain"] += 1
+                    continue
+
+                model = getattr(llm, "model", None)
+                if relationship == "same":
+                    await kb_db.review_resolution_candidate(
+                        candidate["id"], "accepted", "automatic_llm",
+                    )
+                    await merge_entities(
+                        kb_db, left["id"], right["id"],
+                        automation={
+                            "confidence": confidence, "reasoning": reasoning,
+                            "model": model, "parse_success": True,
+                        },
+                    )
+                    result["merged"] += 1
+                elif relationship == "different":
+                    await kb_db.review_resolution_candidate(
+                        candidate["id"], "rejected", "automatic_llm",
+                    )
+                    await kb_db.record_decision(
+                        "entity_duplicate_resolution", "resolution_candidate", candidate["id"],
+                        "rejected_as_different", related_ids=[left["id"], right["id"]],
+                        confidence=confidence, reasoning=reasoning, model=model,
+                        parse_success=True, previous_state={"status": "open"},
+                        resulting_state={"status": "rejected"}, reversible=False,
+                    )
+                    result["rejected"] += 1
+                else:
+                    result["uncertain"] += 1
+            except Exception:
+                result["failed"] += 1
+
+        result["remaining"] = len(await kb_db.list_resolution_candidates(
+            candidate_type="entity_duplicate", status="open", limit=5000,
+        ))
+        return result
+    finally:
+        if owned_llm and llm is not None:
+            await llm.close()
+
+
+async def resolve_open_claim_duplicates(
+    kb_db: KBDatabase,
+    config: Config,
+    *,
+    limit: int = 200,
+    llm: LLMClient | None = None,
+) -> dict:
+    """Conservatively drain old claim-duplicate review backlog.
+
+    New candidates are classified during promotion, but a transient model
+    failure (or candidates created by older code) can leave obvious pairs in
+    the queue forever. This sweep retries those pairs with the currently
+    loaded local model. Only verdicts at the normal auto-resolution
+    confidence threshold are acted on; anything uncertain stays open.
+    """
+    candidates = await kb_db.list_resolution_candidates(
+        candidate_type="claim_duplicate", status="open", limit=limit,
+    )
+    result = {"checked": 0, "merged": 0, "rejected": 0, "uncertain": 0, "failed": 0, "remaining": 0}
+    owned_llm = llm is None
+    if owned_llm:
+        base_url = config.kb.extraction_llm_base_url
+        model = config.kb.extraction_llm_model or await detect_model(base_url)
+        llm = LLMClient(Config(llm=LLMConfig(base_url=base_url, model=model, api_key="not-needed")))
+
+    try:
+        for snapshot in candidates:
+            candidate = await kb_db.get_resolution_candidate(snapshot["id"])
+            if candidate is None or candidate["status"] != "open":
+                continue  # an earlier merge in this sweep already retired it
+            left = await kb_db.get_claim(candidate["left_claim_id"])
+            right = await kb_db.get_claim(candidate["right_claim_id"])
+            if left is None or right is None or left["id"] == right["id"]:
+                continue
+            if (
+                is_review_excluded_claim(left["canonical_text"])
+                or is_review_excluded_claim(right["canonical_text"])
+            ):
+                await kb_db.delete_resolution_candidate(candidate["id"])
+                result["rejected"] += 1
+                continue
+
+            try:
+                if claims_differ_only_by_attribution(left["canonical_text"], right["canonical_text"]):
+                    verdict = {
+                        "relationship": "same", "confidence": 1.0,
+                        "reasoning": "Claims differ only by a leading attribution.",
+                    }
+                    reviewed_by = "automatic_rule"
+                    model = None
+                else:
+                    verdict = await _classify_claim_duplicate(
+                        llm, left["canonical_text"], right["canonical_text"],
+                    )
+                    reviewed_by = "automatic_llm"
+                    model = getattr(llm, "model", None)
+
+                result["checked"] += 1
+                relationship = verdict.get("relationship")
+                confidence = float(verdict.get("confidence") or 0.0)
+                reasoning = str(verdict.get("reasoning") or "No reasoning supplied.")
+                if confidence < CLAIM_LLM_CONFIDENCE_THRESHOLD:
+                    result["uncertain"] += 1
+                    continue
+
+                if relationship == "same":
+                    await kb_db.review_resolution_candidate(candidate["id"], "accepted", reviewed_by)
+                    await merge_claims(
+                        kb_db, left["id"], right["id"],
+                        automation={
+                            "confidence": confidence, "reasoning": reasoning,
+                            "model": model, "parse_success": True,
+                        },
+                    )
+                    result["merged"] += 1
+                elif relationship == "different":
+                    await kb_db.review_resolution_candidate(candidate["id"], "rejected", reviewed_by)
+                    await kb_db.record_decision(
+                        "claim_duplicate_resolution", "resolution_candidate", candidate["id"],
+                        "rejected_as_different", related_ids=[left["id"], right["id"]],
+                        confidence=confidence, reasoning=reasoning, model=model,
+                        parse_success=True, previous_state={"status": "open"},
+                        resulting_state={"status": "rejected"}, reversible=False,
+                    )
+                    result["rejected"] += 1
+                else:
+                    result["uncertain"] += 1
+            except Exception:
+                result["failed"] += 1
+
+        result["remaining"] = len(await kb_db.list_resolution_candidates(
+            candidate_type="claim_duplicate", status="open", limit=5000,
+        ))
+        return result
+    finally:
+        if owned_llm and llm is not None:
+            await llm.close()
 
 
 def _parse_metric_value(value) -> tuple[float | None, str | None]:

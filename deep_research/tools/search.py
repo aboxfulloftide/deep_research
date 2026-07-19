@@ -7,7 +7,12 @@ import httpx
 
 from deep_research.config import Config
 from deep_research.models import SearchResult
-from deep_research.tools.search_usage import log_search_call, timer
+from deep_research.tools.search_usage import (
+    log_search_call,
+    provider_monthly_quota_exhausted,
+    providers_allowed_by_circuit_breaker,
+    timer,
+)
 
 BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search"
 TAVILY_API_URL = "https://api.tavily.com/search"
@@ -21,14 +26,31 @@ _QUERY_STOP_WORDS = {
     "from", "how", "in", "is", "it", "of", "on", "or", "say", "the",
     "to", "was", "were", "what", "when", "where", "who", "why", "with",
 }
-# Below this many combined duckduckgo+brave results, spend a metered Tavily
-# query to fill the gap -- keeps Tavily's smaller monthly budget for when
-# duckduckgo+brave actually come up short, instead of spending it every query.
+_PROPER_NAME_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z0-9]*(?:['’]s)?|[A-Z]{2,})"
+    r"(?:\s+(?:[A-Z][A-Za-z0-9]*(?:['’]s)?|[A-Z]{2,}))*"
+)
+_GENERIC_SENTENCE_OPENERS = {
+    "a", "an", "as", "at", "by", "for", "from", "in", "it", "on",
+    "proof", "that", "the", "these", "this", "those", "when", "while",
+}
+# Below this many combined SearXNG+Brave+Serper results, spend a metered
+# Tavily query to fill the gap. Serper's larger allowance makes it a routine
+# primary source now; Tavily keeps serving as the thin-results fallback.
 MIN_RESULTS_BEFORE_TAVILY_FALLBACK = 3
-# Serper's free tier is a one-time 2500-query trial, not a recurring monthly
-# allowance like brave/tavily -- only spend it if duckduckgo+brave+tavily
-# combined still came up this thin, i.e. genuinely last resort.
-MIN_RESULTS_BEFORE_SERPER_FALLBACK = 3
+
+# Google CSE and Startpage are intentionally not part of SearXNG's default
+# engine set: literal claim sentences caused sustained, repetitive traffic
+# that eventually tripped their bot protection. Verification may opt into
+# them for an LLM-generated alternate query, where the wording is both more
+# search-like and different from the literal first attempt. Keeping this list
+# here (rather than globally enabling the engines in settings.yml) preserves
+# that boundary for interactive and other ordinary searches too.
+SEARXNG_BASE_ENGINES = ("duckduckgo", "bing", "mojeek")
+SEARXNG_RECOVERED_ENGINES = ("google cse", "startpage")
+SEARXNG_DUCKDUCKGO_COOLDOWN_HOURS = 3
+SEARXNG_ALTERNATE_QUERY_ENGINE_MAX_ATTEMPTS = 20
+SEARXNG_ALTERNATE_QUERY_ENGINE_COOLDOWN_HOURS = 48
 
 _searxng_throttle_lock = asyncio.Lock()
 _searxng_last_call_at: float | None = None
@@ -100,11 +122,18 @@ async def _brave_search_layered(query: str, config: Config) -> list[SearchResult
     (config.brave.api_key, ~2000 queries/month, 1 req/s) first, and the paid
     key (config.brave.fallback_api_key, 50 req/s, ~3000/month budgeted) only
     when the free key actually *errors* -- quota exhausted, persistent 429,
-    subscription problem. A genuinely empty result set from the free key is
-    an answer, not a failure, and never triggers paid spend. Each key logs
-    under its own provider name ("brave" / "brave_fallback") so
-    /search-usage shows exactly when the paid key started carrying traffic."""
-    if config.brave.api_key:
+    subscription problem. Once the primary key's 429 retry also fails, its
+    stored error opens a persistent circuit for the rest of the calendar
+    month; subsequent searches go directly to the fallback key. A genuinely
+    empty result set from the free key is an answer, not a failure, and never
+    triggers paid spend. Each key logs under its own provider name ("brave" /
+    "brave_fallback") so /search-usage shows exactly when the paid key started
+    carrying traffic."""
+    primary_paused = (
+        bool(config.brave.api_key)
+        and await provider_monthly_quota_exhausted(config, "brave")
+    )
+    if config.brave.api_key and not primary_paused:
         t = timer()
         try:
             results = await _brave_api_search_with_retry(query, config.brave.api_key)
@@ -224,10 +253,9 @@ async def _wikidata_api_search(query: str, contact: str = "") -> list[SearchResu
 
     wbsearchentities matches entity labels/aliases (returning a proper
     display label + description, unlike Wikidata's REST full-text search,
-    whose result titles are opaque Q-ids) -- so entity-name queries get
-    clean hits and sentence-shaped queries usually get zero results. That's
-    expected and fine: Wikidata is an entity database, and this is a free
-    add-on alongside the engines that do full-text search."""
+    whose result titles are opaque Q-ids). Callers should pass an entity-like
+    label, not an entire factual sentence; web_search derives that label from
+    the best relevant Wikipedia result."""
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
             WIKIDATA_API_URL,
@@ -253,9 +281,12 @@ async def _wikidata_api_search(query: str, contact: str = "") -> list[SearchResu
     return results
 
 
-async def _log_searxng_engines(config: Config, data: dict, elapsed_ms: int, query: str) -> None:
+async def _log_searxng_engines(
+    config: Config, data: dict, elapsed_ms: int, query: str,
+    selected_engines: tuple[str, ...] | None = None,
+) -> None:
     """SearXNG fans one call out to several underlying engines (duckduckgo,
-    bing, mojeek, wikipedia, ...) and merges their results -- log each engine
+    bing, mojeek, ...) and merges their results -- log each engine
     that actually contributed or failed separately, rather than lumping
     everything under "duckduckgo", so /api/search-usage reflects what's
     really answering queries."""
@@ -264,6 +295,7 @@ async def _log_searxng_engines(config: Config, data: dict, elapsed_ms: int, quer
         for engine in item.get("engines") or [item.get("engine")]:
             if engine:
                 contributed[engine] = contributed.get(engine, 0) + 1
+    failed = {engine for engine, _ in data.get("unresponsive_engines", [])}
     for engine, reason in data.get("unresponsive_engines", []):
         if engine not in contributed:
             await log_search_call(
@@ -275,6 +307,14 @@ async def _log_searxng_engines(config: Config, data: dict, elapsed_ms: int, quer
             config, engine, "scrape", "ok",
             result_count=count, elapsed_ms=elapsed_ms, query=query,
         )
+    # An explicitly selected trial engine that returned neither a result nor
+    # an error was still attempted and must count toward its rolling cap.
+    for engine in selected_engines or ():
+        if engine not in contributed and engine not in failed:
+            await log_search_call(
+                config, engine, "scrape", "empty",
+                result_count=0, elapsed_ms=elapsed_ms, query=query,
+            )
     if not contributed and not data.get("unresponsive_engines"):
         await log_search_call(config, "searxng", "scrape", "empty", result_count=0, elapsed_ms=elapsed_ms, query=query)
 
@@ -324,8 +364,42 @@ def _rank_results(results: list[SearchResult], query: str, limit: int = 10) -> l
     return sorted(results, key=lambda result: _relevance_score(result, terms), reverse=True)[:limit]
 
 
-async def web_search(query: str, config: Config) -> list[SearchResult]:
-    """duckduckgo (via SearXNG) + Brave + Tavily, both official APIs. brave/
+def _wikidata_entity_query(query: str, wikipedia_results: list[SearchResult]) -> str | None:
+    """Turn a general web query into the label-shaped input Wikidata expects.
+
+    Wikipedia full-text search is good at mapping a sentence to a page;
+    Wikidata's wbsearchentities endpoint is good at mapping that page title
+    to an entity. Only use a Wikipedia title with real lexical overlap. A
+    naturally short query can already be an entity label and is safe as a
+    fallback. Long sentences without a relevant page are skipped rather than
+    spending an API call that is structurally guaranteed to return nothing.
+    """
+    # Prefer an explicit proper name from the original query. Wikipedia can
+    # rank a secondary detail above the subject (for example, mapping a claim
+    # about Masayoshi Son to UC Berkeley because it mentions university).
+    proper_names = []
+    for match in _PROPER_NAME_RE.finditer(query):
+        candidate = re.sub(r"['’]s$", "", match.group(0)).strip()
+        first_word = candidate.split(maxsplit=1)[0].casefold()
+        if first_word not in _GENERIC_SENTENCE_OPENERS:
+            proper_names.append((match.start(), candidate))
+    if proper_names:
+        return min(proper_names)[-1]
+
+    terms = _query_terms(query)
+    ranked_wikipedia = _rank_results(wikipedia_results, query)
+    for result in ranked_wikipedia:
+        if _is_relevant(result, terms):
+            return result.title.strip() or None
+    if 0 < len(terms) <= 4:
+        return query.strip() or None
+    return None
+
+
+async def web_search(
+    query: str, config: Config, *, include_alternate_query_engines: bool = False,
+) -> list[SearchResult]:
+    """SearXNG + Brave + Serper as primary search, with Tavily as fallback. brave/
     google cse/startpage are disabled in searxng/settings.yml -- they got
     rate limited/CAPTCHA'd under sustained query volume and have no documented
     quota to plan around, unlike Brave's and Tavily's metered APIs.
@@ -339,6 +413,27 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
         "q": query,
         "format": "json",
     }
+    duckduckgo_allowed = await providers_allowed_by_circuit_breaker(
+        config, ("duckduckgo",), max_attempts=None,
+        cooldown_hours=SEARXNG_DUCKDUCKGO_COOLDOWN_HOURS,
+    )
+    selected_engines = tuple(
+        engine for engine in SEARXNG_BASE_ENGINES
+        if engine != "duckduckgo" or engine in duckduckgo_allowed
+    )
+    if include_alternate_query_engines:
+        recovered = await providers_allowed_by_circuit_breaker(
+            config, SEARXNG_RECOVERED_ENGINES,
+            max_attempts=SEARXNG_ALTERNATE_QUERY_ENGINE_MAX_ATTEMPTS,
+            cooldown_hours=SEARXNG_ALTERNATE_QUERY_ENGINE_COOLDOWN_HOURS,
+        )
+        selected_engines += tuple(
+            engine for engine in SEARXNG_RECOVERED_ENGINES if engine in recovered
+        )
+    # Always select the base engines explicitly. Otherwise omitting
+    # DuckDuckGo here would merely make SearXNG's default configuration add it
+    # back, defeating the cooldown while Bing and Mojeek remain healthy.
+    params["engines"] = ",".join(selected_engines)
     await _throttle_searxng(config.searxng.min_interval_seconds)
     t = timer()
     try:
@@ -355,7 +450,9 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
         # the direct providers below when it is unavailable.
         data = {"results": []}
 
-    await _log_searxng_engines(config, data, t.elapsed_ms, query)
+    await _log_searxng_engines(
+        config, data, t.elapsed_ms, query, selected_engines=selected_engines,
+    )
 
     results = []
     for item in data.get("results", [])[:10]:
@@ -382,19 +479,23 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
         )
     results = _merge(results, wiki_results)
 
-    t = timer()
-    try:
-        wikidata_results = await _wikidata_api_search(query, config.wikipedia.contact)
-        await log_search_call(
-            config, "wikidata_api", "api", "ok" if wikidata_results else "empty",
-            result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=query,
-        )
-    except httpx.HTTPError as e:
-        wikidata_results = []
-        await log_search_call(
-            config, "wikidata_api", "api", "error",
-            error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
-        )
+    wikidata_query = _wikidata_entity_query(query, wiki_results)
+    wikidata_results = []
+    if wikidata_query:
+        t = timer()
+        try:
+            wikidata_results = await _wikidata_api_search(
+                wikidata_query, config.wikipedia.contact,
+            )
+            await log_search_call(
+                config, "wikidata_api", "api", "ok" if wikidata_results else "empty",
+                result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=wikidata_query,
+            )
+        except httpx.HTTPError as e:
+            await log_search_call(
+                config, "wikidata_api", "api", "error",
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=wikidata_query,
+            )
     results = _merge(results, wikidata_results)
 
     if config.brave.api_key or config.brave.fallback_api_key:
@@ -402,6 +503,25 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
         # already returned rather than losing the whole search -- each
         # attempt is logged inside _brave_search_layered.
         results = _merge(results, await _brave_search_layered(query, config))
+
+    if config.serper.api_key:
+        # Serper's 50k-search allowance makes it a primary provider alongside
+        # Bing/SearXNG and Brave, not a last-resort fallback. Its failure is
+        # isolated like every other provider so the combined search survives.
+        t = timer()
+        try:
+            serper_results = await _serper_api_search(query, config.serper.api_key)
+            await log_search_call(
+                config, "serper", "api", "ok" if serper_results else "empty",
+                result_count=len(serper_results), elapsed_ms=t.elapsed_ms, query=query,
+            )
+        except httpx.HTTPError as e:
+            serper_results = []
+            await log_search_call(
+                config, "serper", "api", "error",
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+            )
+        results = _merge(results, serper_results)
 
     if sum(_is_relevant(result, terms) for result in results) < MIN_RESULTS_BEFORE_TAVILY_FALLBACK and config.tavily.api_key:
         t = timer()
@@ -421,22 +541,6 @@ async def web_search(query: str, config: Config) -> list[SearchResult]:
             )
         results = _merge(results, tavily_results)
 
-    if sum(_is_relevant(result, terms) for result in results) < MIN_RESULTS_BEFORE_SERPER_FALLBACK and config.serper.api_key:
-        t = timer()
-        try:
-            serper_results = await _serper_api_search(query, config.serper.api_key)
-            await log_search_call(
-                config, "serper", "api", "ok" if serper_results else "empty",
-                result_count=len(serper_results), elapsed_ms=t.elapsed_ms, query=query,
-            )
-        except httpx.HTTPError as e:
-            serper_results = []
-            await log_search_call(
-                config, "serper", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
-            )
-        results = _merge(results, serper_results)
-
     return _rank_results(results, query)
 
 
@@ -453,11 +557,22 @@ async def check_providers_now(config: Config) -> dict:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(
-                f"{config.searxng.url.rstrip('/')}/search", params={"q": probe, "format": "json"},
+                f"{config.searxng.url.rstrip('/')}/search",
+                params={
+                    "q": probe,
+                    "format": "json",
+                    # Do not rely on SearXNG defaults here. Wikipedia and
+                    # Wikidata scrape engines are retired; their direct APIs
+                    # are checked separately below.
+                    "engines": ",".join(SEARXNG_BASE_ENGINES),
+                },
             )
             resp.raise_for_status()
             data = resp.json()
-        await _log_searxng_engines(config, data, t.elapsed_ms, probe)
+        await _log_searxng_engines(
+            config, data, t.elapsed_ms, probe,
+            selected_engines=SEARXNG_BASE_ENGINES,
+        )
         contributed: dict[str, int] = {}
         for item in data.get("results", []):
             for engine in item.get("engines") or [item.get("engine")]:
@@ -490,9 +605,17 @@ async def check_providers_now(config: Config) -> dict:
         await log_search_call(config, "wikidata_api", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
         out["wikidata_api"] = {"responding": False, "result_count": 0, "error": str(e)}
 
+    primary_brave_paused = await provider_monthly_quota_exhausted(config, "brave")
     for provider, api_key in (("brave", config.brave.api_key), ("brave_fallback", config.brave.fallback_api_key)):
         if not api_key:
             out[provider] = {"responding": None, "result_count": 0, "error": "no api key configured"}
+            continue
+        if provider == "brave" and primary_brave_paused:
+            out[provider] = {
+                "responding": None,
+                "result_count": 0,
+                "error": "monthly quota exhausted; paused until next month",
+            }
             continue
         t = timer()
         try:

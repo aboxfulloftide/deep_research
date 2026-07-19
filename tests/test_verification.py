@@ -1,8 +1,24 @@
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from deep_research.config import Config
 from deep_research.kb import verification as v
+from deep_research.kb.claim_filters import is_review_excluded_claim
+from deep_research.models import SearchResult
+
+
+def test_assessment_search_results_are_rejected_without_blocking_legitimate_exam_reporting():
+    assert v._is_assessment_search_result(SearchResult(
+        title="Exam 16: Partnership Accounting | Examlex",
+        url="https://examlexpp.work/exams/69506-partnership-accounting/2",
+        snippet="Multiple choice answers",
+    )) is True
+    assert v._is_assessment_search_result(SearchResult(
+        title="State reports bar exam passage rates fell in 2025",
+        url="https://news.example.org/legal/bar-exam-rates",
+        snippet="A report on annual passage rates.",
+    )) is False
 
 
 async def test_batch_verification_uses_the_dedicated_verifier_endpoint(monkeypatch):
@@ -235,6 +251,231 @@ async def test_classify_relationship_omits_context_line_when_absent():
     assert "Additional context" not in seen["content"]
 
 
+async def test_classify_relationship_does_not_turn_malformed_number_into_contradiction():
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": json.dumps({
+                "relationship": "contradicts",
+                "confidence": 0.95,
+                "reasoning": "5,48 must mean 5,480, which differs from 5,048.62.",
+            })}}]}
+
+    result = await v._classify_relationship(
+        FakeLLM(),
+        "The NASDAQ peaked at 5,48 on March 10th, 2000.",
+        "The Nasdaq reached 5,048.62 in 2000.",
+    )
+
+    assert result == {
+        "relationship": "unrelated",
+        "confidence": 0.0,
+        "reasoning": "A malformed numeric grouping cannot establish a contradiction.",
+    }
+
+
+async def test_classify_relationship_preserves_real_well_formed_numeric_contradiction():
+    class FakeLLM:
+        async def chat(self, messages):
+            if "final gate" in messages[0]["content"]:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "confirmed": True,
+                    "confidence": 0.98,
+                    "reasoning": "Both claims give incompatible values for the same peak on the same date.",
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "relationship": "contradicts",
+                "confidence": 0.95,
+                "reasoning": "The two well-formed values differ.",
+            })}}]}
+
+    result = await v._classify_relationship(
+        FakeLLM(),
+        "The NASDAQ peaked at 5,480 on March 10th, 2000.",
+        "The Nasdaq reached 5,048.62 in 2000.",
+    )
+
+    assert result["relationship"] == "contradicts"
+
+
+async def test_classify_relationship_rejects_false_chronological_contradiction():
+    calls = 0
+
+    class FakeLLM:
+        async def chat(self, messages):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "relationship": "contradicts",
+                    "confidence": 0.95,
+                    "reasoning": "The first pass incorrectly reversed the chronology.",
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "confirmed": False,
+                "confidence": 0.99,
+                "reasoning": "A rate change in 1916 is compatible with no tax before 1913.",
+            })}}]}
+
+    result = await v._classify_relationship(
+        FakeLLM(),
+        "The United States had no income tax until 1913.",
+        "The top income tax rate was raised to 15% in 1916.",
+    )
+
+    assert calls == 2
+    assert result == {
+        "relationship": "unrelated",
+        "confidence": 0.99,
+        "reasoning": "A rate change in 1916 is compatible with no tax before 1913.",
+    }
+
+
+async def test_classify_relationship_requires_confident_second_pass():
+    class FakeLLM:
+        async def chat(self, messages):
+            if "final gate" in messages[0]["content"]:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "confirmed": True,
+                    "confidence": 0.4,
+                    "reasoning": "The time scope is unclear.",
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "relationship": "contradicts",
+                "confidence": 0.95,
+                "reasoning": "The values differ.",
+            })}}]}
+
+    result = await v._classify_relationship(
+        FakeLLM(), "Revenue was $5 million.", "Revenue was $8 million."
+    )
+
+    assert result["relationship"] == "unrelated"
+    assert result["confidence"] == 0.4
+
+
+async def test_classify_relationship_never_links_subjectless_cost_claims():
+    class FakeLLM:
+        async def chat(self, messages):
+            raise AssertionError("subjectless claims should be rejected before the model call")
+
+    result = await v._classify_relationship(
+        FakeLLM(),
+        "The total cost had risen to 23 million.",
+        "It cost $1.4 billion",
+    )
+
+    assert result == {
+        "relationship": "unrelated",
+        "confidence": 1.0,
+        "reasoning": "At least one measurement claim has no identifiable subject.",
+    }
+
+
+async def test_classify_relationship_never_links_unresolved_personal_pronouns():
+    class FakeLLM:
+        async def chat(self, messages):
+            raise AssertionError("unresolved pronouns should be rejected before the model call")
+
+    result = await v._classify_relationship(
+        FakeLLM(),
+        "He retired with a $417 million severance package.",
+        "The largest severance package is over one billion dollars.",
+    )
+
+    assert result["relationship"] == "unrelated"
+    assert result["confidence"] == 1.0
+
+
+def test_disjoint_decades_are_separate_time_scopes():
+    assert v._has_disjoint_time_scopes(
+        "Households in the 1980s were significantly smaller and accommodated more people.",
+        "Households in the 1950s and 1960s were much larger.",
+    ) is True
+    assert v._has_disjoint_time_scopes(
+        "Households in the 1960s were large.",
+        "Households in the 1960s often included two parents and children.",
+    ) is False
+
+
+def test_explicit_cross_period_comparison_is_not_short_circuited():
+    assert v._has_disjoint_time_scopes(
+        "Households became smaller from the 1960s to the 1980s.",
+        "Households in the 1950s were larger than in the 1980s.",
+    ) is False
+
+
+async def test_classify_relationship_skips_disjoint_decades_before_model_call():
+    class FakeLLM:
+        async def chat(self, messages):
+            raise AssertionError("disjoint periods should be rejected before the model call")
+
+    result = await v._classify_relationship(
+        FakeLLM(),
+        "Households in the 1980s were significantly smaller and accommodated more people on average.",
+        "Households in the 1950s and 1960s were much larger, often comprised of two parents with children.",
+    )
+
+    assert result == {
+        "relationship": "unrelated",
+        "confidence": 1.0,
+        "reasoning": "The claims describe separate, non-overlapping time periods.",
+    }
+
+
+def test_dated_nobody_wants_to_work_refrain_is_review_excluded():
+    for text in (
+        "In 1952, nobody wanted to work.",
+        "In 1979, no one wanted to work anymore.",
+        "In 2014, nobody wants to work.",
+    ):
+        assert is_review_excluded_claim(text) is True
+
+    assert is_review_excluded_claim(
+        "In 2022, a survey found that one in five executives said no one wants to work anymore."
+    ) is False
+
+
+async def test_review_excluded_refrain_skips_relationship_model_call():
+    class FakeLLM:
+        async def chat(self, messages):
+            raise AssertionError("review-excluded claims should not reach the model")
+
+    result = await v._classify_relationship(
+        FakeLLM(),
+        "In 1952, nobody wanted to work.",
+        "Job opportunities were plentiful but workers had to fight to get hired.",
+    )
+
+    assert result["relationship"] == "unrelated"
+    assert result["confidence"] == 1.0
+
+
+def test_entity_overlap_rejects_parallel_claims_about_different_empires():
+    roman = [
+        {"name": "Roman Empire", "type": "organization"},
+        {"name": "Emperor Trajan", "type": "person"},
+        {"name": "Empire", "type": "concept"},
+    ]
+    mughal = [{"name": "Mughal Empire", "type": "organization"}]
+
+    assert v._entity_mentions_overlap(roman, mughal) is False
+
+
+def test_entity_overlap_allows_exact_and_expanded_name_matches():
+    assert v._entity_mentions_overlap(
+        [{"name": "Roman Empire", "type": "organization"}],
+        [{"name": "Roman Empire", "type": "concept"}],
+    ) is True
+    assert v._entity_mentions_overlap(
+        [{"name": "Trajan", "type": "person"}],
+        [{"name": "Emperor Trajan", "type": "person"}],
+    ) is True
+
+
+def test_missing_entity_metadata_preserves_model_fallback():
+    assert v._entity_mentions_overlap([], [{"name": "Roman Empire", "type": "organization"}]) is True
+
+
 # -- _suggest_search_query: repeating a failed query wastes the retry --------
 
 async def test_suggest_search_query_uses_llm_suggestion():
@@ -262,6 +503,13 @@ async def test_suggest_search_query_falls_back_to_claim_text_on_empty_query():
 
     result = await v._suggest_search_query(FakeLLM(), "Some claim text.", ["Some claim text."])
     assert result == "Some claim text."
+
+
+def test_only_meaningfully_different_generated_query_is_alternate():
+    claim = "The Nasdaq peaked in March 2000."
+
+    assert v._is_alternate_search_query(claim, "NASDAQ March 2000 historical peak") is True
+    assert v._is_alternate_search_query(claim, "  the NASDAQ peaked in March 2000. ") is False
 
 
 async def test_suggest_search_query_includes_context_in_the_prompt():

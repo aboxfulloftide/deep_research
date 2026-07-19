@@ -1,0 +1,12 @@
+[Unit]
+Description=Deep Research nightly knowledge-base verification sweep
+Wants=network-online.target deep-research.service
+After=network-online.target deep-research.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/matheau/code/deep_research
+ExecStart=/usr/bin/timeout 8h /home/matheau/code/deep_research/.venv/bin/python -m cli.kb verify-unverified --trigger cron
+TimeoutStartSec=8h 5min
+StandardOutput=append:/home/matheau/.local/share/deep_research/logs/verify-unverified.log
+StandardError=append:/home/matheau/.local/share/deep_research/logs/verify-unverified.log

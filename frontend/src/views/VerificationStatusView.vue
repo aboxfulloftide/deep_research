@@ -127,7 +127,7 @@ const statusColors = {
 }
 
 function jobLabel(job) {
-  return ({ source_pipeline: 'Source ingest', source_verify: 'Source verification', topic_verify: 'Topic verification', claim_verify: 'Claim verification', verification_sweep: 'Verification sweep', playlist_poll: 'Playlist ingest', ad_sweep: 'Ad screening', contradiction_triage: 'Contradiction triage', counter_evidence: 'Counter-evidence', topic_discovery: 'Topic discovery', model_experiment: 'Model experiment' })[job.job_type] || job.job_type
+  return ({ source_pipeline: 'Source ingest', source_verify: 'Source verification', topic_verify: 'Topic verification', claim_verify: 'Claim verification', verification_sweep: 'Verification sweep', playlist_poll: 'Playlist ingest', ad_sweep: 'Ad screening', claim_resolution_sweep: 'Claim duplicate cleanup', entity_resolution_sweep: 'Entity duplicate cleanup', contradiction_triage: 'Contradiction triage', counter_evidence: 'Counter-evidence', topic_discovery: 'Topic discovery', model_experiment: 'Model experiment' })[job.job_type] || job.job_type
 }
 
 function formatProgress(job) {
@@ -142,6 +142,8 @@ const STAGE_PROGRESS = {
   verification_sweep: { queued: 0, verify: 55, complete: 100 },
   playlist_poll: { queued: 0, discover: 45, complete: 100 },
   ad_sweep: { queued: 0, ad_check: 55, complete: 100 },
+  claim_resolution_sweep: { queued: 0, resolve_duplicates: 55, complete: 100 },
+  entity_resolution_sweep: { queued: 0, resolve_entities: 55, complete: 100 },
   contradiction_triage: { queued: 0, triage: 55, complete: 100 },
   counter_evidence: { queued: 0, counter_evidence: 55, complete: 100 },
   topic_discovery: { queued: 0, discover: 55, complete: 100 },
@@ -153,7 +155,7 @@ function jobProgressPercent(job) {
 }
 
 function stageLabel(job) {
-  return ({ trust: 'Assessing source', chunk: 'Preparing content', extract: 'Extracting claims', ad_check: 'Screening ads', attach: 'Connecting topic', verify: 'Checking evidence', report: 'Refreshing report', discover: 'Discovering videos', triage: 'Reviewing contradiction', counter_evidence: 'Finding counter-evidence', gather_sources: 'Gathering test sources', evaluate: 'Running model test', waiting_for_idle: 'Waiting for idle GPU', waiting_for_gpu: 'Waiting for idle GPU', swapping_model: 'Temporarily loading test model', restoring_model: 'Restoring primary model', queued: 'Waiting in queue' })[job.stage] || job.stage
+  return ({ trust: 'Assessing source', chunk: 'Preparing content', extract: 'Extracting claims', ad_check: 'Screening ads', resolve_duplicates: 'Resolving duplicate claims', resolve_entities: 'Resolving duplicate entities', attach: 'Connecting topic', verify: 'Checking evidence', report: 'Refreshing report', discover: 'Discovering videos', triage: 'Reviewing contradiction', counter_evidence: 'Finding counter-evidence', queue_counter_evidence: 'Queueing counter-views', gather_sources: 'Gathering test sources', evaluate: 'Running model test', waiting_for_idle: 'Waiting for idle GPU', waiting_for_gpu: 'Waiting for idle GPU', swapping_model: 'Temporarily loading test model', restoring_model: 'Restoring primary model', queued: 'Waiting in queue' })[job.stage] || job.stage
 }
 
 function queuePosition(job) {

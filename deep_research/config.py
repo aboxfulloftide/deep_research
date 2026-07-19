@@ -26,7 +26,7 @@ class SearXNGConfig(BaseModel):
     url: str = "http://localhost:8888"
     # Minimum gap enforced between consecutive SearXNG calls (see
     # search.py's _throttle_searxng), even across concurrent verification
-    # tasks -- duckduckgo/mojeek/wikipedia have no documented rate limit but
+    # tasks -- duckduckgo/mojeek have no documented rate limit but
     # visibly start CAPTCHA'ing/429ing under rapid-fire bursts. This isn't a
     # workaround for that (see the CAPTCHA-solving conversation) -- it's
     # just not hitting them faster than they're willing to serve.
@@ -54,17 +54,15 @@ class TavilyConfig(BaseModel):
     # General-purpose fallback (not tied to one SearXNG engine like brave is)
     # -- used when SearXNG's combined results are thin, regardless of which
     # engine(s) failed (google cse, startpage, or a fully dead SearXNG). Both
-    # brave and tavily are metered at 1000 queries/month on the free tier, so
-    # this is only invoked when actually needed, not on every query.
+    # this is only invoked when the primary SearXNG + Brave + Serper layer is
+    # still thin, not on every query.
     api_key: str = ""
 
 
 class SerperConfig(BaseModel):
-    # Last-resort fallback, tried only if duckduckgo+brave+tavily are all
-    # still thin -- unlike brave/tavily's free tier, Serper's free allotment
-    # (2500 queries) is a one-time trial bucket, not a monthly recurring one,
-    # so it's deliberately kept out of the routine per-query chain to conserve
-    # it for when the other three genuinely can't find anything.
+    # Primary provider alongside SearXNG/Bing and Brave. The current account
+    # allowance is large enough for routine use; Tavily remains the fallback
+    # when the combined primary results are still thin.
     api_key: str = ""
 
 
@@ -137,6 +135,10 @@ class KBConfig(BaseModel):
     # of leaving one idle -- see HARDWARE.md's "Verification bottleneck
     # measurement" section for the concurrency test this was validated with.
     verification_concurrency: int = 2
+    # Counter-view checks can each make several local-model calls. Drain a
+    # bounded set of supported, never-checked claims after the nightly sweep
+    # rather than letting balance checks monopolize the shared worker.
+    nightly_counter_evidence_limit: int = 50
     # Report generation auto-detects the server's actual context window via
     # llama.cpp's /slots endpoint and batches (map-reduce) whatever doesn't
     # fit in one pass, rather than dropping content. This fallback is only
@@ -206,6 +208,7 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_KB_VERIFICATION_IMPORTANCE_THRESHOLD": ("kb", "verification_importance_threshold"),
         "DEEP_RESEARCH_KB_VERIFICATION_RUN_MAX_WEB_SEARCHES": ("kb", "verification_run_max_web_searches"),
         "DEEP_RESEARCH_KB_VERIFICATION_CONCURRENCY": ("kb", "verification_concurrency"),
+        "DEEP_RESEARCH_KB_NIGHTLY_COUNTER_EVIDENCE_LIMIT": ("kb", "nightly_counter_evidence_limit"),
         "DEEP_RESEARCH_KB_VERIFICATION_MAX_CHUNKS_PER_PAGE": ("kb", "verification_max_chunks_per_page"),
         "DEEP_RESEARCH_KB_REPORT_CONTEXT_FALLBACK_TOKENS": ("kb", "report_context_fallback_tokens"),
         "DEEP_RESEARCH_KB_PLAYLIST_MAX_VIDEOS_PER_RUN": ("kb", "playlist_max_videos_per_run"),

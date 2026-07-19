@@ -21,7 +21,8 @@ from deep_research.kb.decision_log import record_decision, record_undo
 from deep_research.kb.embeddings import backfill_embeddings, embed_texts
 from deep_research.kb.ingest import ingest_file, ingest_pasted_text, ingest_web_page, ingest_youtube_video
 from deep_research.kb.jobs import (
-    ProcessingJobWorker, enqueue_manual_job, enqueue_model_experiment, enqueue_model_experiment_comparison,
+    ProcessingJobWorker, enqueue_claim_resolution_sweep, enqueue_entity_resolution_sweep,
+    enqueue_manual_job, enqueue_model_experiment, enqueue_model_experiment_comparison,
     enqueue_playlist_poll, enqueue_source_pipeline,
 )
 from deep_research.kb.merge import review_and_execute
@@ -55,6 +56,12 @@ async def init_kb(cfg: Config):
         snapshot_store = SnapshotStore(cfg.kb_snapshot_dir)
         processing_worker = ProcessingJobWorker(kb_db, cfg, snapshot_store)
         await processing_worker.start()
+        # Promotion already classifies new pairs immediately. This idle pass
+        # catches candidates left by older code or a prior transient model
+        # failure without making the user revisit an unchanged ambiguous queue
+        # on every restart.
+        await enqueue_claim_resolution_sweep(kb_db)
+        await enqueue_entity_resolution_sweep(kb_db)
     except Exception as e:
         print(f"Local knowledge base unavailable ({e}); /api/kb/* routes and kb_search will not work.")
         kb_db = None
@@ -88,6 +95,10 @@ class ReviewRequest(BaseModel):
 
 class ReviewCandidateRequest(BaseModel):
     decision: str  # "accepted" | "rejected"
+
+
+class RemoveClaimRequest(BaseModel):
+    reason: str = "invalid_or_irrelevant_extraction"
 
 
 class AttachSourceRequest(BaseModel):
@@ -515,18 +526,59 @@ async def set_claim_verification_context(claim_id: str, req: VerificationContext
     )})}
 
 
+@router.post("/claims/{claim_id}/remove")
+async def remove_claim(claim_id: str, req: RemoveClaimRequest):
+    """Remove a bad extracted claim while preserving its source and an audit.
+
+    This is intentionally explicit and human-triggered: it is the escape
+    hatch for any invalid, irrelevant, assessment, or promotional material
+    that passed automated screening. The claim's evidence, metrics, topic
+    links, support edges, and every review candidate involving it are removed
+    by delete_claim_cascade.
+    """
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None:
+        raise HTTPException(404, "Claim not found")
+    evidence = await kb_db.list_claim_evidence(claim_id)
+    source_ids = list({row["source_id"] for row in evidence})
+    await record_decision(
+        kb_db, "claim_removed", "claim", claim_id, f"removed: {req.reason}",
+        related_ids=source_ids, confidence=1.0,
+        reasoning="Human removed an extracted claim from the review queue and knowledge base.",
+        parse_success=True,
+        previous_state={
+            "canonical_text": claim["canonical_text"], "status": claim["status"],
+            "source_ids": source_ids,
+        },
+        resulting_state={"removed": True, "reason": req.reason}, reversible=False,
+    )
+    await kb_db.delete_claim_cascade(claim_id)
+    return {"removed_claim_id": claim_id, "reason": req.reason}
+
+
 def _evidence_summary(rows: list[dict]) -> list[dict]:
     """Trims claim_evidence rows down to what a reviewer actually needs to
     judge a claim_duplicate/claim_contradiction candidate: which source it
-    came from and the exact quoted excerpt -- not the full evidence row."""
-    return [
-        {
+    came from, the exact quote, and a bounded window around that quote -- not
+    the full evidence row or full source chunk."""
+    summaries = []
+    for r in rows:
+        context = r.get("context_excerpt")
+        if context:
+            context = context.strip()
+            if r.get("context_truncated_start"):
+                context = f"…{context}"
+            if r.get("context_truncated_end"):
+                context = f"{context}…"
+        summaries.append({
+            "source_id": r.get("source_id"),
             "source_title": r.get("source_title") or r.get("canonical_uri"),
             "canonical_uri": r.get("canonical_uri"),
             "excerpt": r.get("excerpt_text"),
-        }
-        for r in rows
-    ]
+            "context": context,
+            "section_label": r.get("section_label"),
+        })
+    return summaries
 
 
 def _enrich_candidates(
@@ -566,12 +618,17 @@ def _enrich_candidates(
 @router.get("/resolution-candidates")
 async def list_resolution_candidates(status: str = "open", type: str | None = None, limit: int = 200):
     candidates = await kb_db.list_resolution_candidates(candidate_type=type, status=status, limit=limit)
+    counts = await kb_db.count_resolution_candidates(status=status)
     entity_ids = [c[k] for c in candidates for k in ("left_entity_id", "right_entity_id") if c.get(k)]
     claim_ids = [c[k] for c in candidates for k in ("left_claim_id", "right_claim_id") if c.get(k)]
     entities = await kb_db.get_entities_bulk(entity_ids)
     claims = await kb_db.get_claims_bulk(claim_ids)
     claims_evidence = await kb_db.get_claims_evidence_bulk(claim_ids)
-    return {"candidates": _enrich_candidates(candidates, entities, claims, claims_evidence)}
+    return {
+        "candidates": _enrich_candidates(candidates, entities, claims, claims_evidence),
+        "counts": counts,
+        "total": counts.get(type, 0) if type else sum(counts.values()),
+    }
 
 
 @router.post("/resolution-candidates/{candidate_id}/review")
@@ -1142,5 +1199,21 @@ async def trigger_verification_run_route(req: TriggerVerificationRunRequest):
 async def trigger_ad_sweep(limit: int = 10000):
     job = await enqueue_manual_job(
         kb_db, "ad_sweep", "knowledge_base", "default", payload={"limit": limit},
+    )
+    return {"status": "queued", "job": _serialize(job)}
+
+
+@router.post("/claim-resolution-sweep")
+async def trigger_claim_resolution_sweep(limit: int = 200):
+    job = await enqueue_manual_job(
+        kb_db, "claim_resolution_sweep", "knowledge_base", "default", payload={"limit": limit},
+    )
+    return {"status": "queued", "job": _serialize(job)}
+
+
+@router.post("/entity-resolution-sweep")
+async def trigger_entity_resolution_sweep(limit: int = 500):
+    job = await enqueue_manual_job(
+        kb_db, "entity_resolution_sweep", "knowledge_base", "default", payload={"limit": limit},
     )
     return {"status": "queued", "job": _serialize(job)}

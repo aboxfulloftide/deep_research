@@ -268,6 +268,19 @@ export function useApi() {
     return resp.json()
   }
 
+  async function removeClaim(claimId, reason = 'invalid_or_irrelevant_extraction') {
+    const resp = await fetch(`${API_BASE}/kb/claims/${claimId}/remove`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || 'Could not remove claim')
+    }
+    return resp.json()
+  }
+
   // --- Knowledge base (sources: ingest/chunk/extract/verify) ---
 
   async function fetchSources(q = '', limit = 50, includeArchived = false) {
@@ -636,7 +649,7 @@ export function useApi() {
     fetchConversationTranscript,
     fetchTopicSources, reviewClaimSuggestion, reviewSourceSuggestion,
     backfillTopic, triggerTopicVerification, fetchTopicProcessingStatus, fetchReport, generateReport,
-    fetchResolutionCandidates, reviewResolutionCandidate,
+    fetchResolutionCandidates, reviewResolutionCandidate, removeClaim,
     fetchSources, fetchSource, fetchSourceClaims, fetchSourceDecisions, fetchSourceProcessingStatus, resetSourceTrustTier, archiveSource, restoreSource,
     ingestUrl, ingestYoutube, ingestFile, ingestConversation, trackPlaylist, fetchPlaylists, fetchPlaylistVideos, deletePlaylist, checkPlaylist, ingestPlaylistBatch,
     ingestTopicUrl, ingestTopicYoutube, ingestTopicFile, cancelProcessingJob, fetchProcessingJob, fetchProcessingJobs, fetchProcessingQueue, pauseProcessingQueue, resumeProcessingQueue, moveProcessingJob, fetchModelExperimentProfiles, queueModelExperiment, retryProcessingJob,

@@ -55,6 +55,22 @@ async function showPlaylistVideos(playlist) {
   playlistVideos.value = { ...playlistVideos.value, [playlist.id]: data.videos || [] }
 }
 
+function orderedPlaylistVideos(playlistId) {
+  return [...(playlistVideos.value[playlistId] || [])].sort((a, b) => {
+    // Videos still needing ingestion are the actionable part of this list, so
+    // keep them together at the top. Within each status, newest discovery first.
+    const statusOrder = Number(!!a.ingested_at) - Number(!!b.ingested_at)
+    if (statusOrder !== 0) return statusOrder
+    return new Date(b.discovered_at || 0) - new Date(a.discovered_at || 0)
+  })
+}
+
+function playlistVideoCounts(playlistId) {
+  const videos = playlistVideos.value[playlistId] || []
+  const ingested = videos.filter(video => video.ingested_at).length
+  return { ingested, pending: videos.length - ingested }
+}
+
 async function removePlaylist(playlist) {
   await api.deletePlaylist(playlist.id)
   playlistVideos.value = Object.fromEntries(Object.entries(playlistVideos.value).filter(([id]) => id !== playlist.id))
@@ -62,13 +78,55 @@ async function removePlaylist(playlist) {
 }
 
 async function checkPlaylist(playlist) {
-  const { job } = await api.checkPlaylist(playlist.id)
-  for (let attempt = 0; attempt < 30; attempt++) {
-    await new Promise(resolve => setTimeout(resolve, 1000))
-    const status = (await api.fetchProcessingJob(job.id)).job
-    if (['completed', 'partial', 'failed', 'cancelled'].includes(status.status)) break
+  if (playlistChecks.value[playlist.id]?.active) return
+  const update = (patch) => {
+    playlistChecks.value = {
+      ...playlistChecks.value,
+      [playlist.id]: { ...(playlistChecks.value[playlist.id] || {}), ...patch },
+    }
   }
-  await showPlaylistVideos(playlist)
+  update({ active: true, state: 'queueing', message: 'Queueing playlist check…' })
+  try {
+    const { job } = await api.checkPlaylist(playlist.id)
+    for (let attempt = 0; attempt < 30; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      const status = (await api.fetchProcessingJob(job.id)).job
+      if (status.status === 'queued') {
+        const queue = (await api.fetchProcessingQueue()).queue
+        if (queue?.paused) {
+          update({ state: 'paused', message: 'Processing queue is paused, so this check has not started.' })
+          return
+        }
+        update({ state: 'queued', message: 'Playlist check is waiting in the processing queue…' })
+        continue
+      }
+      if (status.status === 'running') {
+        update({ state: 'running', message: 'Checking YouTube for new videos…' })
+        continue
+      }
+      if (status.status === 'completed') {
+        const discovered = status.progress?.discovered || 0
+        const queued = status.progress?.queued || 0
+        update({
+          state: 'completed',
+          message: discovered
+            ? `Found ${discovered} new video(s); ${queued} queued for processing.`
+            : `No new videos found; ${queued} pending video(s) queued for processing.`,
+        })
+        await showPlaylistVideos(playlist)
+        return
+      }
+      if (['partial', 'failed', 'cancelled'].includes(status.status)) {
+        update({ state: 'failed', message: status.error_message || `Playlist check ${status.status}.` })
+        return
+      }
+    }
+    update({ state: 'running', message: 'Playlist check is still running; its results will appear when complete.' })
+  } catch (error) {
+    update({ state: 'failed', message: error?.message || 'Could not check playlist.' })
+  } finally {
+    update({ active: false })
+  }
 }
 
 async function ingestPlaylistBatch(playlist) {
@@ -136,6 +194,7 @@ const sweepingAds = ref(false)
 const adSweepJob = ref(null)
 const playlists = ref([])
 const playlistVideos = ref({})
+const playlistChecks = ref({})
 
 async function runBackfillEmbeddings() {
   backfilling.value = true
@@ -410,8 +469,81 @@ const lifecycleClasses = {
     <details v-if="playlists.length" class="mt-6 text-sm">
       <summary class="cursor-pointer text-gray-600 dark:text-gray-300">Tracked playlists ({{ playlists.length }})</summary>
       <div v-for="playlist in playlists" :key="playlist.id" class="mt-2 p-3 border rounded border-gray-200 dark:border-gray-700">
-        <div class="flex justify-between gap-2"><span>{{ playlist.title || playlist.url }}</span><span class="flex gap-2"><button @click="checkPlaylist(playlist)" class="text-blue-600 hover:underline">Check playlist</button><button @click="ingestPlaylistBatch(playlist)" class="text-blue-600 hover:underline">Ingest next batch</button><button @click="showPlaylistVideos(playlist)" class="text-blue-600 hover:underline">Show videos</button><button @click="removePlaylist(playlist)" class="text-red-600 hover:underline">Remove</button></span></div>
-        <p v-for="video in playlistVideos[playlist.id] || []" :key="video.video_id" class="text-xs text-gray-500 mt-1">{{ video.title || video.video_id }} — {{ video.ingested_at ? 'ingested' : 'discovered' }}</p>
+        <div class="flex justify-between gap-2"><span>{{ playlist.title || playlist.url }}</span><span class="flex gap-2"><button @click="checkPlaylist(playlist)" :disabled="playlistChecks[playlist.id]?.active" class="text-blue-600 hover:underline disabled:opacity-50 disabled:no-underline">{{ playlistChecks[playlist.id]?.active ? 'Checking…' : 'Check playlist' }}</button><button @click="ingestPlaylistBatch(playlist)" class="text-blue-600 hover:underline">Ingest next batch</button><button @click="showPlaylistVideos(playlist)" class="text-blue-600 hover:underline">Show videos</button><button @click="removePlaylist(playlist)" class="text-red-600 hover:underline">Remove</button></span></div>
+        <p
+          v-if="playlistChecks[playlist.id]?.message"
+          class="mt-1 text-xs"
+          :class="playlistChecks[playlist.id]?.state === 'failed'
+            ? 'text-red-600 dark:text-red-400'
+            : playlistChecks[playlist.id]?.state === 'paused'
+              ? 'text-amber-600 dark:text-amber-400'
+              : 'text-gray-500 dark:text-gray-400'"
+        >
+          {{ playlistChecks[playlist.id].message }}
+          <RouterLink
+            v-if="playlistChecks[playlist.id]?.state === 'paused'"
+            :to="{ name: 'verification-status' }"
+            class="ml-1 text-blue-600 dark:text-blue-400 hover:underline"
+          >
+            Open queue controls
+          </RouterLink>
+        </p>
+        <div
+          v-if="playlistVideos[playlist.id]?.length"
+          class="mt-3 overflow-hidden rounded-md border border-gray-200 dark:border-gray-700"
+        >
+          <div class="flex items-center justify-between gap-3 px-3 py-2 bg-gray-100 dark:bg-gray-900/60 text-xs text-gray-600 dark:text-gray-300">
+            <span class="font-medium">Videos</span>
+            <span class="tabular-nums text-gray-500 dark:text-gray-400">
+              {{ playlistVideoCounts(playlist.id).pending }} pending · {{ playlistVideoCounts(playlist.id).ingested }} ingested
+            </span>
+          </div>
+          <div class="divide-y divide-gray-200 dark:divide-gray-700/80">
+            <div
+              v-for="video in orderedPlaylistVideos(playlist.id)"
+              :key="video.video_id"
+              class="flex items-center justify-between gap-3 px-3 py-2.5 border-l-2"
+              :class="video.ingested_at
+                ? 'border-l-transparent bg-gray-50/80 dark:bg-gray-900/25'
+                : 'border-l-amber-400 bg-white dark:bg-gray-800'"
+            >
+              <div class="min-w-0">
+                <a
+                  :href="`https://www.youtube.com/watch?v=${video.video_id}`"
+                  target="_blank"
+                  rel="noopener"
+                  class="block truncate hover:underline"
+                  :class="video.ingested_at
+                    ? 'text-gray-500 dark:text-gray-400'
+                    : 'font-medium text-gray-900 dark:text-gray-100'"
+                >
+                  {{ video.title || video.video_id }}
+                </a>
+                <p class="mt-0.5 text-[11px] text-gray-400 dark:text-gray-500">
+                  Discovered {{ formatDate(video.discovered_at) }}
+                  <span v-if="video.source_title"> · {{ video.source_title }}</span>
+                </p>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <RouterLink
+                  v-if="video.source_id"
+                  :to="{ name: 'source', params: { id: video.source_id } }"
+                  class="text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  View source
+                </RouterLink>
+                <span
+                  class="px-2 py-0.5 rounded-full text-[10px] font-medium uppercase tracking-wide"
+                  :class="video.ingested_at
+                    ? 'bg-gray-200/70 dark:bg-gray-700/60 text-gray-500 dark:text-gray-400'
+                    : 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300'"
+                >
+                  {{ video.ingested_at ? 'Ingested' : 'Pending' }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
         <p v-if="playlistVideos[playlist.id]?.length === 0" class="text-xs text-gray-500 mt-1">No videos discovered yet. Check the playlist to start its first scan.</p>
       </div>
     </details>

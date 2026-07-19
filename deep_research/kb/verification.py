@@ -33,9 +33,11 @@ from datetime import datetime, timedelta, timezone
 from deep_research.config import Config, LLMConfig
 from deep_research.kb.artifacts import build_artifact_for_version
 from deep_research.kb.canonical import is_social_media_domain
+from deep_research.kb.claim_filters import is_review_excluded_claim
+from deep_research.kb.chunking import normalize_name
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.embeddings import cosine, embed_texts
-from deep_research.kb.extraction import detect_model, run_extraction
+from deep_research.kb.extraction import detect_model, has_unresolved_subject, run_extraction
 from deep_research.kb.ingest import ingest_web_page
 from deep_research.kb.resolution import resolve_and_promote
 from deep_research.kb.storage import SnapshotStore
@@ -52,13 +54,151 @@ Classify the relationship as exactly one of:
 
 Do the arithmetic/unit conversion yourself if needed before deciding — do not assume different-looking numbers contradict without checking whether they are equivalent.
 
+Different points on a timeline are normally compatible. A rate, count, or
+policy can change between years. For example, "there was no income tax until
+1913" and "the income-tax rate was raised in 1916" can both be true: the
+second event happened after the boundary in the first claim. Only use
+"contradicts" when both claims address the same entity, the same attribute or
+event, and overlapping time scope, and they cannot both be true.
+
+A number with malformed or ambiguous digit grouping (for example `5,48`) is
+not reliable evidence of a different value. Do not invent a completion such
+as `5,480` or `5,488`, and do not classify a pair as contradictory based only
+on that malformed number.
+
 If additional context is given, it is a human's note about what specifically to look for -- weigh whether the second claim actually addresses that angle, not just whether it's topically similar to the first claim.
 
 Return ONLY a JSON object: {"relationship": "supports"|"contradicts"|"unrelated", "confidence": 0.0-1.0, "reasoning": "one short sentence"}
 """
 
+CONTRADICTION_CONFIRMATION_SYSTEM_PROMPT = """/no_think
+You are the conservative final gate for a proposed contradiction between two
+factual claims. The first comparison pass said they conflict. Independently
+check whether that is logically true.
+
+A real contradiction requires the same entity or clearly identified subject,
+the same attribute/event, and overlapping time scope. Claims about different
+years, different measures, different unnamed subjects, or a chronological
+sequence are compatible or unrelated—not contradictions. Rates and totals can
+change over time. In particular, "no X until YEAR" is compatible with X
+existing or changing after YEAR; do not reverse the chronology.
+
+Set confirmed=false whenever both claims can be true at the same time, even if
+they share keywords or discuss the same broad topic. Set confirmed=true only
+when you can identify the specific mutually exclusive fact.
+
+Return ONLY a JSON object: {"confirmed": true|false, "confidence": 0.0-1.0, "reasoning": "one short sentence"}
+"""
+
+CONTRADICTION_CONFIRMATION_THRESHOLD = 0.7
+
 # Only candidates at least this similar are worth an LLM comparison pass at all.
 CANDIDATE_SIMILARITY_FLOOR = 0.80
+
+# English-language source text should group thousands in three-digit blocks.
+# Tokens such as ``5,48`` normally come from captions/OCR dropping a digit,
+# but the missing digit cannot be reconstructed safely. Such a token may be
+# useful for retrieval; it is not sound evidence that a well-formed value in
+# another source is false.
+_COMMA_GROUPED_NUMBER_RE = re.compile(r"(?<![\d,])\d+(?:,\d+)+(?:\.\d+)?(?![\d,])")
+_ASSESSMENT_RESULT_TITLE_RE = re.compile(
+    r"\b(?:exam\s+\d+|multiple[- ]choice|test\s+bank|answer\s+key|"
+    r"quiz\s+answers?|flashcards?)\b",
+    re.IGNORECASE,
+)
+_ASSESSMENT_RESULT_URL_RE = re.compile(
+    r"/(?:exams?|quizzes?|test[-_]?banks?|answer[-_]?keys?|flashcards?)(?:[/_-]|$)",
+    re.IGNORECASE,
+)
+_GENERIC_ENTITY_NAMES = {
+    "amount", "assets", "capital", "company", "cost", "country", "empire",
+    "government", "he", "her", "him", "his", "it", "market", "price",
+    "rate", "she", "state", "tax", "they", "value",
+}
+_DECADE_RE = re.compile(r"\b((?:18|19|20)\d0)s\b", re.IGNORECASE)
+_YEAR_RE = re.compile(r"\b((?:18|19|20)\d{2})\b")
+_CROSS_PERIOD_COMPARISON_RE = re.compile(
+    r"\b(?:from\b.{0,40}\bto|between\b.{0,40}\band|compared\s+(?:with|to)|"
+    r"than\s+(?:in|during)|since|until|over\s+the\s+(?:period|decades?|years?))\b",
+    re.IGNORECASE,
+)
+
+
+def _has_malformed_numeric_grouping(text: str) -> bool:
+    for token in _COMMA_GROUPED_NUMBER_RE.findall(text):
+        integer_part = token.split(".", 1)[0]
+        groups = integer_part.split(",")
+        if len(groups[0]) > 3 or any(len(group) != 3 for group in groups[1:]):
+            return True
+    return False
+
+
+def _is_assessment_search_result(result) -> bool:
+    """Reject obvious answer-bank pages before spending fetch/LLM budget."""
+    return bool(
+        _ASSESSMENT_RESULT_TITLE_RE.search(result.title or "")
+        or _ASSESSMENT_RESULT_URL_RE.search(result.url or "")
+    )
+
+
+def _meaningful_entity_names(entities: list[dict]) -> set[str]:
+    names = {
+        normalize_name(str(entity.get("name") or ""))
+        for entity in entities
+        if isinstance(entity, dict) and entity.get("name")
+    }
+    return {name for name in names if name and name not in _GENERIC_ENTITY_NAMES}
+
+
+def _entity_mentions_overlap(left_entities: list[dict], right_entities: list[dict]) -> bool:
+    """Whether two claims identify at least one compatible named entity.
+
+    Exact names are preferred, with containment allowed for ordinary expanded
+    names ("Trajan" / "Emperor Trajan"). Generic nouns such as "empire" do
+    not make Roman Empire and Mughal Empire the same subject.
+    """
+    left = _meaningful_entity_names(left_entities)
+    right = _meaningful_entity_names(right_entities)
+    if not left or not right:
+        # Missing extraction metadata is inconclusive, not proof that subjects
+        # differ; preserve the model fallback for older/incomplete records.
+        return True
+    for left_name in left:
+        for right_name in right:
+            if left_name == right_name:
+                return True
+            shorter, longer = sorted((left_name, right_name), key=len)
+            if len(shorter) >= 4 and re.search(rf"\b{re.escape(shorter)}\b", longer):
+                return True
+    return False
+
+
+def _explicit_time_intervals(text: str) -> list[tuple[int, int]]:
+    intervals = [(int(match.group(1)), int(match.group(1)) + 9) for match in _DECADE_RE.finditer(text)]
+    intervals.extend((int(match.group(1)), int(match.group(1))) for match in _YEAR_RE.finditer(text))
+    return intervals
+
+
+def _has_disjoint_time_scopes(claim_text: str, other_text: str) -> bool:
+    """True for separate explicit periods that neither claim compares.
+
+    Parallel adjectives and metrics in different decades are separate facts,
+    not conflicting values. Wording that explicitly spans or compares periods
+    stays eligible for semantic analysis because its subject is the change
+    between those periods rather than either period in isolation.
+    """
+    if (
+        _CROSS_PERIOD_COMPARISON_RE.search(claim_text)
+        or _CROSS_PERIOD_COMPARISON_RE.search(other_text)
+    ):
+        return False
+    left = _explicit_time_intervals(claim_text)
+    right = _explicit_time_intervals(other_text)
+    if not left or not right:
+        return False
+    return all(left_end < right_start or right_end < left_start
+               for left_start, left_end in left
+               for right_start, right_end in right)
 
 
 @dataclass
@@ -104,6 +244,28 @@ def _parse_json_object(content: str) -> dict:
 
 
 async def _classify_relationship(llm: LLMClient, claim_text: str, other_text: str, context: str | None = None) -> dict:
+    if is_review_excluded_claim(claim_text) or is_review_excluded_claim(other_text):
+        return {
+            "relationship": "unrelated",
+            "confidence": 1.0,
+            "reasoning": "This dated refrain is excluded from pair review.",
+        }
+    if has_unresolved_subject(claim_text) or has_unresolved_subject(other_text):
+        # Without a named referent, two cost/value/total statements cannot be
+        # established as the same fact. Do not let embedding similarity plus
+        # different numbers manufacture a contradiction between unrelated
+        # purchases, projects, or organizations.
+        return {
+            "relationship": "unrelated",
+            "confidence": 1.0,
+            "reasoning": "At least one measurement claim has no identifiable subject.",
+        }
+    if _has_disjoint_time_scopes(claim_text, other_text):
+        return {
+            "relationship": "unrelated",
+            "confidence": 1.0,
+            "reasoning": "The claims describe separate, non-overlapping time periods.",
+        }
     user_content = f"Claim A: {claim_text}\nClaim B: {other_text}"
     if context:
         user_content += f"\nAdditional context (what to specifically look for): {context}"
@@ -114,7 +276,44 @@ async def _classify_relationship(llm: LLMClient, claim_text: str, other_text: st
     ]
     resp = await llm.chat(messages)
     content = resp["choices"][0]["message"]["content"] or ""
-    return _parse_json_object(content)
+    result = _parse_json_object(content)
+    if result.get("relationship") == "contradicts" and (
+        _has_malformed_numeric_grouping(claim_text)
+        or _has_malformed_numeric_grouping(other_text)
+    ):
+        # A verifier may still infer a plausible missing digit and confidently
+        # report a contradiction. Plausible is not enough for the destructive
+        # stop condition: one contradiction immediately marks a claim as
+        # contradicted and creates review work. Leave the comparison
+        # inconclusive; another source with a well-formed value can still
+        # establish a real conflict normally.
+        return {
+            "relationship": "unrelated",
+            "confidence": 0.0,
+            "reasoning": "A malformed numeric grouping cannot establish a contradiction.",
+        }
+    if result.get("relationship") == "contradicts":
+        confirmation_content = f"Claim A: {claim_text}\nClaim B: {other_text}"
+        if context:
+            confirmation_content += f"\nAdditional context: {context}"
+        confirmation_content += "\n\nConfirm or reject the proposed contradiction."
+        confirmation_response = await llm.chat([
+            {"role": "system", "content": CONTRADICTION_CONFIRMATION_SYSTEM_PROMPT},
+            {"role": "user", "content": confirmation_content},
+        ])
+        confirmation = _parse_json_object(
+            confirmation_response["choices"][0]["message"]["content"] or ""
+        )
+        confirmed = confirmation.get("confirmed") is True
+        confidence = confirmation.get("confidence") or 0.0
+        if not confirmed or confidence < CONTRADICTION_CONFIRMATION_THRESHOLD:
+            return {
+                "relationship": "unrelated",
+                "confidence": confidence,
+                "reasoning": confirmation.get("reasoning")
+                or "The proposed contradiction was not independently confirmed.",
+            }
+    return result
 
 
 SEARCH_QUERY_SUGGESTION_PROMPT = """/no_think
@@ -167,6 +366,16 @@ async def _suggest_search_query(
     parsed = _parse_json_object(content)
     query = parsed.get("query")
     return query.strip() if isinstance(query, str) and query.strip() else claim_text
+
+
+def _is_alternate_search_query(claim_text: str, query: str) -> bool:
+    """True only when query generation produced meaningfully different text.
+
+    Whitespace and case alone do not turn the literal claim into an alternate
+    query; this guards the parse-failure fallback in _suggest_search_query.
+    """
+    normalize = lambda value: " ".join(value.casefold().split())
+    return normalize(query) != normalize(claim_text)
 
 
 async def _rank_candidates_by_similarity(
@@ -347,9 +556,17 @@ async def _examine_candidates(
     other from being tried at all. claim["verification_context"], if set, is
     forwarded to every comparison so the LLM weighs whether a candidate
     actually addresses the angle a human flagged, not just topical overlap."""
+    entity_ids = [claim["id"], *(candidate["id"] for candidate, _ in ranked_candidates)]
+    entities_by_claim = await kb_db.get_claims_entities_bulk(entity_ids)
+    claim_entities = entities_by_claim.get(claim["id"], [])
+
     for other_claim, similarity in ranked_candidates:
         if budget.should_stop() or not budget.sources_remaining(phase):
             return
+        if not _entity_mentions_overlap(
+            claim_entities, entities_by_claim.get(other_claim["id"], []),
+        ):
+            continue
         other_source_ids = await kb_db.get_claim_source_ids(other_claim["id"])
         new_sources = other_source_ids - examined_source_ids
         if not new_sources:
@@ -492,6 +709,7 @@ async def verify_claim(
             if run_search_budget is not None and not await run_search_budget.reserve():
                 break
             budget.web_searches_used += 1
+            include_alternate_query_engines = False
             if tried_queries or verification_context:
                 # Either not the first search attempted against this claim
                 # (this run or a prior one) -- repeating the same query
@@ -504,12 +722,22 @@ async def verify_claim(
                     query = await _suggest_search_query(
                         llm, claim["canonical_text"], tried_queries, verification_context,
                     )
+                # Google CSE and Startpage are opt-in for genuinely alternate
+                # LLM-generated queries only. If parsing failed and the helper
+                # fell back to the literal claim, keep the conservative engine
+                # set instead of accidentally treating it as an alternate.
+                include_alternate_query_engines = _is_alternate_search_query(
+                    claim["canonical_text"], query,
+                )
             else:
                 query = claim["canonical_text"]
             tried_queries.append(query)
             try:
                 with _timed(timings, "web_search"):
-                    results = await web_search(query, config)
+                    results = await web_search(
+                        query, config,
+                        include_alternate_query_engines=include_alternate_query_engines,
+                    )
             except Exception:
                 break
             if not results:
@@ -518,6 +746,8 @@ async def verify_claim(
             for result in results:
                 if budget.should_stop() or not budget.sources_remaining("external"):
                     break
+                if _is_assessment_search_result(result):
+                    continue
                 with _timed(timings, "scrape_ingest"):
                     ingest_result = await ingest_web_page(
                         result.url, config, kb_db, snapshot_store, source_purpose="verification_evidence",

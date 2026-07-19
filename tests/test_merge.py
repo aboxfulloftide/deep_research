@@ -80,6 +80,21 @@ async def test_merge_entities_is_idempotent_when_already_merged(kb_db):
     assert result["loser_id"] is None  # no-op: both sides already resolve to the same entity
 
 
+async def test_merge_entities_supersedes_open_candidate_collapsed_to_self(kb_db):
+    e1, _ = await kb_db.get_or_create_entity("product", "compute server")
+    e2, _ = await kb_db.get_or_create_entity("product", "compute servers")
+    candidate, _ = await kb_db.add_entity_resolution_candidate(
+        e1["id"], e2["id"], 0.9, "substring",
+    )
+
+    await m.merge_entities(kb_db, e1["id"], e2["id"])
+
+    candidate_after = await kb_db.get_resolution_candidate(candidate["id"])
+    assert candidate_after["left_entity_id"] == candidate_after["right_entity_id"]
+    assert candidate_after["status"] == "superseded"
+    assert candidate_after["reviewed_by"] == "system_merge"
+
+
 async def test_merge_entities_follows_chain_to_ultimate_winner(kb_db):
     """If the winner of an earlier merge later becomes the loser of a
     different merge, merging into it again must land on the true final
@@ -127,6 +142,21 @@ async def test_merge_claims_picks_higher_importance_and_reassigns_evidence(kb_db
 
     evidence = await kb_db.list_claim_evidence(claim_b["id"])
     assert len(evidence) == 1  # reassigned from the loser
+
+
+async def test_merge_claims_supersedes_open_candidate_collapsed_to_self(kb_db):
+    claim_a, _ = await kb_db.get_or_create_claim("fact", "Howard Marks is an investor.")
+    claim_b, _ = await kb_db.get_or_create_claim("fact", "Howard Marks is a billionaire investor.")
+    candidate, _ = await kb_db.add_claim_resolution_candidate(
+        claim_a["id"], claim_b["id"], 0.97, "embedding_cosine",
+    )
+
+    await m.merge_claims(kb_db, claim_a["id"], claim_b["id"])
+
+    candidate_after = await kb_db.get_resolution_candidate(candidate["id"])
+    assert candidate_after["left_claim_id"] == candidate_after["right_claim_id"]
+    assert candidate_after["status"] == "superseded"
+    assert candidate_after["reviewed_by"] == "system_merge"
 
 
 # -- contradictions: status update, never a merge ----------------------------
@@ -183,3 +213,56 @@ async def test_review_and_execute_claim_contradiction_records_no_merge(kb_db):
     refreshed_a = await kb_db.get_claim(claim_a["id"])
     assert refreshed_a["status"] == "contradicted"
     assert refreshed_a["merged_into_claim_id"] is None
+
+
+async def test_rejecting_claim_contradiction_restores_unverified_status(kb_db):
+    claim_a, _ = await kb_db.get_or_create_claim("fact", "Banks stopped lending.")
+    claim_b, _ = await kb_db.get_or_create_claim("fact", "Banks once lent deposits.")
+    candidate, _ = await kb_db.add_claim_contradiction_candidate(
+        claim_a["id"], claim_b["id"], 0.85, "llm_comparison",
+    )
+    await kb_db.update_claim_verification(
+        claim_a["id"], "contradicted",
+        {"contradicts_found": 1, "contradicting_claim_ids": [claim_b["id"]]},
+    )
+
+    await m.review_and_execute(kb_db, candidate["id"], "rejected")
+
+    refreshed = await kb_db.get_claim(claim_a["id"])
+    assert refreshed["status"] == "unverified"
+    assert refreshed["verification_notes"]["contradicts_found"] == 0
+    assert refreshed["verification_notes"]["contradicting_claim_ids"] == []
+
+
+async def test_rejecting_claim_contradiction_preserves_independent_support(kb_db):
+    claim_a, _ = await kb_db.get_or_create_claim("fact", "A supported claim.")
+    claim_b, _ = await kb_db.get_or_create_claim("fact", "A supposed conflict.")
+    support, _ = await kb_db.get_or_create_claim("fact", "Independent support.")
+    await kb_db.record_claim_supports(claim_a["id"], [support["id"]])
+    candidate, _ = await kb_db.add_claim_contradiction_candidate(
+        claim_a["id"], claim_b["id"], 0.85, "llm_comparison",
+    )
+    await kb_db.update_claim_verification(claim_a["id"], "mixed", {"contradicts_found": 1})
+
+    await m.review_and_execute(kb_db, candidate["id"], "rejected")
+
+    assert (await kb_db.get_claim(claim_a["id"]))["status"] == "supported"
+
+
+async def test_rejecting_one_of_two_contradictions_keeps_remaining_conflict(kb_db):
+    claim, _ = await kb_db.get_or_create_claim("fact", "The disputed claim.")
+    other_a, _ = await kb_db.get_or_create_claim("fact", "First proposed conflict.")
+    other_b, _ = await kb_db.get_or_create_claim("fact", "Second proposed conflict.")
+    rejected, _ = await kb_db.add_claim_contradiction_candidate(
+        claim["id"], other_a["id"], 0.85, "llm_comparison",
+    )
+    await kb_db.add_claim_contradiction_candidate(
+        claim["id"], other_b["id"], 0.85, "llm_comparison",
+    )
+    await kb_db.update_claim_verification(claim["id"], "contradicted", {"contradicts_found": 2})
+
+    await m.review_and_execute(kb_db, rejected["id"], "rejected")
+
+    refreshed = await kb_db.get_claim(claim["id"])
+    assert refreshed["status"] == "contradicted"
+    assert refreshed["verification_notes"]["contradicting_claim_ids"] == [other_b["id"]]

@@ -6,6 +6,7 @@ or CLI processes cannot simultaneously drive the one local GPU/search budget.
 """
 
 import asyncio
+import hashlib
 import uuid
 
 from deep_research.config import Config
@@ -96,6 +97,88 @@ async def enqueue_model_experiment_comparison(kb_db: KBDatabase, payload: dict) 
         is_speculative=True, payload=payload, stage="waiting_for_idle",
     )
     return job
+
+
+async def enqueue_claim_resolution_sweep(
+    kb_db: KBDatabase, *, limit: int = 200,
+) -> tuple[dict | None, bool]:
+    """Queue one low-priority retry pass for the current duplicate backlog.
+
+    The open candidate IDs form the idempotency signature: restarts do not
+    repeatedly reconsider an unchanged ambiguous queue, while any newly
+    created or resolved candidate produces a fresh bounded pass.
+    """
+    candidates = await kb_db.list_resolution_candidates(
+        candidate_type="claim_duplicate", status="open", limit=limit,
+    )
+    if not candidates:
+        return None, False
+    signature = hashlib.sha256("|".join(sorted(c["id"] for c in candidates)).encode()).hexdigest()[:20]
+    return await kb_db.enqueue_processing_job(
+        "claim_resolution_sweep", "knowledge_base", subject_id="default",
+        idempotency_key=f"claim_resolution_sweep:v1:{signature}",
+        priority=-50, is_speculative=True, payload={"limit": limit},
+    )
+
+
+async def enqueue_entity_resolution_sweep(
+    kb_db: KBDatabase, *, limit: int = 500,
+) -> tuple[dict | None, bool]:
+    """Queue a low-priority local-model pass over the entity backlog."""
+    candidates = await kb_db.list_resolution_candidates(
+        candidate_type="entity_duplicate", status="open", limit=limit,
+    )
+    if not candidates:
+        return None, False
+    signature = hashlib.sha256("|".join(sorted(c["id"] for c in candidates)).encode()).hexdigest()[:20]
+    return await kb_db.enqueue_processing_job(
+        "entity_resolution_sweep", "knowledge_base", subject_id="default",
+        idempotency_key=f"entity_resolution_sweep:v1:{signature}",
+        priority=-50, is_speculative=True, payload={"limit": limit},
+    )
+
+
+async def enqueue_supported_counter_evidence(
+    kb_db: KBDatabase, *, limit: int = 50,
+) -> dict[str, int]:
+    """Queue nightly counter-views for supported, never-checked claims.
+
+    Stable per-claim keys make timer retries and service restarts idempotent.
+    The jobs remain speculative and lower priority than ingestion or an
+    explicit user request, so they drain only while the shared model is idle.
+    """
+    if limit <= 0:
+        return {"eligible": 0, "queued": 0, "already_queued": 0, "remaining": 0}
+    claims = await kb_db.list_claims(limit=10000)
+    eligible = [
+        claim for claim in claims
+        if claim["status"] == "supported"
+        and claim.get("counter_claim_checked_at") is None
+        and claim.get("merged_into_claim_id") is None
+    ]
+    eligible.sort(
+        key=lambda claim: (bool(claim.get("topics")), claim.get("importance_score") or 0),
+        reverse=True,
+    )
+    queued = 0
+    already_queued = 0
+    for claim in eligible:
+        if queued >= limit:
+            break
+        _, created = await kb_db.enqueue_processing_job(
+            "counter_evidence", "claim", subject_id=claim["id"],
+            idempotency_key=f"counter_evidence:auto:v1:{claim['id']}",
+            priority=-25, is_speculative=True, payload={"force": False},
+        )
+        if created:
+            queued += 1
+        else:
+            already_queued += 1
+    return {
+        "eligible": len(eligible), "queued": queued,
+        "already_queued": already_queued,
+        "remaining": max(len(eligible) - queued - already_queued, 0),
+    }
 
 
 class ProcessingJobWorker:
@@ -203,6 +286,12 @@ class ProcessingJobWorker:
         if job["job_type"] == "ad_sweep":
             await self._run_ad_sweep(job)
             return
+        if job["job_type"] == "claim_resolution_sweep":
+            await self._run_claim_resolution_sweep(job)
+            return
+        if job["job_type"] == "entity_resolution_sweep":
+            await self._run_entity_resolution_sweep(job)
+            return
         if job["job_type"] == "contradiction_triage":
             await self._run_contradiction_triage(job)
             return
@@ -285,6 +374,17 @@ class ProcessingJobWorker:
                 )
                 await check_claims_for_ads(self.kb_db, self.config, new_claim_ids)
                 await check_claims_against_topics(self.kb_db, self.config, new_claim_ids)
+            elif extraction.status == "unchanged":
+                # Idempotent reprocessing found a completed extraction with
+                # the same artifact/model/prompt signature. Its observations
+                # were already promoted by the original run, so there is
+                # nothing to promote again and this is a successful no-op—not
+                # a partial failure. Continue through source-level verification
+                # and reporting so an explicit rerun still refreshes aftercare.
+                await self.kb_db.update_processing_job_progress(
+                    job_id, "ad_check", {"new_claim_count": 0, "extraction_reused": True},
+                    lease_seconds=900,
+                )
             else:
                 raise RuntimeError(f"extraction ended with status {extraction.status!r}")
             if await self._cancelled(job_id):
@@ -398,11 +498,21 @@ class ProcessingJobWorker:
         payload = job.get("payload") or {}
         await self.kb_db.update_processing_job_progress(job["id"], "verify", lease_seconds=900)
         result = await run_verification_sweep(
-            self.kb_db, self.config, trigger="job_worker", threshold=payload.get("verification_threshold"),
+            self.kb_db, self.config, trigger=payload.get("trigger") or "job_worker",
+            threshold=payload.get("verification_threshold"),
             limit=payload.get("limit"), force=bool(payload.get("force")),
         )
+        counter_evidence = None
+        if payload.get("trigger") == "cron":
+            await self.kb_db.update_processing_job_progress(
+                job["id"], "queue_counter_evidence", lease_seconds=900,
+            )
+            counter_evidence = await enqueue_supported_counter_evidence(
+                self.kb_db, limit=self.config.kb.nightly_counter_evidence_limit,
+            )
         await self.kb_db.finish_processing_job(
-            job["id"], "completed", stage="complete", progress={"verification_run_id": result["run_id"]},
+            job["id"], "completed", stage="complete",
+            progress={"verification_run_id": result["run_id"], "counter_evidence": counter_evidence},
         )
 
     async def _run_ad_sweep(self, job: dict) -> None:
@@ -414,6 +524,34 @@ class ProcessingJobWorker:
         await self.kb_db.finish_processing_job(
             job["id"], "completed", stage="complete",
             progress={"claims_checked": len(candidate_ids), "claims_excluded": len(flagged)},
+        )
+
+    async def _run_claim_resolution_sweep(self, job: dict) -> None:
+        from deep_research.kb.resolution import resolve_open_claim_duplicates
+
+        await self.kb_db.update_processing_job_progress(
+            job["id"], "resolve_duplicates", lease_seconds=900,
+        )
+        result = await resolve_open_claim_duplicates(
+            self.kb_db, self.config, limit=(job.get("payload") or {}).get("limit") or 200,
+        )
+        await self.kb_db.finish_processing_job(
+            job["id"], "partial" if result["failed"] else "completed",
+            stage="complete", progress=result,
+        )
+
+    async def _run_entity_resolution_sweep(self, job: dict) -> None:
+        from deep_research.kb.resolution import resolve_open_entity_duplicates
+
+        await self.kb_db.update_processing_job_progress(
+            job["id"], "resolve_entities", lease_seconds=900,
+        )
+        result = await resolve_open_entity_duplicates(
+            self.kb_db, self.config, limit=(job.get("payload") or {}).get("limit") or 500,
+        )
+        await self.kb_db.finish_processing_job(
+            job["id"], "partial" if result["failed"] else "completed",
+            stage="complete", progress=result,
         )
 
     async def _run_contradiction_triage(self, job: dict) -> None:

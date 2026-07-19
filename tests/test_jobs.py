@@ -3,7 +3,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from deep_research.kb import decision_log
-from deep_research.kb.jobs import enqueue_manual_job, enqueue_model_experiment
+from deep_research.kb.jobs import (
+    enqueue_manual_job,
+    enqueue_model_experiment,
+    enqueue_supported_counter_evidence,
+)
 
 
 async def test_enqueue_processing_job_is_idempotent_and_leases_once(kb_db):
@@ -103,6 +107,37 @@ async def test_explicit_user_actions_get_separate_durable_jobs(kb_db):
     assert {job["id"] for job in await kb_db.list_processing_jobs(source_id=source["id"])} == {first["id"], second["id"]}
 
 
+async def test_nightly_counter_evidence_queues_only_supported_unchecked_claims(kb_db):
+    first, _ = await kb_db.get_or_create_claim("fact", "First supported claim.", importance_score=0.9)
+    second, _ = await kb_db.get_or_create_claim("fact", "Second supported claim.", importance_score=0.8)
+    checked, _ = await kb_db.get_or_create_claim("fact", "Already checked claim.", importance_score=1.0)
+    await kb_db.get_or_create_claim("fact", "Unverified claim.", importance_score=1.0)
+    for claim in (first, second, checked):
+        await kb_db.update_claim_verification(claim["id"], "supported")
+    await kb_db.mark_counter_claim_checked(checked["id"])
+
+    result = await enqueue_supported_counter_evidence(kb_db, limit=1)
+
+    assert result == {"eligible": 2, "queued": 1, "already_queued": 0, "remaining": 1}
+    jobs = [
+        job for job in await kb_db.list_processing_jobs(limit=20)
+        if job["job_type"] == "counter_evidence"
+    ]
+    assert [job["subject_id"] for job in jobs] == [first["id"]]
+    assert jobs[0]["is_speculative"] is True
+    assert jobs[0]["priority"] == -25
+
+    # A timer retry does not duplicate the first job; the next eligible claim
+    # can still fill the nightly batch.
+    retried = await enqueue_supported_counter_evidence(kb_db, limit=1)
+    assert retried == {"eligible": 2, "queued": 1, "already_queued": 1, "remaining": 0}
+    jobs = [
+        job for job in await kb_db.list_processing_jobs(limit=20)
+        if job["job_type"] == "counter_evidence"
+    ]
+    assert {job["subject_id"] for job in jobs} == {first["id"], second["id"]}
+
+
 async def test_model_experiments_are_low_priority_speculative_jobs(kb_db):
     experiment = await enqueue_model_experiment(kb_db, {"prompt": "Compare models"})
     normal, _ = await kb_db.enqueue_processing_job(
@@ -177,6 +212,40 @@ async def test_source_list_exposes_durable_lifecycle_status(kb_db):
     listed = next(row for row in await kb_db.list_sources(limit=10) if row["id"] == source["id"])
     assert listed["lifecycle"] == "failed"
     assert listed["processing_error"] == "snapshot unavailable"
+
+
+async def test_source_with_claims_is_ready_despite_stale_terminal_job(kb_db):
+    source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="https://example.com/usable-after-rerun",
+        canonical_key="usable-after-rerun",
+    )
+    version, _ = await kb_db.add_source_version(
+        source["id"], content_hash="usable-hash", snapshot_path="/tmp/usable",
+        http_status=200, mime_type="text/plain",
+    )
+    artifact, _ = await kb_db.upsert_artifact(
+        artifact_id="usable-artifact", source_version_id=version["id"],
+        artifact_type="clean_text", storage_path="/tmp/usable.txt",
+        content_hash="usable-hash", chunk_params_hash="usable-params",
+    )
+    chunk = await kb_db.add_chunk(artifact["id"], 0, "Usable evidence.", "usable-chunk")
+    claim, _ = await kb_db.get_or_create_claim("fact", "Usable evidence.")
+    await kb_db.add_claim_evidence(
+        claim_id=claim["id"], artifact_chunk_id=chunk["id"], source_id=source["id"],
+        source_version_id=version["id"], excerpt_text="Usable evidence.",
+    )
+    job, _ = await kb_db.enqueue_processing_job(
+        "source_pipeline", "source", subject_id=source["id"], source_id=source["id"],
+        idempotency_key="source_pipeline:usable-after-rerun:v1",
+    )
+    await kb_db.claim_next_processing_job("worker")
+    await kb_db.finish_processing_job(job["id"], "partial", error_message="stale rerun error")
+
+    listed = next(row for row in await kb_db.list_sources(limit=20) if row["id"] == source["id"])
+
+    assert listed["lifecycle"] == "ready"
+    assert listed["claim_count"] == 1
+    assert listed["processing_status"] == "partial"
 
 
 async def test_archived_sources_are_hidden_by_default_but_restorable(kb_db):

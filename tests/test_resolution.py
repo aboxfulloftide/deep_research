@@ -2,6 +2,31 @@ from deep_research.config import Config
 from deep_research.kb import resolution as r
 
 
+# -- high-precision claim attribution normalization --------------------------
+
+
+def test_claims_differ_only_by_attribution_matches_bare_restatement():
+    assert r.claims_differ_only_by_attribution(
+        "Adam Smith wrote that the increase of stock, which raises wages, tends to lower profit.",
+        "The increase of stock, which raises wages, tends to lower profit",
+    )
+    assert r.claims_differ_only_by_attribution(
+        "According to Adam Smith, the increase of stock tends to lower profit.",
+        "The increase of stock tends to lower profit.",
+    )
+
+
+def test_claims_differ_only_by_attribution_keeps_material_differences():
+    assert not r.claims_differ_only_by_attribution(
+        "Adam Smith wrote that stock raises wages and lowers profit.",
+        "Stock raises wages.",
+    )
+    assert not r.claims_differ_only_by_attribution(
+        "Adam Smith wrote that stock raises wages.",
+        "David Ricardo wrote that stock raises wages.",
+    )
+
+
 # -- _entity_similarity: pure function, no I/O -------------------------------
 
 def test_exact_match_returns_none_handled_elsewhere():
@@ -54,14 +79,16 @@ def test_generic_word_buried_in_specific_name_suppressed_for_non_person():
     assert r._entity_similarity("economy", "british industrial economy", "concept") is None
 
 
-def test_generic_word_ratio_filter_does_not_apply_to_person():
-    # Real, valuable pattern: a bare surname substring-matching someone's full
-    # name has a low length ratio too, but this is almost always the same
-    # person, not noise -- must not be suppressed like the organization case.
+def test_person_substring_only_keeps_complete_final_name_token():
+    # A bare final surname can still be useful evidence for the local model,
+    # but first names and partial-token hits generated only false candidates.
     result = r._entity_similarity("clayton", "christopher clayton", "person")
     assert result == (0.85, "substring")
     result = r._entity_similarity("coppola", "antonio coppola", "person")
     assert result == (0.85, "substring")
+    assert r._entity_similarity("samuel", "samuel travers", "person") is None
+    assert r._entity_similarity("gray", "grayson john", "person") is None
+    assert r._entity_similarity("choi", "choi jong koo", "person") is None
 
 
 def test_generic_word_ratio_filter_allows_close_length_non_person_matches():
@@ -297,6 +324,86 @@ async def test_generate_entity_candidates_without_llm_preserves_old_behavior(kb_
     assert count == 1
 
 
+async def test_count_resolution_candidates_reports_full_counts_by_type(kb_db):
+    entity_a, _ = await kb_db.get_or_create_entity("organization", "Example Bank")
+    entity_b, _ = await kb_db.get_or_create_entity("organization", "Example Banks")
+    claim_a, _ = await kb_db.get_or_create_claim("fact", "Revenue increased.")
+    claim_b, _ = await kb_db.get_or_create_claim("fact", "Revenue rose.")
+    await kb_db.add_entity_resolution_candidate(entity_a["id"], entity_b["id"], 0.9, "trigram")
+    claim_candidate, _ = await kb_db.add_claim_resolution_candidate(
+        claim_a["id"], claim_b["id"], 0.9, "embedding_cosine",
+    )
+
+    assert await kb_db.count_resolution_candidates(status="open") == {
+        "entity_duplicate": 1,
+        "claim_duplicate": 1,
+    }
+
+    await kb_db.review_resolution_candidate(claim_candidate["id"], "rejected", "test")
+    assert await kb_db.count_resolution_candidates(status="open") == {"entity_duplicate": 1}
+    assert await kb_db.count_resolution_candidates(status=None) == {
+        "entity_duplicate": 1,
+        "claim_duplicate": 1,
+    }
+
+
+async def test_delete_resolution_candidates_for_claims_includes_reviewed_rows(kb_db):
+    target, _ = await kb_db.get_or_create_claim("fact", "In 1952, nobody wanted to work.")
+    other_a, _ = await kb_db.get_or_create_claim("fact", "Hiring was difficult in 1952.")
+    other_b, _ = await kb_db.get_or_create_claim("fact", "Employment rose in 1952.")
+    open_candidate, _ = await kb_db.add_claim_resolution_candidate(
+        target["id"], other_a["id"], 0.9, "embedding_cosine",
+    )
+    reviewed_candidate, _ = await kb_db.add_claim_resolution_candidate(
+        target["id"], other_b["id"], 0.88, "embedding_cosine",
+    )
+    await kb_db.review_resolution_candidate(reviewed_candidate["id"], "rejected", "test")
+
+    removed = await kb_db.delete_resolution_candidates_for_claims([target["id"]])
+
+    assert removed == 2
+    assert await kb_db.get_resolution_candidate(open_candidate["id"]) is None
+    assert await kb_db.get_resolution_candidate(reviewed_candidate["id"]) is None
+
+
+async def test_resolve_open_entity_duplicates_acts_only_on_confident_verdicts(kb_db, monkeypatch):
+    same_a, _ = await kb_db.get_or_create_entity("concept", "IG corporate bond issuance")
+    same_b, _ = await kb_db.get_or_create_entity("concept", "U.S. IG corporate bond issuance")
+    different_a, _ = await kb_db.get_or_create_entity("organization", "Central Bank of Canada")
+    different_b, _ = await kb_db.get_or_create_entity("organization", "Central Bank of California")
+    uncertain_a, _ = await kb_db.get_or_create_entity("concept", "credit conditions")
+    uncertain_b, _ = await kb_db.get_or_create_entity("concept", "credit conditioning")
+    same_candidate, _ = await kb_db.add_entity_resolution_candidate(
+        same_a["id"], same_b["id"], 0.95, "trigram",
+    )
+    different_candidate, _ = await kb_db.add_entity_resolution_candidate(
+        different_a["id"], different_b["id"], 0.9, "trigram",
+    )
+    uncertain_candidate, _ = await kb_db.add_entity_resolution_candidate(
+        uncertain_a["id"], uncertain_b["id"], 0.88, "trigram",
+    )
+
+    async def fake_classify(llm, name_a, name_b, entity_type):
+        pair_text = f"{name_a} {name_b}"
+        if "bond issuance" in pair_text:
+            return {"relationship": "same", "confidence": 0.95, "reasoning": "same concept"}
+        if "Central Bank" in pair_text:
+            return {"relationship": "different", "confidence": 0.95, "reasoning": "different organizations"}
+        return {"relationship": "same", "confidence": 0.4, "reasoning": "not certain"}
+
+    monkeypatch.setattr(r, "_classify_entity_duplicate", fake_classify)
+    fake_llm = type("FakeLLM", (), {"model": "local-test-model"})()
+    result = await r.resolve_open_entity_duplicates(kb_db, _fake_config(), llm=fake_llm)
+
+    assert result == {
+        "checked": 3, "merged": 1, "rejected": 1,
+        "uncertain": 1, "failed": 0, "remaining": 1,
+    }
+    assert (await kb_db.get_resolution_candidate(same_candidate["id"]))["status"] == "accepted"
+    assert (await kb_db.get_resolution_candidate(different_candidate["id"]))["status"] == "rejected"
+    assert (await kb_db.get_resolution_candidate(uncertain_candidate["id"]))["status"] == "open"
+
+
 # -- claim embedding + candidate generation (embed_texts mocked out) ---------
 # Real cosine similarity is computed by Postgres/pgvector over whatever
 # vectors we hand it -- mocking embed_texts (the Ollama call) still exercises
@@ -402,6 +509,93 @@ async def test_generate_claim_candidates_merges_on_confident_llm_same_verdict(kb
     a_after = await kb_db.get_claim(claim_a["id"])
     b_after = await kb_db.get_claim(claim_b["id"])
     assert (a_after["merged_into_claim_id"] is None) != (b_after["merged_into_claim_id"] is None)
+
+
+async def test_generate_claim_candidates_merges_attribution_variant_without_llm(kb_db, monkeypatch):
+    config, claim_a, claim_b = await _embed_and_index_near_duplicate_pair(
+        kb_db, monkeypatch,
+        "Adam Smith wrote that the increase of stock tends to lower profit.",
+        "The increase of stock tends to lower profit.",
+    )
+
+    count = await r.generate_claim_resolution_candidates(
+        kb_db, config, [claim_a["id"], claim_b["id"]], llm=None,
+    )
+
+    assert count == 0
+    assert await kb_db.list_resolution_candidates(candidate_type="claim_duplicate", status="open") == []
+    a_after = await kb_db.get_claim(claim_a["id"])
+    b_after = await kb_db.get_claim(claim_b["id"])
+    assert (a_after["merged_into_claim_id"] is None) != (b_after["merged_into_claim_id"] is None)
+
+
+async def test_generate_claim_candidates_excludes_dated_nobody_wants_to_work(kb_db, monkeypatch):
+    config, refrain, comparison = await _embed_and_index_near_duplicate_pair(
+        kb_db, monkeypatch,
+        "In 1952, nobody wanted to work.",
+        "In 1952, many people wanted to work.",
+    )
+
+    count = await r.generate_claim_resolution_candidates(
+        kb_db, config, [refrain["id"], comparison["id"]], llm=None,
+    )
+
+    assert count == 0
+    assert await kb_db.list_resolution_candidates(
+        candidate_type="claim_duplicate", status="open",
+    ) == []
+
+
+async def test_resolve_open_claim_duplicates_deletes_excluded_rows(kb_db):
+    refrain, _ = await kb_db.get_or_create_claim("fact", "In 1979, nobody wanted to work.")
+    other, _ = await kb_db.get_or_create_claim("fact", "Workers struggled to find jobs in 1979.")
+    candidate, _ = await kb_db.add_claim_resolution_candidate(
+        refrain["id"], other["id"], 0.91, "embedding_cosine",
+    )
+    fake_llm = type("FakeLLM", (), {"model": "local-test-model"})()
+
+    result = await r.resolve_open_claim_duplicates(kb_db, _fake_config(), llm=fake_llm)
+
+    assert result["rejected"] == 1
+    assert await kb_db.get_resolution_candidate(candidate["id"]) is None
+
+
+async def test_resolve_open_claim_duplicates_acts_only_on_confident_verdicts(kb_db, monkeypatch):
+    same_a, _ = await kb_db.get_or_create_claim("fact", "Revenue rose sharply this year.")
+    same_b, _ = await kb_db.get_or_create_claim("fact", "Revenue increased sharply this year.")
+    different_a, _ = await kb_db.get_or_create_claim("fact", "Inflation rose this year.")
+    different_b, _ = await kb_db.get_or_create_claim("fact", "The company opened a factory.")
+    uncertain_a, _ = await kb_db.get_or_create_claim("fact", "Demand may weaken.")
+    uncertain_b, _ = await kb_db.get_or_create_claim("fact", "Demand weakened in one market.")
+    same_candidate, _ = await kb_db.add_claim_resolution_candidate(
+        same_a["id"], same_b["id"], 0.95, "embedding_cosine",
+    )
+    different_candidate, _ = await kb_db.add_claim_resolution_candidate(
+        different_a["id"], different_b["id"], 0.9, "embedding_cosine",
+    )
+    uncertain_candidate, _ = await kb_db.add_claim_resolution_candidate(
+        uncertain_a["id"], uncertain_b["id"], 0.88, "embedding_cosine",
+    )
+
+    async def fake_classify(llm, claim_text, other_text):
+        pair_text = f"{claim_text} {other_text}"
+        if "Revenue" in pair_text:
+            return {"relationship": "same", "confidence": 0.95, "reasoning": "same fact"}
+        if "Inflation" in pair_text:
+            return {"relationship": "different", "confidence": 0.95, "reasoning": "unrelated facts"}
+        return {"relationship": "same", "confidence": 0.4, "reasoning": "not certain"}
+
+    monkeypatch.setattr(r, "_classify_claim_duplicate", fake_classify)
+    fake_llm = type("FakeLLM", (), {"model": "local-test-model"})()
+    result = await r.resolve_open_claim_duplicates(kb_db, _fake_config(), llm=fake_llm)
+
+    assert result == {
+        "checked": 3, "merged": 1, "rejected": 1,
+        "uncertain": 1, "failed": 0, "remaining": 1,
+    }
+    assert (await kb_db.get_resolution_candidate(same_candidate["id"]))["status"] == "accepted"
+    assert (await kb_db.get_resolution_candidate(different_candidate["id"]))["status"] == "rejected"
+    assert (await kb_db.get_resolution_candidate(uncertain_candidate["id"]))["status"] == "open"
 
 
 async def test_generate_claim_candidates_drops_on_confident_llm_different_verdict(kb_db, monkeypatch):

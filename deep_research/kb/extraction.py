@@ -27,7 +27,7 @@ from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
 
 PROMPT_NAME = "claim_extraction"
-PROMPT_VERSION = "v3-with-date-precision"
+PROMPT_VERSION = "v7-unresolved-pronouns"
 EXTRACTION_SCHEMA_VERSION = "v1"
 
 EXTRACTION_SYSTEM_PROMPT = """/no_think
@@ -46,9 +46,128 @@ For each claim, output an object with these exact fields:
 Rules:
 - Only extract claims actually present in the chunk. Do not invent facts, numbers, or dates not present in the text.
 - Keep each claim atomic: one fact per claim.
+- Every claim must be self-contained when read outside this chunk. Resolve
+  pronouns and vague references using the surrounding text: write "The
+  Louisiana Purchase cost..." or "The acquisition of United States Shoes
+  cost...", never "It cost..." or "The total cost..." with no named subject.
+  If the subject cannot be identified from the chunk, do not extract the
+  claim.
+- Do not extract quiz, test, or exam questions, answer choices, answer keys,
+  flash cards, worked exercises, or hypothetical word-problem figures. An
+  option marked as the correct answer is still assessment material, not a
+  factual assertion about a real-world entity.
+- A parenthetical year range immediately following a person's name, such as
+  "Benito Mussolini (1883-1945)", is normally that person's birth and death
+  years. It is not the duration of the role preceding the name. Never rewrite
+  it as "was [role] from 1883 to 1945" or use it as an event/tenure date. A
+  role claim should omit those years; a separate lifespan claim may say the
+  person lived from the first year to the second.
 - If the chunk has no extractable claims, return an empty array.
 - Return ONLY a JSON array. No prose, no markdown fences, no explanation.
 """
+
+_ASSESSMENT_LABEL_RE = re.compile(
+    r"(?im)^\s*(?:question(?:\s+\d+)?|multiple\s+choice|correct\s+answer|"
+    r"show\s+answer|review\s+later|add\s+note)\s*$"
+)
+_ANSWER_OPTION_RE = re.compile(r"(?im)^\s*[A-E][.)]\s+\S")
+_CLAIM_YEAR_RANGE_RE = re.compile(
+    r"\s+from\s+(?P<start>1\d{3}|20\d{2})\s+to\s+(?P<end>1\d{3}|20\d{2})(?=\b)",
+    re.IGNORECASE,
+)
+_LIFESPAN_PREDICATE_RE = re.compile(
+    r"\b(?:lived|lifespan|life\s+spanned|was\s+born|born\s+in|died\s+in)\b",
+    re.IGNORECASE,
+)
+_UNRESOLVED_SUBJECT_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:he|she|they|we|you)\b|"
+    r"(?:his|her|their|our|your)\s+|"
+    r"(?:it|this|that)\s+(?:cost(?:s|ed)?|was\s+worth|is\s+worth|"
+    r"rose|fell|increased|decreased|reached)\b|"
+    r"(?:the\s+)?total\s+cost\s+(?:had|has|have|was|is|rose|fell|"
+    r"increased|decreased|reached)\b|"
+    r"(?:the\s+)?total\s+(?:assets?|capital)\s+(?:are|were|was|is|"
+    r"had|has|reached)\b|"
+    r"the\s+(?:cost|price)\s+(?:was|is|had|has|rose|fell|reached)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_assessment_content(text: str) -> bool:
+    """High-confidence detector for quiz/exam UI captured from web pages.
+
+    Requiring both assessment labels and answer-option structure avoids
+    dropping ordinary prose that happens to mention an exam or a question.
+    This is intentionally deterministic: answer-bank pages should never rely
+    on an LLM noticing that a bare number is only choice E.
+    """
+    labels = {match.group(0).strip().casefold() for match in _ASSESSMENT_LABEL_RE.finditer(text)}
+    option_count = len(_ANSWER_OPTION_RE.findall(text))
+    has_answer_ui = any(label in labels for label in ("correct answer", "show answer"))
+    has_question_ui = any(
+        label == "question" or label.startswith("question ") or label == "multiple choice"
+        for label in labels
+    )
+    return option_count >= 2 and has_answer_ui and has_question_ui
+
+
+def has_unresolved_subject(claim_text: str) -> bool:
+    """True when a numeric/measurement claim discarded its referent.
+
+    Such a sentence may be locally understandable beside a transcript, but
+    it is unsafe as a standalone KB claim: similarity search will link every
+    generic cost/total statement regardless of what was purchased or
+    measured.
+    """
+    return bool(_UNRESOLVED_SUBJECT_RE.search(claim_text or ""))
+
+
+def repair_lifespan_date_misattribution(claim: dict) -> dict:
+    """Remove a person's parenthetical lifespan from an invented role range.
+
+    The extraction prompt is the first line of defense, but this exact error
+    is mechanically recognizable and too damaging to leave to model
+    consistency: it creates a false dated event and then false contradiction
+    cards. Valid lifespan claims ("X lived from ...") remain unchanged.
+    """
+    claim_text = str(claim.get("claim_text") or "")
+    quote = str(claim.get("supporting_quote") or "")
+    if not claim_text or not quote or _LIFESPAN_PREDICATE_RE.search(claim_text):
+        return claim
+
+    people = [
+        str(entity.get("name") or "").strip()
+        for entity in claim.get("entities") or []
+        if isinstance(entity, dict) and entity.get("type") == "person"
+    ]
+    for person in people:
+        lifespan_match = re.search(
+            rf"\b{re.escape(person)}\s*\(\s*(1\d{{3}}|20\d{{2}})\s*[-–—]\s*"
+            rf"(1\d{{3}}|20\d{{2}})\s*\)",
+            quote,
+            re.IGNORECASE,
+        )
+        if not lifespan_match:
+            continue
+        birth_year, death_year = lifespan_match.groups()
+        range_match = _CLAIM_YEAR_RANGE_RE.search(claim_text)
+        if not range_match or range_match.groups() != (birth_year, death_year):
+            continue
+
+        repaired_text = _CLAIM_YEAR_RANGE_RE.sub("", claim_text, count=1).strip()
+        if repaired_text and repaired_text[-1] not in ".!?":
+            repaired_text += "."
+        claim["claim_text"] = repaired_text
+
+        event = claim.get("event")
+        if isinstance(event, dict):
+            event_years = re.findall(r"(?:1\d{3}|20\d{2})", str(event.get("date") or ""))
+            if event_years == [birth_year, death_year]:
+                claim["event"] = None
+        return claim
+    return claim
 
 
 @dataclass
@@ -182,6 +301,10 @@ async def run_extraction(
     failed_chunk_count = 0
     try:
         for chunk in chunks:
+            if is_assessment_content(chunk["chunk_text"]):
+                # Skip the model call as well as its output: these chunks are
+                # structurally answer banks, not merely low-value prose.
+                continue
             messages = [
                 {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Chunk text:\n\n{chunk['chunk_text']}"},
@@ -196,6 +319,9 @@ async def run_extraction(
 
             for claim in _parse_json_array(content):
                 if not isinstance(claim, dict) or not claim.get("claim_text"):
+                    continue
+                claim = repair_lifespan_date_misattribution(claim)
+                if has_unresolved_subject(claim["claim_text"]):
                     continue
                 quote = claim.get("supporting_quote", "")
                 match = find_quote(quote, chunk["chunk_text"])

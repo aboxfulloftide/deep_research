@@ -365,10 +365,9 @@ CREATE TABLE IF NOT EXISTS claim_evidence (
 CREATE INDEX IF NOT EXISTS idx_claim_evidence_claim ON claim_evidence(claim_id);
 CREATE INDEX IF NOT EXISTS idx_claim_evidence_chunk ON claim_evidence(artifact_chunk_id);
 
--- The v1 merge/review queue (decision 25). Uncertain matches land here instead
--- of being silently merged. Accepting/rejecting a candidate only changes its
--- status in this step — executing an accepted merge (reassigning evidence,
--- tombstoning the duplicate) is explicitly deferred, not implemented yet.
+-- The merge/review queue (decision 25). Uncertain matches land here instead
+-- of being silently merged. Accepted duplicate candidates execute a merge;
+-- rejected candidates leave both records untouched.
 CREATE TABLE IF NOT EXISTS resolution_candidates (
     id TEXT PRIMARY KEY,
     candidate_type TEXT NOT NULL,
@@ -394,6 +393,18 @@ ALTER TABLE resolution_candidates ADD COLUMN IF NOT EXISTS triage_recommendation
 ALTER TABLE resolution_candidates ADD COLUMN IF NOT EXISTS triage_reasoning TEXT;
 ALTER TABLE resolution_candidates ADD COLUMN IF NOT EXISTS triage_model TEXT;
 ALTER TABLE resolution_candidates ADD COLUMN IF NOT EXISTS triaged_at TIMESTAMPTZ;
+
+-- Older merges reassigned both sides of every related candidate but did not
+-- retire rows that consequently became A-vs-A. Preserve those rows for audit
+-- while keeping them out of the open human-review queue.
+UPDATE resolution_candidates
+SET status = 'superseded', reviewed_by = 'system_merge_cleanup',
+    reviewed_at = COALESCE(reviewed_at, NOW()), updated_at = NOW()
+WHERE status = 'open' AND (
+    (left_entity_id IS NOT NULL AND left_entity_id = right_entity_id) OR
+    (left_event_id IS NOT NULL AND left_event_id = right_event_id) OR
+    (left_claim_id IS NOT NULL AND left_claim_id = right_claim_id)
+);
 
 CREATE TABLE IF NOT EXISTS metrics (
     id TEXT PRIMARY KEY,
@@ -965,8 +976,9 @@ class KBDatabase:
                 "COALESCE(array_agg(DISTINCT t.name) FILTER (WHERE t.name IS NOT NULL), '{}') AS topic_names, "
                 "pj.status AS processing_status, pj.stage AS processing_stage, pj.error_message AS processing_error, "
                 "CASE "
-                "  WHEN pj.status IN ('queued', 'running', 'partial', 'failed', 'cancelled') THEN pj.status "
+                "  WHEN pj.status IN ('queued', 'running') THEN pj.status "
                 "  WHEN COUNT(DISTINCT ce.claim_id) > 0 THEN 'ready' "
+                "  WHEN pj.status IN ('partial', 'failed', 'cancelled') THEN pj.status "
                 "  WHEN artifact_exists.present THEN 'chunked' "
                 "  WHEN version_exists.present THEN 'ingested' "
                 "  WHEN failed_fetch.present THEN 'failed' "
@@ -1259,15 +1271,24 @@ class KBDatabase:
             await conn.execute("UPDATE metrics SET entity_id = $1 WHERE entity_id = $2", winner_id, loser_id)
 
     async def reassign_resolution_candidates_entity(self, loser_id: str, winner_id: str) -> None:
+        now = _now()
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE resolution_candidates SET left_entity_id = $1 WHERE left_entity_id = $2",
-                winner_id, loser_id,
-            )
-            await conn.execute(
-                "UPDATE resolution_candidates SET right_entity_id = $1 WHERE right_entity_id = $2",
-                winner_id, loser_id,
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE resolution_candidates SET left_entity_id = $1 WHERE left_entity_id = $2",
+                    winner_id, loser_id,
+                )
+                await conn.execute(
+                    "UPDATE resolution_candidates SET right_entity_id = $1 WHERE right_entity_id = $2",
+                    winner_id, loser_id,
+                )
+                await conn.execute(
+                    "UPDATE resolution_candidates SET status = 'superseded', "
+                    "reviewed_by = 'system_merge', reviewed_at = $1, updated_at = $1 "
+                    "WHERE status = 'open' AND left_entity_id = right_entity_id "
+                    "AND left_entity_id IS NOT NULL",
+                    now,
+                )
 
     async def mark_entity_merged(self, loser_id: str, winner_id: str) -> None:
         async with self.pool.acquire() as conn:
@@ -1686,15 +1707,24 @@ class KBDatabase:
                 )
 
     async def reassign_resolution_candidates_claim(self, loser_id: str, winner_id: str) -> None:
+        now = _now()
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE resolution_candidates SET left_claim_id = $1 WHERE left_claim_id = $2",
-                winner_id, loser_id,
-            )
-            await conn.execute(
-                "UPDATE resolution_candidates SET right_claim_id = $1 WHERE right_claim_id = $2",
-                winner_id, loser_id,
-            )
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE resolution_candidates SET left_claim_id = $1 WHERE left_claim_id = $2",
+                    winner_id, loser_id,
+                )
+                await conn.execute(
+                    "UPDATE resolution_candidates SET right_claim_id = $1 WHERE right_claim_id = $2",
+                    winner_id, loser_id,
+                )
+                await conn.execute(
+                    "UPDATE resolution_candidates SET status = 'superseded', "
+                    "reviewed_by = 'system_merge', reviewed_at = $1, updated_at = $1 "
+                    "WHERE status = 'open' AND left_claim_id = right_claim_id "
+                    "AND left_claim_id IS NOT NULL",
+                    now,
+                )
 
     async def mark_claim_merged(self, loser_id: str, winner_id: str) -> None:
         now = _now()
@@ -1801,6 +1831,9 @@ class KBDatabase:
                 )
                 await conn.execute("DELETE FROM metrics WHERE claim_id = $1", claim_id)
                 await conn.execute("DELETE FROM claim_topics WHERE claim_id = $1", claim_id)
+                await conn.execute(
+                    "DELETE FROM claim_supports WHERE claim_id = $1 OR supporting_claim_id = $1", claim_id,
+                )
                 await conn.execute(
                     "DELETE FROM resolution_candidates WHERE left_claim_id = $1 OR right_claim_id = $1", claim_id,
                 )
@@ -1978,15 +2011,24 @@ class KBDatabase:
         """One round trip for many claims' evidence, keyed by claim_id -- see
         get_entities_bulk/get_claims_bulk. Used by the resolution-candidates
         list API so a reviewer can see *why* two claims might be duplicates
-        (source + quoted excerpt), not just the bare claim text side by side."""
+        (source + quoted excerpt + bounded surrounding chunk context), not
+        just the bare claim text side by side. The database clips context here
+        rather than returning every full source chunk for a queue that may
+        contain hundreds of claims."""
         ids = list({i for i in claim_ids if i})
         if not ids:
             return {}
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT ce.*, s.title AS source_title, s.canonical_uri "
+                "SELECT ce.*, s.title AS source_title, s.canonical_uri, ac.section_label, "
+                "substring(ac.chunk_text FROM "
+                "  GREATEST(COALESCE(ce.char_start, 280) - 280, 0) + 1 FOR 1000) AS context_excerpt, "
+                "GREATEST(COALESCE(ce.char_start, 280) - 280, 0) > 0 AS context_truncated_start, "
+                "GREATEST(COALESCE(ce.char_start, 280) - 280, 0) + 1000 < char_length(ac.chunk_text) "
+                "  AS context_truncated_end "
                 "FROM claim_evidence ce "
                 "JOIN sources s ON s.id = ce.source_id "
+                "JOIN artifact_chunks ac ON ac.id = ce.artifact_chunk_id "
                 "WHERE ce.claim_id = ANY($1::text[]) ORDER BY ce.created_at",
                 ids,
             )
@@ -2135,10 +2177,44 @@ class KBDatabase:
             rows = await conn.fetch(query, *params)
         return [dict(r) for r in rows]
 
+    async def count_resolution_candidates(self, status: str | None = "open") -> dict[str, int]:
+        """Count the full review queue by type without applying a list limit."""
+        query = "SELECT candidate_type, COUNT(*) AS count FROM resolution_candidates WHERE TRUE"
+        params: list[Any] = []
+        if status:
+            params.append(status)
+            query += f" AND status = ${len(params)}"
+        query += " GROUP BY candidate_type"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+        return {row["candidate_type"]: row["count"] for row in rows}
+
     async def get_resolution_candidate(self, candidate_id: str) -> dict | None:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM resolution_candidates WHERE id = $1", candidate_id)
         return dict(row) if row else None
+
+    async def delete_resolution_candidate(self, candidate_id: str) -> bool:
+        """Permanently remove review noise that a deterministic rule excludes."""
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM resolution_candidates WHERE id = $1", candidate_id,
+            )
+        return result == "DELETE 1"
+
+    async def delete_resolution_candidates_for_claims(self, claim_ids: list[str]) -> int:
+        """Remove open and already-reviewed pairs involving any listed claim."""
+        ids = list({claim_id for claim_id in claim_ids if claim_id})
+        if not ids:
+            return 0
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "DELETE FROM resolution_candidates "
+                "WHERE left_claim_id = ANY($1::text[]) OR right_claim_id = ANY($1::text[]) "
+                "RETURNING id",
+                ids,
+            )
+        return len(rows)
 
     async def review_resolution_candidate(
         self, candidate_id: str, decision: str, reviewed_by: str | None = None,

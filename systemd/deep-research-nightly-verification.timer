@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Deep Research knowledge-base verification nightly
+
+[Timer]
+OnCalendar=*-*-* 23:00:00
+Persistent=true
+Unit=deep-research-nightly-verification.service
+
+[Install]
+WantedBy=timers.target

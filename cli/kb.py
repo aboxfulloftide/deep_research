@@ -526,7 +526,10 @@ async def cmd_verify_unverified(args):
 
     job = await enqueue_manual_job(
         kb_db, "verification_sweep", "knowledge_base", "default",
-        payload={"verification_threshold": args.threshold, "limit": args.limit, "force": args.force},
+        payload={
+            "verification_threshold": args.threshold, "limit": args.limit,
+            "force": args.force, "trigger": args.trigger,
+        },
     )
     console.print("[dim]Queued KB-wide verification sweep.[/dim]")
     _print_job_result(await _wait_for_job(kb_db, config, snapshot_store, job["id"]))

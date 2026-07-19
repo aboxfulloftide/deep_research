@@ -140,10 +140,50 @@ async def apply_confirmed_contradiction(kb_db: KBDatabase, claim_a_id: str, clai
         if claim is None:
             continue
         other_id = claim_b_id if cid == claim_a_id else claim_a_id
-        new_status = "mixed" if claim["status"] == "supported" else "contradicted"
+        has_support = bool(await kb_db.get_claim_support_ids(cid))
+        new_status = "mixed" if claim["status"] in {"supported", "mixed"} or has_support else "contradicted"
         notes = dict(claim.get("verification_notes") or {})
         notes["contradiction_confirmed_with"] = other_id
         await kb_db.update_claim_verification(cid, new_status, notes)
+
+
+async def reconcile_claim_after_rejected_contradiction(kb_db: KBDatabase, claim_id: str) -> None:
+    """Remove a rejected conflict from a claim's derived verification state.
+
+    Verification marks a claim contradicted as soon as it queues a proposed
+    conflict. If a reviewer later rejects that proposal, leaving the status
+    untouched makes the review decision cosmetic. Rebuild the contradiction
+    portion from still-open or accepted candidates while preserving any
+    independently recorded support.
+    """
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None:
+        return
+    contradiction_rows = await kb_db.get_claim_contradictions(claim_id)
+    active_rows = [
+        row for row in contradiction_rows
+        if row["candidate_status"] in {"open", "accepted"}
+    ]
+    active_other_ids = [row["other_claim_id"] for row in active_rows]
+    accepted_other_ids = [
+        row["other_claim_id"] for row in active_rows
+        if row["candidate_status"] == "accepted"
+    ]
+    has_support = bool(await kb_db.get_claim_support_ids(claim_id))
+    was_supported = claim["status"] in {"supported", "mixed"}
+    if active_rows:
+        new_status = "mixed" if has_support or was_supported else "contradicted"
+    else:
+        new_status = "supported" if has_support or was_supported else "unverified"
+
+    notes = dict(claim.get("verification_notes") or {})
+    notes["contradicts_found"] = len(active_rows)
+    notes["contradicting_claim_ids"] = active_other_ids
+    if accepted_other_ids:
+        notes["contradiction_confirmed_with"] = accepted_other_ids[0]
+    else:
+        notes.pop("contradiction_confirmed_with", None)
+    await kb_db.update_claim_verification(claim_id, new_status, notes)
 
 
 @dataclass
@@ -166,6 +206,9 @@ async def review_and_execute(
     await kb_db.review_resolution_candidate(candidate_id, decision, reviewed_by)
 
     if decision != "accepted":
+        if candidate["candidate_type"] == "claim_contradiction":
+            await reconcile_claim_after_rejected_contradiction(kb_db, candidate["left_claim_id"])
+            await reconcile_claim_after_rejected_contradiction(kb_db, candidate["right_claim_id"])
         return ReviewResult(candidate_id, decision, candidate["candidate_type"], action="rejected")
 
     ctype = candidate["candidate_type"]

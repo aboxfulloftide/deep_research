@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
-import { Radio, RefreshCw } from 'lucide-vue-next'
+import { ExternalLink, Radio, RefreshCw } from 'lucide-vue-next'
 import { useApi } from '../composables/useApi.js'
 
 const api = useApi()
@@ -43,12 +43,18 @@ async function checkNow() {
 }
 
 const PROVIDER_LABELS = {
-  duckduckgo: 'DuckDuckGo', bing: 'Bing', mojeek: 'Mojeek', wikipedia: 'Wikipedia (via SearXNG)', searxng: 'SearXNG (other)',
-  wikipedia_api: 'Wikipedia (direct API)', brave: 'Brave', tavily: 'Tavily', serper: 'Serper',
+  duckduckgo: 'DuckDuckGo', bing: 'Bing', mojeek: 'Mojeek', searxng: 'SearXNG (other)',
+  wikipedia_api: 'Wikipedia (direct API)', wikidata_api: 'Wikidata (direct API)', brave: 'Brave', brave_fallback: 'Brave (fallback)', tavily: 'Tavily', serper: 'Serper',
+}
+const PROVIDER_ACCOUNT_URLS = {
+  brave: 'https://brave.com/search/api/',
+  brave_fallback: 'https://brave.com/search/api/',
+  tavily: 'https://app.tavily.com/home#',
+  serper: 'https://serper.dev/dashboard',
 }
 // Preferred order for known providers; anything else (a SearXNG engine we
 // haven't explicitly labeled) is appended alphabetically after these.
-const KNOWN_ORDER = ['duckduckgo', 'bing', 'mojeek', 'wikipedia', 'wikipedia_api', 'brave', 'tavily', 'serper']
+const KNOWN_ORDER = ['duckduckgo', 'bing', 'mojeek', 'wikipedia_api', 'wikidata_api', 'brave', 'brave_fallback', 'serper', 'tavily']
 
 const providerOrder = computed(() => {
   const keys = Object.keys(providers.value)
@@ -59,6 +65,10 @@ const providerOrder = computed(() => {
 
 function providerLabel(key) {
   return PROVIDER_LABELS[key] || key
+}
+
+function providerAccountUrl(key) {
+  return PROVIDER_ACCOUNT_URLS[key]
 }
 
 function statusBadge(p) {
@@ -107,12 +117,9 @@ const statusColors = {
     </div>
 
     <p class="text-sm text-gray-500 dark:text-gray-400 mb-6">
-      web_search() queries SearXNG (free/unauthenticated scrape -- duckduckgo, bing, mojeek, wikipedia),
-      Wikipedia's own public REST API (also free, no key), and Brave (real API) on every call, falling
-      back to Tavily (real API) when combined results come back thin, and Serper (real API) as a last
-      resort if that's still thin. Brave/Tavily quotas renew monthly; Serper's free tier is a one-time
-      2500-query trial, so it's held back for when it's genuinely needed. "Check Now" fires one live
-      probe at each provider instead of relying on how recently something happened to call it.
+      web_search() combines SearXNG, the direct Wikipedia/Wikidata APIs, Brave, and Serper on each call. Tavily runs
+      only when the primary results are thin. Account links are available for providers with usage
+      dashboards. "Check Now" fires one live probe at each provider instead of relying on recent calls.
     </p>
 
     <div v-if="loading" class="text-sm text-gray-500 dark:text-gray-400">Loading...</div>
@@ -124,8 +131,21 @@ const statusColors = {
           :key="key"
           class="p-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg"
         >
-          <div class="flex items-center justify-between mb-2">
-            <span class="font-semibold text-gray-900 dark:text-white">{{ providerLabel(key) }}</span>
+          <div class="flex items-start justify-between gap-2 mb-2">
+            <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+              <span class="font-semibold text-gray-900 dark:text-white">{{ providerLabel(key) }}</span>
+              <a
+                v-if="providerAccountUrl(key)"
+                :href="providerAccountUrl(key)"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                :aria-label="`Open ${providerLabel(key)} account page in a new tab`"
+              >
+                Account
+                <ExternalLink class="w-3 h-3" aria-hidden="true" />
+              </a>
+            </div>
             <span class="px-1.5 py-0.5 text-[10px] rounded uppercase font-medium" :class="modeBadge(providers[key]?.mode).class">
               {{ modeBadge(providers[key]?.mode).label }}
             </span>
