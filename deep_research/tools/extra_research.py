@@ -29,11 +29,18 @@ SOURCE_ANALYSIS_CHARS = 2_500
 # to be duplicates, low-quality, or unusable -- without this, a single query
 # could keep walking an entire ranked-results list one fetch at a time.
 MAX_FETCH_ATTEMPTS_PER_QUERY = 4
-OFFICIAL_HF_ORGANIZATIONS = {
-    "qwen", "mistralai", "meta-llama", "google", "microsoft", "deepseek-ai",
-    "nvidia", "ibm-granite", "tiiuae", "allenai", "cohereforai", "openai",
-}
 BAD_SCRAPE_MARKERS = ("found 2 products:", "found 1 product:", "did you describe any potential participant risks")
+
+# Structural/path-based authority signals for classify_source(), deliberately
+# not tied to any single industry, product, or vendor -- a legal, medical,
+# financial, or product question gets the same tiering logic as any other.
+_FORUM_PATH_MARKERS = ("/discussions/", "/discussion/", "/community/", "/forum/", "/comments/")
+_SCHOLARLY_PUBLISHING_DOMAINS = {
+    "arxiv.org", "openreview.net", "biorxiv.org", "ssrn.com",
+    "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov", "doi.org", "jstor.org",
+}
+_REPOSITORY_DOMAINS = {"github.com", "gitlab.com", "bitbucket.org", "sourceforge.net", "huggingface.co"}
+_COMMUNITY_DOMAINS = {"reddit.com", "news.ycombinator.com", "medium.com", "quora.com"}
 
 
 @dataclass
@@ -134,9 +141,9 @@ def _adapter_query(capability: str, question: str) -> str:
     """
     suffixes = {
         "primary": "primary source official",
-        "scholarly": "site:arxiv.org OR site:openreview.net research paper",
+        "scholarly": "peer-reviewed research paper OR academic study",
         "official_documentation": "official documentation specifications",
-        "repository": "site:github.com repository documentation",
+        "repository": "official repository documentation",
         "news": "reputable news publication date",
         "local_knowledge": "",  # No local-KB adapter is registered yet; web remains transparent fallback.
         "web": "",
@@ -154,42 +161,31 @@ def _title_key(title: str) -> str:
     return "title:" + re.sub(r"\W+", " ", article_title.lower()).strip()
 
 
-def _model_family_key(title: str, url: str) -> str | None:
-    """Collapse FP8/AWQ/GGUF repacks into the base model's evidence slot."""
-    if (urlparse(url).hostname or "").lower().removeprefix("www.") != "huggingface.co":
-        return None
-    name = title.split("·", 1)[0].strip().lower().rsplit("/", 1)[-1]
-    name = re.sub(r"[-_ ](?:fp\d+|awq|gptq|gguf|exl2|iq\d+|q\d+(?:_[a-z]+)*)$", "", name)
-    return f"model-family:{re.sub(r'\s+', ' ', name)}" if name else None
-
-
 def _usable_scrape(content: str) -> bool:
     normalised = _normalise(content)
     return len(normalised) >= 240 and not any(marker in normalised for marker in BAD_SCRAPE_MARKERS)
 
 
 def classify_source(url: str) -> tuple[str, int]:
-    """Give primary technical material priority without silently excluding corroboration."""
-    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
-    if host in {"arxiv.org", "openreview.net"}:
-        return "paper", 5
-    if host == "huggingface.co":
-        path_parts = [part for part in urlparse(url).path.split("/") if part]
-        first_path = path_parts[0] if path_parts else ""
-        if any(part in {"discussions", "community"} for part in path_parts):
-            return "community", 1
-        if first_path.lower() in OFFICIAL_HF_ORGANIZATIONS:
-            return "primary", 5
-        if first_path not in {"blog", "docs", "spaces", "collections"}:
-            return "technical_reference", 3
-        return "technical_reference", 3
-    if host in {"qwenlm.github.io", "mistral.ai", "docs.mistral.ai", "llama.com", "ai.meta.com"}:
+    """Give primary/official/academic material priority without silently
+    excluding corroboration. Authority signals are structural -- TLD,
+    recognized scholarly-publishing infrastructure, generic forum/discussion
+    path markers -- rather than tied to any single industry, product, or
+    vendor, so a legal, medical, financial, or product question gets the
+    same tiering logic as any other."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if any(marker in f"{parsed.path.lower()}/" for marker in _FORUM_PATH_MARKERS):
+        return "community", 1
+    if host.endswith((".gov", ".mil")):
         return "primary", 5
-    if host in {"github.com", "paperswithcode.com", "swebench.com", "livecodebench.github.io"}:
+    if host in _SCHOLARLY_PUBLISHING_DOMAINS:
+        return "paper", 5
+    if host.endswith(".edu") or host.startswith(("docs.", "developer.")):
         return "technical_reference", 4
-    if host.startswith(("docs.", "developer.")) or any(marker in host for marker in ("benchmark", "lmarena", "lmsys")):
+    if host in _REPOSITORY_DOMAINS:
         return "technical_reference", 4
-    if host in {"reddit.com", "news.ycombinator.com", "medium.com"}:
+    if host in _COMMUNITY_DOMAINS:
         return "community", 1
     return "secondary", 2
 
@@ -248,7 +244,6 @@ async def collect_sources(
 
             canonical_key = result.canonical_url or result.url
             title_key = _title_key(result.title)
-            family_key = _model_family_key(result.title, result.url)
             _, quality_score = classify_source(result.url)
 
             def _record(decision: str, reason: str = "") -> None:
@@ -261,7 +256,6 @@ async def collect_sources(
             if (
                 canonical_key in seen_urls or canonical_key in pending_urls
                 or title_key in seen_urls or title_key in pending_titles
-                or (family_key is not None and (family_key in seen_urls or family_key in pending_titles))
             ):
                 _record("rejected_duplicate")
                 continue
@@ -299,17 +293,12 @@ async def collect_sources(
             ))
             pending_urls.add(canonical_key)
             pending_titles.add(title_key)
-            if family_key is not None:
-                pending_titles.add(family_key)
             accepted_this_query += 1
             _record("accepted")
 
     for source in sources:
         seen_urls.add(source.canonical_url or source.url)
         seen_urls.add(_title_key(source.title))
-        family_key = _model_family_key(source.title, source.url)
-        if family_key is not None:
-            seen_urls.add(family_key)
     return sources
 
 
@@ -348,7 +337,7 @@ def _fallback_research_plan(question: str) -> ResearchPlan:
     return ResearchPlan(question, [], [
         ResearchFacet("core", question, "Direct evidence that answers the central question.", ["web", "primary"], f"{keywords} official specifications"),
         ResearchFacet("constraints", "Definitions, limits, and assumptions relevant to the question.", "Definitions, limits, and assumptions.", ["official_documentation", "web"], f"{keywords} requirements limitations"),
-        ResearchFacet("corroboration", "Independent corroboration relevant to the question.", "Independent or primary corroboration.", ["scholarly", "repository"], f"{keywords} independent benchmark evidence"),
+        ResearchFacet("corroboration", "Independent corroboration relevant to the question.", "Independent or primary corroboration.", ["scholarly", "repository"], f"{keywords} independent corroborating evidence"),
     ])
 
 
@@ -534,9 +523,9 @@ async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[s
             "role": "system",
             "content": (
                 "/no_think\nYou plan a concise web-research search set. Return exactly two search queries, one per line. "
-                "First identify ambiguous constraints that must not be assumed (for example total RAM versus VRAM). "
+                "First identify ambiguous constraints in the question that must not be assumed. "
                 "Then break the question into complementary factual branches: official specifications, primary data, "
-                "independently reproducible benchmarks, or decision criteria. Keep each query independently searchable. "
+                "independently reproducible results, or decision criteria. Keep each query independently searchable. "
                 "Do not answer the question."
             ),
         },
@@ -551,12 +540,12 @@ async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[s
             return queries
     except Exception:
         pass
-    # Never silently steer arbitrary research toward one model vendor. This
-    # fallback retains the user's actual constraints while asking for sources
-    # that can support a later evidence gate.
+    # Never silently steer arbitrary research toward one vendor or product.
+    # This fallback retains the user's actual constraints while asking for
+    # sources that can support a later evidence gate.
     return [
-        f"{original_query} official model card specifications context hardware requirements",
-        f"{original_query} benchmark owner methodology results",
+        f"{original_query} official specifications requirements",
+        f"{original_query} independent evaluation methodology results",
     ]
 
 
@@ -570,7 +559,7 @@ async def derive_follow_up_queries(
             "role": "system",
             "content": (
                 "/no_think\nYou plan web research. Return exactly two concise search queries, one per line. "
-                "Use the evidence to find an official model card, technical paper, benchmark owner, or independent "
+                "Use the evidence to find official documentation, an authoritative source, or independent "
                 "corroboration for a specific unresolved tradeoff. Avoid generic reviews and search-result summaries. "
                 "Do not answer the original question."
             ),
@@ -602,7 +591,7 @@ async def derive_follow_up_queries(
         anchor = anchor[:120]
         fallbacks = [
             f"{anchor} official documentation technical details",
-            f"{anchor} independent comparison limitations benchmarks",
+            f"{anchor} independent comparison limitations evidence",
         ]
         known = {query.lower() for query in queries} | {original_query.lower()}
         queries.extend(query for query in fallbacks if query.lower() not in known)
@@ -756,5 +745,8 @@ def claim_ledger_context(claims: list[EvidenceClaim]) -> str:
 
 
 def has_authoritative_source(sources: list[ResearchSource]) -> bool:
-    """A decision memo needs at least one model card or paper, not only commentary."""
-    return any(source.source_kind in {"primary", "paper"} for source in sources)
+    """A decision memo needs at least one high-tier source -- government,
+    peer-reviewed research, official documentation, .edu, or a recognized
+    repository -- not only commentary or secondary write-ups, regardless of
+    the question's domain."""
+    return any(source.quality_score >= 4 for source in sources)

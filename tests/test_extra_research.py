@@ -196,7 +196,7 @@ async def test_follow_up_query_planning_falls_back_to_evidence_title():
 
     assert queries == [
         "Qwen coding guide official documentation technical details",
-        "Qwen coding guide independent comparison limitations benchmarks",
+        "Qwen coding guide independent comparison limitations evidence",
     ]
 
 
@@ -211,18 +211,22 @@ async def test_starting_query_planning_uses_the_topic_aware_plan():
     assert queries == ["primary data source", "independent comparison"]
 
 
-def test_huggingface_quantization_is_not_labeled_primary_and_family_is_deduplicated():
-    assert extra.classify_source("https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct")[0] == "primary"
-    assert extra.classify_source("https://huggingface.co/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ")[0] == "technical_reference"
-    base = extra._model_family_key(
-        "Qwen/Qwen3-Coder-480B-A35B-Instruct · Hugging Face",
-        "https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct",
-    )
-    awq = extra._model_family_key(
-        "QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ · Hugging Face",
-        "https://huggingface.co/QuantTrio/Qwen3-Coder-480B-A35B-Instruct-AWQ",
-    )
-    assert base == awq
+def test_classify_source_uses_domain_neutral_authority_signals():
+    assert extra.classify_source("https://www.irs.gov/publications/p17") == ("primary", 5)
+    assert extra.classify_source("https://arxiv.org/abs/2401.00000") == ("paper", 5)
+    assert extra.classify_source("https://docs.stripe.com/api") == ("technical_reference", 4)
+    assert extra.classify_source("https://github.com/example/repo") == ("technical_reference", 4)
+    assert extra.classify_source("https://github.com/example/repo/discussions/1") == ("community", 1)
+    assert extra.classify_source("https://reddit.com/r/test") == ("community", 1)
+    assert extra.classify_source("https://randomblog.example.com/post") == ("secondary", 2)
+
+
+def test_has_authoritative_source_accepts_official_documentation_not_just_papers():
+    docs_only = [extra.ResearchSource("Docs", "https://docs.example.com/x", "x" * 300, 1, "q", quality_score=4, source_kind="technical_reference")]
+    assert extra.has_authoritative_source(docs_only) is True
+
+    secondary_only = [extra.ResearchSource("Blog", "https://example.com/x", "x" * 300, 1, "q", quality_score=2, source_kind="secondary")]
+    assert extra.has_authoritative_source(secondary_only) is False
 
 
 def test_broken_marketplace_scrape_is_not_usable_evidence():
