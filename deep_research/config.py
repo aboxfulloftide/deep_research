@@ -80,6 +80,16 @@ class ScrapingConfig(BaseModel):
     max_content_length: int = 8000
 
 
+class SearchCacheConfig(BaseModel):
+    # web_search() results are cached in their own SQLite file
+    # (search_cache.py) so identical/near-identical searches within the TTL
+    # don't each spend a fresh provider call. Kept independent of the KB
+    # Postgres DB: web_search() and everything under it (the plain chat tool
+    # loop, Extra Research's collection pipeline) only ever receive Config,
+    # never a KBDatabase handle.
+    enabled: bool = True
+
+
 class AgentConfig(BaseModel):
     max_steps: int = 20
 
@@ -156,6 +166,7 @@ class Config(BaseModel):
     serper: SerperConfig = SerperConfig()
     wikipedia: WikipediaConfig = WikipediaConfig()
     scraping: ScrapingConfig = ScrapingConfig()
+    search_cache: SearchCacheConfig = SearchCacheConfig()
     agent: AgentConfig = AgentConfig()
     db: DBConfig = DBConfig()
     web: WebConfig = WebConfig()
@@ -190,6 +201,7 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_WIKIPEDIA_CONTACT": ("wikipedia", "contact"),
         "DEEP_RESEARCH_SCRAPING_TIMEOUT": ("scraping", "timeout"),
         "DEEP_RESEARCH_SCRAPING_MAX_CONTENT_LENGTH": ("scraping", "max_content_length"),
+        "DEEP_RESEARCH_SEARCH_CACHE_ENABLED": ("search_cache", "enabled"),
         "DEEP_RESEARCH_AGENT_MAX_STEPS": ("agent", "max_steps"),
         "DEEP_RESEARCH_DB_PATH": ("db", "path"),
         "DEEP_RESEARCH_WEB_HOST": ("web", "host"),
@@ -224,6 +236,8 @@ def _apply_env_overrides(config: Config) -> Config:
                 val = int(val)
             elif sub_field.annotation is float:
                 val = float(val)
+            elif sub_field.annotation is bool:
+                val = val.strip().lower() in ("1", "true", "yes", "on")
             data[section][key] = val
     return Config(**data)
 

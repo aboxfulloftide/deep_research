@@ -8,6 +8,11 @@ import httpx
 from deep_research.config import Config
 from deep_research.kb.canonical import normalize_url
 from deep_research.models import ProviderObservation, SearchResult
+from deep_research.tools.search_cache import (
+    get_cached_results,
+    normalize_cache_key,
+    store_cached_results,
+)
 from deep_research.tools.search_usage import (
     log_search_call,
     provider_monthly_quota_exhausted,
@@ -90,6 +95,37 @@ SEARXNG_ALTERNATE_QUERY_ENGINE_COOLDOWN_HOURS = 48
 
 _searxng_throttle_lock = asyncio.Lock()
 _searxng_last_call_at: float | None = None
+
+# In-process-only request coalescing, keyed by the same cache key
+# search_cache.py uses. No cross-process coordination -- that would need a
+# much heavier mechanism (a durable lease) for a benefit this doesn't need
+# yet. A concurrent web_search() call for the same key while one is already
+# computing awaits the in-flight Future instead of independently spending
+# its own provider calls.
+_inflight_searches: dict[str, asyncio.Future] = {}
+_inflight_searches_lock = asyncio.Lock()
+
+
+async def _coalesced(cache_key: str, compute):
+    async with _inflight_searches_lock:
+        future = _inflight_searches.get(cache_key)
+        owner = future is None
+        if owner:
+            future = asyncio.get_event_loop().create_future()
+            _inflight_searches[cache_key] = future
+    if not owner:
+        return await future
+    try:
+        result = await compute()
+        future.set_result(result)
+        return result
+    except Exception as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        async with _inflight_searches_lock:
+            if _inflight_searches.get(cache_key) is future:
+                del _inflight_searches[cache_key]
 
 
 async def _throttle_searxng(min_interval_seconds: float) -> None:
@@ -500,6 +536,7 @@ async def web_search(
     plan_id: str | None = None,
     facet_id: str | None = None,
     attempt_id: str | None = None,
+    freshness: str = "default",
 ) -> list[SearchResult]:
     """SearXNG (Bing/DuckDuckGo) + Wikipedia unconditionally, then an adaptive
     waterfall: Wikidata only when capability="grounding" (its yield is ~67%
@@ -521,177 +558,204 @@ async def web_search(
     the research run/plan/facet/attempt (or claim verification) that made
     it -- callers with no such concept (e.g. the plain chat tool loop) simply
     omit them. capability="grounding" additionally controls whether Wikidata
-    is consulted at all."""
+    is consulted at all.
+
+    Results are cached (search_cache.py) by normalized query/capability/
+    engine-set/freshness for config.search_cache.enabled callers, and
+    concurrent identical searches are coalesced into one computation instead
+    of each spending their own provider calls -- see _coalesced above."""
     search_ids = {
         "capability": capability, "run_id": run_id, "plan_id": plan_id,
         "facet_id": facet_id, "attempt_id": attempt_id,
     }
-    url = f"{config.searxng.url.rstrip('/')}/search"
-    params = {
-        "q": query,
-        "format": "json",
-    }
-    duckduckgo_allowed = await providers_allowed_by_circuit_breaker(
-        config, ("duckduckgo",), max_attempts=None,
-        cooldown_hours=SEARXNG_DUCKDUCKGO_COOLDOWN_HOURS,
+    cache_key = normalize_cache_key(
+        query, capability=capability,
+        include_alternate_query_engines=include_alternate_query_engines,
+        freshness=freshness,
     )
-    selected_engines = tuple(
-        engine for engine in SEARXNG_BASE_ENGINES
-        if engine != "duckduckgo" or engine in duckduckgo_allowed
-    )
-    if include_alternate_query_engines:
-        recovered = await providers_allowed_by_circuit_breaker(
-            config, SEARXNG_RECOVERED_ENGINES,
-            max_attempts=SEARXNG_ALTERNATE_QUERY_ENGINE_MAX_ATTEMPTS,
-            cooldown_hours=SEARXNG_ALTERNATE_QUERY_ENGINE_COOLDOWN_HOURS,
-        )
-        selected_engines += tuple(
-            engine for engine in SEARXNG_RECOVERED_ENGINES if engine in recovered
-        )
-    # Always select the base engines explicitly. Otherwise omitting
-    # DuckDuckGo here would merely make SearXNG's default configuration add it
-    # back, defeating the cooldown while Bing remains healthy.
-    params["engines"] = ",".join(selected_engines)
-    await _throttle_searxng(config.searxng.min_interval_seconds)
-    t = timer()
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as e:
-        await log_search_call(
-            config, "searxng", "scrape", "error",
-            error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
-            error_category=classify_http_error(e), **search_ids,
-        )
-        # SearXNG is one provider, not a single point of failure. Continue to
-        # the direct providers below when it is unavailable.
-        data = {"results": []}
+    if config.search_cache.enabled:
+        cached = await get_cached_results(config, cache_key)
+        if cached is not None:
+            await log_search_call(
+                config, "cache", "cache", "hit",
+                result_count=len(cached), query=query, **search_ids,
+            )
+            return cached
 
-    await _log_searxng_engines(
-        config, data, t.elapsed_ms, query, selected_engines=selected_engines,
-        search_ids=search_ids,
-    )
-
-    results = []
-    for rank, item in enumerate(data.get("results", [])[:10], start=1):
-        item_url = item.get("url", "")
-        # SearXNG already fuses per-engine duplicates before returning this
-        # list, so `rank` here is the merged SearXNG position, not each
-        # individual engine's own rank -- good enough for observability;
-        # true per-engine ranks would require querying engines directly.
-        engines = [engine for engine in (item.get("engines") or [item.get("engine")]) if engine]
-        results.append(SearchResult(
-            title=item.get("title", ""),
-            url=item_url,
-            snippet=item.get("content", ""),
-            canonical_url=normalize_url(item_url),
-            observations=[
-                ProviderObservation(provider=f"searxng:{engine}", rank=rank, query=query)
-                for engine in engines
-            ] or [ProviderObservation(provider="searxng", rank=rank, query=query)],
-        ))
-
-    terms = _query_terms(query)
-
-    t = timer()
-    try:
-        wiki_results = await _wikipedia_api_search(query, config.wikipedia.contact)
-        await log_search_call(
-            config, "wikipedia_api", "api", "ok" if wiki_results else "empty",
-            result_count=len(wiki_results), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+    async def _compute() -> list[SearchResult]:
+        url = f"{config.searxng.url.rstrip('/')}/search"
+        params = {
+            "q": query,
+            "format": "json",
+        }
+        duckduckgo_allowed = await providers_allowed_by_circuit_breaker(
+            config, ("duckduckgo",), max_attempts=None,
+            cooldown_hours=SEARXNG_DUCKDUCKGO_COOLDOWN_HOURS,
         )
-    except httpx.HTTPError as e:
-        wiki_results = []
-        await log_search_call(
-            config, "wikipedia_api", "api", "error",
-            error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
-            error_category=classify_http_error(e), **search_ids,
+        selected_engines = tuple(
+            engine for engine in SEARXNG_BASE_ENGINES
+            if engine != "duckduckgo" or engine in duckduckgo_allowed
         )
-    results = _merge(results, wiki_results)
+        if include_alternate_query_engines:
+            recovered = await providers_allowed_by_circuit_breaker(
+                config, SEARXNG_RECOVERED_ENGINES,
+                max_attempts=SEARXNG_ALTERNATE_QUERY_ENGINE_MAX_ATTEMPTS,
+                cooldown_hours=SEARXNG_ALTERNATE_QUERY_ENGINE_COOLDOWN_HOURS,
+            )
+            selected_engines += tuple(
+                engine for engine in SEARXNG_RECOVERED_ENGINES if engine in recovered
+            )
+        # Always select the base engines explicitly. Otherwise omitting
+        # DuckDuckGo here would merely make SearXNG's default configuration add it
+        # back, defeating the cooldown while Bing remains healthy.
+        params["engines"] = ",".join(selected_engines)
+        await _throttle_searxng(config.searxng.min_interval_seconds)
+        t = timer()
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPError as e:
+            await log_search_call(
+                config, "searxng", "scrape", "error",
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+                error_category=classify_http_error(e), **search_ids,
+            )
+            # SearXNG is one provider, not a single point of failure. Continue to
+            # the direct providers below when it is unavailable.
+            data = {"results": []}
 
-    # Wikidata is an entity/reference lookup, not a general search -- only
-    # derive an entity query and call it when a facet/caller explicitly
-    # wants grounding (see RESEARCH_WORK_HANDOFF.md: ~67% of past Wikidata
-    # calls returned nothing, because most queries were never entity-shaped
-    # to begin with). Wikipedia stays unconditional above; its yield doesn't
-    # have the same waste problem.
-    if capability == "grounding":
-        wikidata_query = _wikidata_entity_query(query, wiki_results)
-        if wikidata_query:
+        await _log_searxng_engines(
+            config, data, t.elapsed_ms, query, selected_engines=selected_engines,
+            search_ids=search_ids,
+        )
+
+        results = []
+        for rank, item in enumerate(data.get("results", [])[:10], start=1):
+            item_url = item.get("url", "")
+            # SearXNG already fuses per-engine duplicates before returning this
+            # list, so `rank` here is the merged SearXNG position, not each
+            # individual engine's own rank -- good enough for observability;
+            # true per-engine ranks would require querying engines directly.
+            engines = [engine for engine in (item.get("engines") or [item.get("engine")]) if engine]
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                url=item_url,
+                snippet=item.get("content", ""),
+                canonical_url=normalize_url(item_url),
+                observations=[
+                    ProviderObservation(provider=f"searxng:{engine}", rank=rank, query=query)
+                    for engine in engines
+                ] or [ProviderObservation(provider="searxng", rank=rank, query=query)],
+            ))
+
+        terms = _query_terms(query)
+
+        t = timer()
+        try:
+            wiki_results = await _wikipedia_api_search(query, config.wikipedia.contact)
+            await log_search_call(
+                config, "wikipedia_api", "api", "ok" if wiki_results else "empty",
+                result_count=len(wiki_results), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+            )
+        except httpx.HTTPError as e:
+            wiki_results = []
+            await log_search_call(
+                config, "wikipedia_api", "api", "error",
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+                error_category=classify_http_error(e), **search_ids,
+            )
+        results = _merge(results, wiki_results)
+
+        # Wikidata is an entity/reference lookup, not a general search -- only
+        # derive an entity query and call it when a facet/caller explicitly
+        # wants grounding (see RESEARCH_WORK_HANDOFF.md: ~67% of past Wikidata
+        # calls returned nothing, because most queries were never entity-shaped
+        # to begin with). Wikipedia stays unconditional above; its yield doesn't
+        # have the same waste problem.
+        if capability == "grounding":
+            wikidata_query = _wikidata_entity_query(query, wiki_results)
+            if wikidata_query:
+                t = timer()
+                try:
+                    wikidata_results = await _wikidata_api_search(
+                        wikidata_query, config.wikipedia.contact,
+                    )
+                    await log_search_call(
+                        config, "wikidata_api", "api", "ok" if wikidata_results else "empty",
+                        result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=wikidata_query,
+                        **search_ids,
+                    )
+                    results = _merge(results, wikidata_results)
+                except httpx.HTTPError as e:
+                    await log_search_call(
+                        config, "wikidata_api", "api", "error",
+                        error_message=str(e), elapsed_ms=t.elapsed_ms, query=wikidata_query,
+                        error_category=classify_http_error(e), **search_ids,
+                    )
+
+        # Adaptive waterfall from here: Serper, then Brave, then Tavily each only
+        # fire when the results accumulated so far aren't already sufficient --
+        # "fewer, better provider calls" instead of calling every configured
+        # provider on every search regardless of whether SearXNG/Wikipedia/
+        # Wikidata already answered the question.
+        if (
+            config.serper.api_key
+            and sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
+        ):
             t = timer()
             try:
-                wikidata_results = await _wikidata_api_search(
-                    wikidata_query, config.wikipedia.contact,
-                )
+                serper_results = await _serper_api_search(query, config.serper.api_key)
                 await log_search_call(
-                    config, "wikidata_api", "api", "ok" if wikidata_results else "empty",
-                    result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=wikidata_query,
-                    **search_ids,
+                    config, "serper", "api", "ok" if serper_results else "empty",
+                    result_count=len(serper_results), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
                 )
-                results = _merge(results, wikidata_results)
             except httpx.HTTPError as e:
+                serper_results = []
                 await log_search_call(
-                    config, "wikidata_api", "api", "error",
-                    error_message=str(e), elapsed_ms=t.elapsed_ms, query=wikidata_query,
+                    config, "serper", "api", "error",
+                    error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
                     error_category=classify_http_error(e), **search_ids,
                 )
+            results = _merge(results, serper_results)
 
-    # Adaptive waterfall from here: Serper, then Brave, then Tavily each only
-    # fire when the results accumulated so far aren't already sufficient --
-    # "fewer, better provider calls" instead of calling every configured
-    # provider on every search regardless of whether SearXNG/Wikipedia/
-    # Wikidata already answered the question.
-    if (
-        config.serper.api_key
-        and sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
-    ):
-        t = timer()
-        try:
-            serper_results = await _serper_api_search(query, config.serper.api_key)
-            await log_search_call(
-                config, "serper", "api", "ok" if serper_results else "empty",
-                result_count=len(serper_results), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
-            )
-        except httpx.HTTPError as e:
-            serper_results = []
-            await log_search_call(
-                config, "serper", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
-                error_category=classify_http_error(e), **search_ids,
-            )
-        results = _merge(results, serper_results)
+        if (
+            (config.brave.api_key or config.brave.fallback_api_key)
+            and sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
+        ):
+            # Both keys erroring falls through with whatever the other providers
+            # already returned rather than losing the whole search -- each
+            # attempt is logged inside _brave_search_layered.
+            results = _merge(results, await _brave_search_layered(query, config, search_ids))
 
-    if (
-        (config.brave.api_key or config.brave.fallback_api_key)
-        and sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
-    ):
-        # Both keys erroring falls through with whatever the other providers
-        # already returned rather than losing the whole search -- each
-        # attempt is logged inside _brave_search_layered.
-        results = _merge(results, await _brave_search_layered(query, config, search_ids))
+        if sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS and config.tavily.api_key:
+            t = timer()
+            try:
+                tavily_results = await _tavily_api_search(query, config.tavily.api_key)
+                await log_search_call(
+                    config, "tavily", "api", "ok" if tavily_results else "empty",
+                    result_count=len(tavily_results), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+                )
+            except httpx.HTTPError as e:
+                # Quota exhausted or the API is unreachable -- fall through with
+                # whatever's already been found rather than losing the search.
+                tavily_results = []
+                await log_search_call(
+                    config, "tavily", "api", "error",
+                    error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+                    error_category=classify_http_error(e), **search_ids,
+                )
+            results = _merge(results, tavily_results)
 
-    if sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS and config.tavily.api_key:
-        t = timer()
-        try:
-            tavily_results = await _tavily_api_search(query, config.tavily.api_key)
-            await log_search_call(
-                config, "tavily", "api", "ok" if tavily_results else "empty",
-                result_count=len(tavily_results), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
-            )
-        except httpx.HTTPError as e:
-            # Quota exhausted or the API is unreachable -- fall through with
-            # whatever's already been found rather than losing the search.
-            tavily_results = []
-            await log_search_call(
-                config, "tavily", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
-                error_category=classify_http_error(e), **search_ids,
-            )
-        results = _merge(results, tavily_results)
+        final = _rank_results(results, query)
+        if config.search_cache.enabled:
+            await store_cached_results(config, cache_key, final, freshness)
+        return final
 
-    return _rank_results(results, query)
+    if config.search_cache.enabled:
+        return await _coalesced(cache_key, _compute)
+    return await _compute()
 
 
 async def check_providers_now(config: Config) -> dict:

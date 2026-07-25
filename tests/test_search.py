@@ -21,6 +21,27 @@ def _result(title: str, snippet: str = "") -> SearchResult:
     return SearchResult(title=title, url=f"https://example.test/{title}", snippet=snippet)
 
 
+@pytest.fixture(autouse=True)
+def _no_search_cache(monkeypatch):
+    """Every test in this file calls web_search() with a bare Config(),
+    which resolves to a fixed real on-disk path
+    (~/.local/share/deep_research/research.db), not a per-test tmp_path.
+    Several tests reuse the same query text across different tests, so a
+    real on-disk search_cache.db would let one test's cached entry leak into
+    another's assertions. Neutralize caching for this whole file the same
+    way it already neutralizes search_usage logging (log_search_call ->
+    noop) in individual tests; dedicated cache/coalescing behavior is tested
+    in tests/test_search_cache.py with a tmp_path-scoped Config instead."""
+    async def always_miss(*args, **kwargs):
+        return None
+
+    async def noop_store(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(search_module, "get_cached_results", always_miss)
+    monkeypatch.setattr(search_module, "store_cached_results", noop_store)
+
+
 def test_rank_results_prefers_results_about_the_question_over_stale_results():
     query = "Did Donald Trump say racists were very fine people?"
     results = [
