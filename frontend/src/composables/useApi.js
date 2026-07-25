@@ -634,7 +634,14 @@ export function useApi() {
   // --- Search provider usage ---
 
   async function fetchSearchUsage() {
-    const resp = await fetch(`${API_BASE}/search-usage`)
+    let timezone = 'UTC'
+    try {
+      timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || timezone
+    } catch {
+      // UTC remains a safe fallback in environments without Intl timezone data.
+    }
+    const params = new URLSearchParams({ timezone })
+    const resp = await fetch(`${API_BASE}/search-usage?${params}`)
     return resp.json()
   }
 

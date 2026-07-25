@@ -4,6 +4,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -106,11 +107,14 @@ async def list_models():
 
 
 @app.get("/api/search-usage")
-async def search_usage():
+async def search_usage(timezone: str = "UTC"):
     """Per-provider search call counts/status (duckduckgo via SearXNG scrape,
     brave/tavily via their real APIs) -- how many calls, ok/empty/error
     breakdown, and the most recent call's outcome per provider."""
-    return await get_usage_summary(config)
+    try:
+        return await get_usage_summary(config, timezone_name=timezone)
+    except ZoneInfoNotFoundError:
+        raise HTTPException(400, f"Unknown timezone: {timezone}") from None
 
 
 @app.post("/api/search-usage/check")
