@@ -1,12 +1,12 @@
 import json
 import re
 
-import httpx
 from bs4 import BeautifulSoup, Tag
 
 from deep_research.config import Config
 from deep_research.llm import LLMClient
 from deep_research.models import ScrapedPage
+from deep_research.tools.fetch import safe_fetch
 
 REMOVE_TAGS = {"script", "style", "nav", "footer", "header", "aside", "noscript"}
 
@@ -153,15 +153,12 @@ def _extract_products(html: str) -> list[dict] | None:
 
 
 async def scrape_page(url: str, config: Config) -> ScrapedPage:
-    """Fetch a URL and extract its text content."""
-    async with httpx.AsyncClient(
-        timeout=config.scraping.timeout,
-        follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-    ) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        html = resp.text
+    """Fetch a URL and extract its text content. Uses the shared
+    SSRF-safe/byte-bounded safe_fetch() -- extra_research.py's
+    collect_sources() already filters candidates to HTML before calling
+    this, so decoding as text is safe here."""
+    doc = await safe_fetch(url, config)
+    html = doc.content.decode("utf-8", errors="replace")
 
     # Try structured product extraction first
     products = _extract_products(html)

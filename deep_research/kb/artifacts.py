@@ -72,7 +72,17 @@ async def build_artifact_for_version(
     raw_bytes = Path(version["snapshot_path"]).read_bytes()
     turns = None
 
-    if source_type_code in ("web", "html_file"):
+    # A web-fetched source is registered as "web" before its MIME type is
+    # known (kb/ingest.py's ingest_web_page() creates the source before
+    # fetching), so a PDF found at an ordinary URL still carries
+    # source_type_code == "web" -- the version's own stored mime_type is
+    # what actually distinguishes it, not the parent source's type.
+    if source_type_code == "web" and (version.get("mime_type") or "").split(";")[0].strip() == "application/pdf":
+        artifact_type, extractor = "parsed_pdf", "pypdf_v1"
+        pages = _extract_pdf_pages(raw_bytes)
+        text = None
+        segments = None
+    elif source_type_code in ("web", "html_file"):
         artifact_type, extractor = "clean_text", "bs4_extract_text_v1"
         pages = None
         text = _extract_web_html(raw_bytes)

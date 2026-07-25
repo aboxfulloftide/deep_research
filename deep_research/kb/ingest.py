@@ -32,6 +32,7 @@ from deep_research.kb.canonical import (
 )
 from deep_research.kb.db import KBDatabase
 from deep_research.kb.storage import SnapshotStore
+from deep_research.tools.fetch import FetchTooLargeError, UnsafeURLError, safe_fetch
 
 _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -127,13 +128,21 @@ async def ingest_web_page(
     source_id = source["id"]
 
     try:
-        async with httpx.AsyncClient(
-            timeout=config.scraping.timeout,
-            follow_redirects=True,
-            headers={"User-Agent": _USER_AGENT},
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
+        doc = await safe_fetch(url, config, headers={"User-Agent": _USER_AGENT})
+    except UnsafeURLError as e:
+        await kb_db.add_fetch_attempt(
+            source_id=source_id, attempt_type="fetch", status="failed",
+            requested_uri=url, error_code="unsafe_url", error_message=str(e),
+            started_at=started_at, completed_at=_now(),
+        )
+        return IngestResult(status="failed", source_id=source_id, source_created=source_created, error=str(e))
+    except FetchTooLargeError as e:
+        await kb_db.add_fetch_attempt(
+            source_id=source_id, attempt_type="fetch", status="failed",
+            requested_uri=url, error_code="too_large", error_message=str(e),
+            started_at=started_at, completed_at=_now(),
+        )
+        return IngestResult(status="failed", source_id=source_id, source_created=source_created, error=str(e))
     except httpx.HTTPStatusError as e:
         status = "not_found" if e.response.status_code == 404 else "failed"
         await kb_db.add_fetch_attempt(
@@ -151,10 +160,10 @@ async def ingest_web_page(
         )
         return IngestResult(status="failed", source_id=source_id, source_created=source_created, error=str(e))
 
-    content = resp.content
+    content = doc.content
     content_hash = sha256_bytes(content)
-    mime_type = resp.headers.get("content-type", "text/html").split(";")[0].strip()
-    ext = ".html" if "html" in mime_type else ".dat"
+    mime_type = doc.mime_type or "text/html"
+    ext = ".pdf" if "pdf" in mime_type else (".html" if "html" in mime_type else ".dat")
 
     title = None
     if "html" in mime_type:
@@ -169,14 +178,14 @@ async def ingest_web_page(
 
     version_row, version_created, pruned_ids = await _finalize_version(
         kb_db, snapshot_store, source_id, content, content_hash, ext,
-        http_status=resp.status_code, mime_type=mime_type,
+        http_status=doc.status_code, mime_type=mime_type,
         metadata={"title": title} if title else None,
     )
 
     await kb_db.add_fetch_attempt(
         source_id=source_id, attempt_type="fetch", status="succeeded",
         requested_uri=url, source_version_id=version_row["id"],
-        final_uri=str(resp.url), http_status=resp.status_code,
+        final_uri=doc.final_url, http_status=doc.status_code,
         started_at=started_at, completed_at=_now(),
         metadata=None if version_created else {"note": "content_unchanged"},
     )

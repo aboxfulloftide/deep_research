@@ -78,6 +78,11 @@ class WikipediaConfig(BaseModel):
 class ScrapingConfig(BaseModel):
     timeout: int = 15
     max_content_length: int = 8000
+    # Shared by tools/fetch.py's safe_fetch(), used by both scrape_page() and
+    # ingest_web_page() -- the only two call sites that fetch
+    # attacker-influenced (search-result or user-supplied) URLs.
+    max_response_bytes: int = 10_000_000  # 10 MB, enforced while streaming
+    max_redirects: int = 5
 
 
 class SearchCacheConfig(BaseModel):
@@ -201,6 +206,8 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_WIKIPEDIA_CONTACT": ("wikipedia", "contact"),
         "DEEP_RESEARCH_SCRAPING_TIMEOUT": ("scraping", "timeout"),
         "DEEP_RESEARCH_SCRAPING_MAX_CONTENT_LENGTH": ("scraping", "max_content_length"),
+        "DEEP_RESEARCH_SCRAPING_MAX_RESPONSE_BYTES": ("scraping", "max_response_bytes"),
+        "DEEP_RESEARCH_SCRAPING_MAX_REDIRECTS": ("scraping", "max_redirects"),
         "DEEP_RESEARCH_SEARCH_CACHE_ENABLED": ("search_cache", "enabled"),
         "DEEP_RESEARCH_AGENT_MAX_STEPS": ("agent", "max_steps"),
         "DEEP_RESEARCH_DB_PATH": ("db", "path"),
