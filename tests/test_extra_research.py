@@ -16,7 +16,7 @@ class _FakeLLM:
 
 @pytest.mark.asyncio
 async def test_collect_sources_reads_unique_sources_and_keeps_context_bounded(monkeypatch):
-    async def fake_search(query, config):
+    async def fake_search(query, config, **kwargs):
         return [
             SearchResult(title=f"{query} first", url="https://huggingface.co/one", snippet="first"),
             SearchResult(title=f"{query} second", url="https://github.com/two", snippet="second"),
@@ -40,7 +40,7 @@ async def test_collect_sources_reads_unique_sources_and_keeps_context_bounded(mo
 
 @pytest.mark.asyncio
 async def test_collect_sources_skips_syndicated_title_copies(monkeypatch):
-    async def fake_search(query, config):
+    async def fake_search(query, config, **kwargs):
         return [
             SearchResult(title="One article", url="https://huggingface.co/first", snippet="first"),
             SearchResult(title="One article", url="https://github.com/copy", snippet="copy"),
@@ -62,7 +62,7 @@ async def test_collect_sources_skips_syndicated_title_copies(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_gap_closing_level_can_cap_a_single_query_to_one_source(monkeypatch):
-    async def fake_search(query, config):
+    async def fake_search(query, config, **kwargs):
         return [
             SearchResult(title="First", url="https://huggingface.co/one", snippet="first"),
             SearchResult(title="Second", url="https://github.com/two", snippet="second"),
@@ -79,6 +79,86 @@ async def test_gap_closing_level_can_cap_a_single_query_to_one_source(monkeypatc
 
     assert len(sources) == 1
     assert sources[0].full_content == "source text " * 30
+
+
+@pytest.mark.asyncio
+async def test_collect_sources_backfills_to_the_next_candidate_when_the_top_result_fails_to_fetch(monkeypatch):
+    async def fake_search(query, config, **kwargs):
+        return [
+            SearchResult(title="Top paper", url="https://arxiv.org/abs/1111.11111", snippet="top"),
+            SearchResult(title="Second choice", url="https://github.com/two", snippet="second"),
+        ]
+
+    async def fake_scrape(url, config):
+        if "arxiv.org" in url:
+            raise RuntimeError("connection reset")
+        return ScrapedPage(url=url, title="Second choice", text_content="source text " * 30)
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+
+    outcomes = []
+    sources = await extra.collect_sources(
+        ["question"], Config(), 1, set(), sources_per_query=1, outcomes=outcomes,
+    )
+
+    assert len(sources) == 1
+    assert sources[0].url == "https://github.com/two"
+    decisions = {outcome["url"]: outcome["decision"] for outcome in outcomes}
+    assert decisions["https://arxiv.org/abs/1111.11111"] == "fetch_failed"
+    assert decisions["https://github.com/two"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_collect_sources_never_uses_snippet_as_content(monkeypatch):
+    long_snippet = "This snippet is deliberately long enough to pass the old usable-scrape threshold. " * 5
+
+    async def fake_search(query, config, **kwargs):
+        return [SearchResult(title="Broken page", url="https://github.com/broken", snippet=long_snippet)]
+
+    async def fake_scrape(url, config):
+        raise RuntimeError("500 server error")
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+
+    outcomes = []
+    sources = await extra.collect_sources(["question"], Config(), 1, set(), outcomes=outcomes)
+
+    assert sources == []
+    assert outcomes[0]["decision"] == "fetch_failed"
+
+
+@pytest.mark.asyncio
+async def test_collect_sources_records_a_terminal_outcome_for_every_considered_candidate(monkeypatch):
+    async def fake_search(query, config, **kwargs):
+        return [
+            SearchResult(title="Community post", url="https://reddit.com/one", snippet="low quality"),
+            SearchResult(title="Duplicate", url="https://github.com/dup", snippet="dup"),
+            SearchResult(title="Duplicate", url="https://github.com/dup-again", snippet="dup again"),
+            SearchResult(title="Too short", url="https://github.com/short", snippet="short"),
+        ]
+
+    async def fake_scrape(url, config):
+        if "short" in url:
+            return ScrapedPage(url=url, title="Too short", text_content="short")
+        return ScrapedPage(url=url, title="Duplicate", text_content="source text " * 30)
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+
+    outcomes = []
+    sources = await extra.collect_sources(
+        ["question"], Config(), 1, set(), sources_per_query=4, outcomes=outcomes,
+    )
+
+    assert len(outcomes) == 4
+    decisions = {outcome["url"]: outcome["decision"] for outcome in outcomes}
+    assert decisions["https://reddit.com/one"] == "rejected_low_quality"
+    assert decisions["https://github.com/dup-again"] == "rejected_duplicate"
+    assert decisions["https://github.com/short"] == "rejected_unusable_scrape"
+    assert decisions["https://github.com/dup"] == "accepted"
+    assert len(sources) == 1
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,8 @@ for a practical local model to synthesize.
 import asyncio
 import json
 import re
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field
 from urllib.parse import urlparse
 
 from deep_research.config import Config
@@ -24,6 +25,10 @@ FOLLOW_UP_QUERY_LIMIT = 2
 INITIAL_QUERY_LIMIT = 2
 GAP_CLOSING_QUERY_LIMIT = 1
 SOURCE_ANALYSIS_CHARS = 2_500
+# Bounds worst case when several top-ranked candidates for one query turn out
+# to be duplicates, low-quality, or unusable -- without this, a single query
+# could keep walking an entire ranked-results list one fetch at a time.
+MAX_FETCH_ATTEMPTS_PER_QUERY = 4
 OFFICIAL_HF_ORGANIZATIONS = {
     "qwen", "mistralai", "meta-llama", "google", "microsoft", "deepseek-ai",
     "nvidia", "ibm-granite", "tiiuae", "allenai", "cohereforai", "openai",
@@ -41,6 +46,27 @@ class ResearchSource:
     full_content: str = ""
     source_kind: str = "secondary"
     quality_score: int = 0
+    canonical_url: str = ""
+
+
+@dataclass(frozen=True)
+class CandidateOutcome:
+    """Terminal outcome for one candidate considered while filling one
+    query's slice of collect_sources. Field names are chosen to map directly
+    onto a future KB candidate-ledger row (storing accepted/rejected research
+    candidates) without a rename -- today this is only carried in-memory on
+    ResearchBundle."""
+
+    query: str
+    url: str
+    canonical_url: str
+    facet_id: str
+    capability: str
+    level: int
+    rank: int
+    decision: str  # accepted | rejected_low_quality | rejected_duplicate |
+                   # rejected_non_html | fetch_failed | rejected_unusable_scrape
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -82,6 +108,7 @@ class ResearchBundle:
     collection_attempts: list[dict]
     coverage: dict
     assessments: list[dict] = field(default_factory=list)
+    candidate_outcomes: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -136,16 +163,6 @@ def _model_family_key(title: str, url: str) -> str | None:
     return f"model-family:{re.sub(r'\s+', ' ', name)}" if name else None
 
 
-def _canonical_source_key(url: str) -> str | None:
-    """Recognize the arXiv abstract and HTML rendering as the same paper."""
-    parsed = urlparse(url)
-    if parsed.hostname and parsed.hostname.lower() == "arxiv.org":
-        match = re.match(r"/(?:abs|html)/(\d{4}\.\d{4,5})", parsed.path)
-        if match:
-            return f"arxiv:{match.group(1)}"
-    return None
-
-
 def _usable_scrape(content: str) -> bool:
     normalised = _normalise(content)
     return len(normalised) >= 240 and not any(marker in normalised for marker in BAD_SCRAPE_MARKERS)
@@ -178,85 +195,121 @@ def classify_source(url: str) -> tuple[str, int]:
 
 
 async def collect_sources(
-    queries: list[str], config: Config, level: int, seen_urls: set[str], *, sources_per_query: int | None = None,
+    queries: list[str], config: Config, level: int, seen_urls: set[str], *,
+    sources_per_query: int | None = None,
+    facet_id: str = "", capability: str = "",
+    run_id: str | None = None, attempt_id: str | None = None,
+    outcomes: list[dict] | None = None,
 ) -> list[ResearchSource]:
-    """Search each query and read new HTML sources from it.
+    """Search each query and read new HTML sources from it, walking the
+    ranked candidate list in order per query until per_query_limit usable
+    sources are accepted or the fetch-attempt budget is exhausted -- a failed
+    or unusable fetch moves on to the next-ranked candidate instead of ending
+    the query empty-handed. A search-result snippet is discovery metadata
+    only and never substitutes for page content that was never fetched.
+
+    Every candidate considered (accepted or not) gets a terminal outcome
+    dict appended to `outcomes` if the caller supplies a list -- this is
+    in-memory observability today; the field names mirror what a future KB
+    candidate-ledger row would need.
 
     The first level combines the original wording with planned subquestions.
     Follow-up levels use focused evidence branches; the final level uses one
     gap-closing query. This keeps the whole run bounded while diversifying
     evidence beyond the user's exact wording.
     """
-    selections: list[tuple[str, SearchResult]] = []
+    if outcomes is None:
+        outcomes = []
+    per_query_limit = sources_per_query if sources_per_query is not None else (2 if len(queries) == 1 else SOURCES_PER_QUERY)
     pending_urls: set[str] = set()
     pending_titles: set[str] = set()
-    per_query_limit = sources_per_query if sources_per_query is not None else (2 if len(queries) == 1 else SOURCES_PER_QUERY)
+    sources: list[ResearchSource] = []
+
     for query in queries:
         try:
-            results = await web_search(query, config)
-        except Exception:
+            results = await web_search(
+                query, config, capability=capability or None, facet_id=facet_id or None,
+                run_id=run_id, attempt_id=attempt_id,
+            )
+        except Exception as exc:
+            outcomes.append(asdict(CandidateOutcome(
+                query=query, url="", canonical_url="", facet_id=facet_id, capability=capability,
+                level=level, rank=0, decision="fetch_failed", reason=f"web_search raised: {exc}"[:200],
+            )))
             continue
-        added = 0
+
         ranked_results = sorted(results, key=lambda result: classify_source(result.url)[1], reverse=True)
-        for result in ranked_results:
-            _, quality_score = classify_source(result.url)
-            if quality_score < MIN_EVIDENCE_QUALITY:
-                continue
+        accepted_this_query = 0
+        fetch_attempts_this_query = 0
+
+        for rank, result in enumerate(ranked_results, start=1):
+            if accepted_this_query >= per_query_limit or fetch_attempts_this_query >= MAX_FETCH_ATTEMPTS_PER_QUERY:
+                break
+
+            canonical_key = result.canonical_url or result.url
             title_key = _title_key(result.title)
             family_key = _model_family_key(result.title, result.url)
-            canonical_key = _canonical_source_key(result.url)
+            _, quality_score = classify_source(result.url)
+
+            def _record(decision: str, reason: str = "") -> None:
+                outcomes.append(asdict(CandidateOutcome(
+                    query=query, url=result.url, canonical_url=canonical_key,
+                    facet_id=facet_id, capability=capability, level=level,
+                    rank=rank, decision=decision, reason=reason,
+                )))
+
             if (
-                result.url in seen_urls
-                or title_key in seen_urls
-                or (family_key is not None and family_key in seen_urls)
-                or (canonical_key is not None and canonical_key in seen_urls)
-                or result.url in pending_urls
-                or title_key in pending_titles
-                or (canonical_key is not None and canonical_key in pending_titles)
-                or not _is_html_result(result)
+                canonical_key in seen_urls or canonical_key in pending_urls
+                or title_key in seen_urls or title_key in pending_titles
+                or (family_key is not None and (family_key in seen_urls or family_key in pending_titles))
             ):
+                _record("rejected_duplicate")
                 continue
-            selections.append((query, result))
-            pending_urls.add(result.url)
+            if quality_score < MIN_EVIDENCE_QUALITY:
+                _record("rejected_low_quality")
+                continue
+            if not _is_html_result(result):
+                _record("rejected_non_html")
+                continue
+
+            fetch_attempts_this_query += 1
+            try:
+                page = await scrape_page(result.url, config)
+                content = page.text_content
+                title = page.title or result.title
+            except Exception as exc:
+                _record("fetch_failed", reason=str(exc)[:200])
+                continue
+
+            if not _usable_scrape(content):
+                _record("rejected_unusable_scrape")
+                continue
+
+            source_kind, _ = classify_source(result.url)
+            sources.append(ResearchSource(
+                title=title,
+                url=result.url,
+                content=content[:SOURCE_EXCERPT_CHARS],
+                level=level,
+                query=query,
+                full_content=content,
+                source_kind=source_kind,
+                quality_score=quality_score,
+                canonical_url=canonical_key,
+            ))
+            pending_urls.add(canonical_key)
             pending_titles.add(title_key)
             if family_key is not None:
                 pending_titles.add(family_key)
-            if canonical_key is not None:
-                pending_titles.add(canonical_key)
-            added += 1
-            if added >= per_query_limit:
-                break
+            accepted_this_query += 1
+            _record("accepted")
 
-    async def read(query: str, result: SearchResult) -> ResearchSource:
-        try:
-            page = await scrape_page(result.url, config)
-            content = page.text_content or result.snippet
-            title = page.title or result.title
-        except Exception:
-            content = result.snippet
-            title = result.title
-        source_kind, quality_score = classify_source(result.url)
-        return ResearchSource(
-            title=title,
-            url=result.url,
-            content=content[:SOURCE_EXCERPT_CHARS],
-            level=level,
-            query=query,
-            full_content=content,
-            source_kind=source_kind,
-            quality_score=quality_score,
-        )
-
-    sources = [source for source in await asyncio.gather(*(read(query, result) for query, result in selections)) if _usable_scrape(source.content)]
     for source in sources:
-        seen_urls.add(source.url)
+        seen_urls.add(source.canonical_url or source.url)
         seen_urls.add(_title_key(source.title))
         family_key = _model_family_key(source.title, source.url)
         if family_key is not None:
             seen_urls.add(family_key)
-        canonical_key = _canonical_source_key(source.url)
-        if canonical_key is not None:
-            seen_urls.add(canonical_key)
     return sources
 
 
@@ -376,7 +429,10 @@ def _source_assessment(source: ResearchSource, facet: ResearchFacet) -> dict:
     directness = round(min(1.0, 0.25 + overlap * 1.5), 2)
     return {
         "url": source.url, "facet_id": facet.id, "authority": source.quality_score,
-        "directness": directness, "independent": True,
+        "directness": directness,
+        # No publisher/syndication/common-origin analysis exists yet -- do not
+        # claim independence has been established until it actually has.
+        "independent": "unknown",
         "extractable": len(_normalise(source.content)) >= 240,
         "accepted": source.quality_score >= MIN_EVIDENCE_QUALITY and directness >= 0.45,
     }
@@ -416,11 +472,25 @@ async def collect_research_bundle(llm: LLMClient, question: str, config: Config,
     sources: list[ResearchSource] = []
     attempts: list[dict] = []
     assessments: list[dict] = []
+    candidate_outcomes: list[dict] = []
+    # Shared across every collect_sources() call this bundle makes, so the
+    # search-usage log can join every provider call back to the bundle that
+    # made it (and each call's own attempt_id back to the specific attempt).
+    run_id = uuid.uuid4().hex
+    attempt_counter = 0
 
     async def collect_for(facet: ResearchFacet, level: int, capability: str, query: str) -> None:
+        nonlocal attempt_counter
         if len(sources) >= budget.max_sources:
             return
-        found = await collect_sources([query], config, level, seen_urls, sources_per_query=1)
+        attempt_counter += 1
+        attempt_id = str(attempt_counter)
+        outcomes: list[dict] = []
+        found = await collect_sources(
+            [query], config, level, seen_urls, sources_per_query=1,
+            facet_id=facet.id, capability=capability, run_id=run_id, attempt_id=attempt_id,
+            outcomes=outcomes,
+        )
         found = found[:max(0, budget.max_sources - len(sources))]
         sources.extend(found)
         # Attribute retrieved evidence to its facet even if a recovery query
@@ -428,7 +498,12 @@ async def collect_research_bundle(llm: LLMClient, question: str, config: Config,
         for source in found:
             source.query = facet.question
             assessments.append(_source_assessment(source, facet))
-        attempts.append({"level": level, "facet_id": facet.id, "adapter": capability, "queries": [query], "source_count": len(found), "source_urls": [source.url for source in found]})
+        candidate_outcomes.extend(outcomes)
+        attempts.append({
+            "level": level, "facet_id": facet.id, "adapter": capability, "queries": [query],
+            "source_count": len(found), "source_urls": [source.url for source in found],
+            "attempt_id": attempt_id,
+        })
 
     for facet in plan.facets:
         for capability in facet.capabilities[:budget.max_adapters_per_facet]:
@@ -444,7 +519,7 @@ async def collect_research_bundle(llm: LLMClient, question: str, config: Config,
             await collect_for(facet, 2, recovery, _adapter_query(recovery, f"{facet.search_query} independent corroboration"))
         coverage = _coverage_for(plan, sources, assessments)
 
-    return ResearchBundle(plan, sources, attempts, coverage, assessments)
+    return ResearchBundle(plan, sources, attempts, coverage, assessments, candidate_outcomes)
 
 
 async def derive_starting_queries(llm: LLMClient, original_query: str) -> list[str]:

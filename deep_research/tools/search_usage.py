@@ -12,6 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
@@ -32,6 +33,25 @@ CREATE TABLE IF NOT EXISTS search_calls (
 
 CREATE INDEX IF NOT EXISTS idx_search_calls_provider_created ON search_calls(provider, created_at DESC);
 """
+
+# Nullable, additive columns so a search call can be joined back to the
+# research run/plan/facet/attempt that made it and the capability it was
+# serving. Unlike kb/db.py's Postgres schema, SQLite has no
+# "ALTER TABLE ... ADD COLUMN IF NOT EXISTS" -- it errors with a syntax error,
+# not a silent no-op -- so each missing column is added individually via
+# PRAGMA table_info, safe to run on every connect.
+_ADDITIVE_COLUMNS = ("run_id", "plan_id", "facet_id", "attempt_id", "capability")
+
+
+async def _ensure_additive_columns(db: aiosqlite.Connection) -> None:
+    existing = {row[1] for row in await db.execute_fetchall("PRAGMA table_info(search_calls)")}
+    added = False
+    for column in _ADDITIVE_COLUMNS:
+        if column not in existing:
+            await db.execute(f"ALTER TABLE search_calls ADD COLUMN {column} TEXT")
+            added = True
+    if added:
+        await db.commit()
 
 # Seed list shown even before any calls are logged. SearXNG can surface
 # other engines too (bing, mojeek, ...) -- get_usage_summary
@@ -55,6 +75,7 @@ async def _connect(config: Config):
     db = await aiosqlite.connect(path)
     try:
         await db.executescript(SCHEMA)
+        await _ensure_additive_columns(db)
         yield db
     finally:
         await db.close()
@@ -64,18 +85,28 @@ async def log_search_call(
     config: Config, provider: str, mode: str, status: str, *,
     result_count: int | None = None, error_message: str | None = None,
     elapsed_ms: int | None = None, query: str | None = None,
+    run_id: str | None = None, plan_id: str | None = None,
+    facet_id: str | None = None, attempt_id: str | None = None,
+    capability: str | None = None,
 ) -> None:
     """Best-effort -- a logging hiccup must never break the actual search
     call it's describing, so this swallows its own errors rather than
-    propagating them (same posture as trust.py's classification writes)."""
+    propagating them (same posture as trust.py's classification writes).
+
+    run_id/plan_id/facet_id/attempt_id/capability are optional context IDs so
+    a search call can later be joined back to the research run/plan/facet/
+    attempt (or claim verification) that made it -- callers with no such
+    concept (e.g. the plain chat tool loop) simply leave them unset."""
     try:
         async with _connect(config) as db:
             await db.execute(
                 "INSERT INTO search_calls (provider, mode, status, result_count, error_message, "
-                "elapsed_ms, query, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "elapsed_ms, query, run_id, plan_id, facet_id, attempt_id, capability, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     provider, mode, status, result_count, error_message, elapsed_ms,
-                    (query or "")[:200], datetime.now(timezone.utc).isoformat(),
+                    (query or "")[:200], run_id, plan_id, facet_id, attempt_id, capability,
+                    datetime.now(timezone.utc).isoformat(),
                 ),
             )
             await db.commit()
@@ -142,10 +173,61 @@ def timer() -> _Timer:
     return _Timer()
 
 
-async def get_usage_summary(config: Config, recent_limit: int = 50) -> dict:
-    now = datetime.now(timezone.utc)
-    today = now.date().isoformat()
-    month = now.strftime("%Y-%m")
+def _utc_period_bounds(
+    timezone_name: str, now_utc: datetime | None = None,
+) -> tuple[datetime, datetime, datetime, datetime]:
+    """Return local day/month boundaries converted to UTC for storage queries.
+
+    Search-call timestamps stay in UTC. The usage cards, however, describe
+    periods to a person ("today" and "this month"), so their boundaries need
+    to follow that person's timezone rather than rolling over at UTC midnight.
+    """
+    display_timezone = ZoneInfo(timezone_name)
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+    local_now = now_utc.astimezone(display_timezone)
+
+    day_start_local = datetime(
+        local_now.year, local_now.month, local_now.day, tzinfo=display_timezone,
+    )
+    day_end_local = day_start_local + timedelta(days=1)
+    month_start_local = datetime(
+        local_now.year, local_now.month, 1, tzinfo=display_timezone,
+    )
+    if local_now.month == 12:
+        month_end_local = datetime(
+            local_now.year + 1, 1, 1, tzinfo=display_timezone,
+        )
+    else:
+        month_end_local = datetime(
+            local_now.year, local_now.month + 1, 1, tzinfo=display_timezone,
+        )
+
+    return tuple(
+        boundary.astimezone(timezone.utc)
+        for boundary in (
+            day_start_local, day_end_local, month_start_local, month_end_local,
+        )
+    )
+
+
+async def get_usage_summary(
+    config: Config,
+    recent_limit: int = 50,
+    *,
+    timezone_name: str = "UTC",
+    now_utc: datetime | None = None,
+) -> dict:
+    day_start, day_end, month_start, month_end = _utc_period_bounds(
+        timezone_name, now_utc,
+    )
+    day_start_iso = day_start.isoformat()
+    day_end_iso = day_end.isoformat()
+    month_start_iso = month_start.isoformat()
+    month_end_iso = month_end.isoformat()
 
     async with _connect(config) as db:
         db.row_factory = aiosqlite.Row
@@ -162,13 +244,20 @@ async def get_usage_summary(config: Config, recent_limit: int = 50) -> dict:
             # look permanently capped at exactly 500 calls this month.
             summary_rows = await db.execute_fetchall(
                 "SELECT "
-                "COUNT(*) FILTER (WHERE created_at LIKE ?) AS calls_today, "
-                "COUNT(*) FILTER (WHERE created_at LIKE ?) AS calls_month, "
-                "COUNT(*) FILTER (WHERE created_at LIKE ? AND status = 'ok') AS ok_count, "
-                "COUNT(*) FILTER (WHERE created_at LIKE ? AND status = 'empty') AS empty_count, "
-                "COUNT(*) FILTER (WHERE created_at LIKE ? AND status = 'error') AS error_count "
+                "COUNT(*) FILTER (WHERE created_at >= ? AND created_at < ?) AS calls_today, "
+                "COUNT(*) FILTER (WHERE created_at >= ? AND created_at < ?) AS calls_month, "
+                "COUNT(*) FILTER (WHERE created_at >= ? AND created_at < ? AND status = 'ok') AS ok_count, "
+                "COUNT(*) FILTER (WHERE created_at >= ? AND created_at < ? AND status = 'empty') AS empty_count, "
+                "COUNT(*) FILTER (WHERE created_at >= ? AND created_at < ? AND status = 'error') AS error_count "
                 "FROM search_calls WHERE provider = ?",
-                (f"{today}%", f"{month}%", f"{month}%", f"{month}%", f"{month}%", provider),
+                (
+                    day_start_iso, day_end_iso,
+                    month_start_iso, month_end_iso,
+                    month_start_iso, month_end_iso,
+                    month_start_iso, month_end_iso,
+                    month_start_iso, month_end_iso,
+                    provider,
+                ),
             )
             summary = summary_rows[0]
             last_rows = await db.execute_fetchall(
@@ -198,4 +287,8 @@ async def get_usage_summary(config: Config, recent_limit: int = 50) -> dict:
         )
         recent_calls = [dict(r) for r in recent]
 
-    return {"providers": providers, "recent_calls": recent_calls}
+    return {
+        "providers": providers,
+        "recent_calls": recent_calls,
+        "timezone": timezone_name,
+    }

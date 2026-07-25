@@ -36,6 +36,19 @@ class _FakeLLM:
         pass
 
 
+def test_serialize_and_deserialize_source_round_trips_canonical_url():
+    source = extra.ResearchSource(
+        "Source", "https://example.test/page", "Evidence text", 1, "query",
+        source_kind="primary", quality_score=5, canonical_url="https://example.test/page",
+    )
+
+    serialized = experiments._serialize_source(source)
+    assert serialized["canonical_url"] == "https://example.test/page"
+
+    [restored] = experiments._deserialize_sources([serialized])
+    assert restored.canonical_url == "https://example.test/page"
+
+
 @pytest.mark.asyncio
 async def test_current_model_experiment_uses_active_server_without_starting_profile(monkeypatch):
     async def fake_model(base_url):
@@ -177,3 +190,4 @@ async def test_collection_only_returns_raw_sources_without_synthesis(monkeypatch
     assert result["sources"][0]["title"] == "Source"
     assert result["has_authoritative_source"] is True
     assert len(result["collection_attempts"]) == 1
+    assert result["candidate_outcomes"] == []

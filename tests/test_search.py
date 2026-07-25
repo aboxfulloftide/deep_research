@@ -3,13 +3,16 @@ import pytest
 
 import deep_research.tools.search as search_module
 from deep_research.config import BraveConfig, Config, SerperConfig, TavilyConfig
-from deep_research.models import SearchResult
+from deep_research.kb.canonical import normalize_url
+from deep_research.models import ProviderObservation, SearchResult
 from deep_research.tools.search import (
     SEARXNG_BASE_ENGINES,
+    SEARXNG_HEALTH_PROBE_ENGINES,
     SEARXNG_RECOVERED_ENGINES,
     _brave_search_layered,
     _rank_results,
     _wikidata_entity_query,
+    check_providers_now,
     web_search,
 )
 
@@ -66,6 +69,53 @@ def test_wikidata_uses_short_entity_query_and_skips_unmapped_sentence():
     assert _wikidata_entity_query(
         "This long sentence has no useful matching entity page in the available results.", []
     ) is None
+
+
+def _finalized(title: str, url: str, provider: str, rank: int, query: str = "q") -> SearchResult:
+    return SearchResult(
+        title=title, url=url, snippet="", canonical_url=normalize_url(url),
+        observations=[ProviderObservation(provider=provider, rank=rank, query=query)],
+    )
+
+
+def test_merge_preserves_both_providers_observations_for_a_tracking_param_duplicate():
+    first = [_finalized("Article", "https://example.com/story?utm_source=x", "brave", 1)]
+    second = [_finalized("Article", "https://example.com/story", "serper", 2)]
+
+    merged = search_module._merge(first, second)
+
+    assert len(merged) == 1
+    providers = {obs.provider for obs in merged[0].observations}
+    assert providers == {"brave", "serper"}
+
+
+def test_merge_folds_a_www_duplicate_across_providers():
+    first = [_finalized("Home", "https://www.example.com/page", "bing_via_searxng", 1)]
+    second = [_finalized("Home", "https://example.com/page", "wikipedia_api", 1)]
+
+    merged = search_module._merge(first, second)
+
+    assert len(merged) == 1
+    assert {obs.provider for obs in merged[0].observations} == {"bing_via_searxng", "wikipedia_api"}
+
+
+def test_merge_folds_arxiv_abstract_and_html_across_providers():
+    first = [_finalized("Paper", "https://arxiv.org/abs/2401.12345", "brave", 1)]
+    second = [_finalized("Paper", "https://arxiv.org/html/2401.12345v2", "serper", 1)]
+
+    merged = search_module._merge(first, second)
+
+    assert len(merged) == 1
+    assert {obs.provider for obs in merged[0].observations} == {"brave", "serper"}
+
+
+def test_merge_keeps_genuinely_distinct_urls_separate():
+    first = [_finalized("A", "https://example.com/a", "brave", 1)]
+    second = [_finalized("B", "https://example.com/b", "serper", 1)]
+
+    merged = search_module._merge(first, second)
+
+    assert len(merged) == 2
 
 
 def _http_error(status_code: int) -> httpx.HTTPStatusError:
@@ -277,7 +327,56 @@ async def test_web_search_omits_duckduckgo_while_its_circuit_is_open(monkeypatch
 
     await web_search("literal claim", Config())
 
-    assert requested_params[0]["engines"] == "bing,mojeek"
+    assert requested_params[0]["engines"] == "bing"
+
+
+async def test_health_probe_still_checks_mojeek_while_ordinary_search_omits_it(monkeypatch):
+    requested_params = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [], "unresponsive_engines": []}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, params=None, headers=None):
+            requested_params.append(params)
+            return FakeResponse()
+
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(search_module.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr(search_module, "_throttle_searxng", noop)
+    monkeypatch.setattr(search_module, "log_search_call", noop)
+    monkeypatch.setattr(search_module, "_wikipedia_api_search", no_results)
+    monkeypatch.setattr(search_module, "_wikidata_api_search", no_results)
+
+    await check_providers_now(Config())
+    assert requested_params[0]["engines"] == ",".join(SEARXNG_HEALTH_PROBE_ENGINES)
+    assert "mojeek" in requested_params[0]["engines"]
+
+    requested_params.clear()
+    monkeypatch.setattr(search_module, "_log_searxng_engines", noop)
+
+    async def allow_engines(config, providers, **kwargs):
+        return set(providers)
+
+    monkeypatch.setattr(search_module, "providers_allowed_by_circuit_breaker", allow_engines)
+
+    await web_search("literal claim", Config())
+    assert "mojeek" not in requested_params[0]["engines"]
 
 
 async def test_serper_is_primary_and_tavily_remains_thin_results_fallback(monkeypatch):
@@ -338,3 +437,51 @@ async def test_serper_is_primary_and_tavily_remains_thin_results_fallback(monkey
     await web_search("PostgreSQL index documentation", config)
 
     assert calls == {"serper": 1, "tavily": 0}
+
+
+async def test_web_search_forwards_capability_and_ids_to_search_usage_log(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [], "unresponsive_engines": []}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, params=None, headers=None):
+            return FakeResponse()
+
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    logged = []
+
+    async def capture_log(config, provider, mode, status, **kwargs):
+        logged.append(kwargs)
+
+    monkeypatch.setattr(search_module.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr(search_module, "_throttle_searxng", noop)
+    monkeypatch.setattr(search_module, "log_search_call", capture_log)
+    monkeypatch.setattr(search_module, "_wikipedia_api_search", no_results)
+    monkeypatch.setattr(search_module, "_wikidata_api_search", no_results)
+
+    await web_search(
+        "concise alternate keywords", Config(),
+        capability="scholarly", facet_id="facet-1", run_id="run-1", attempt_id="attempt-1",
+    )
+
+    assert logged
+    assert all(
+        entry.get("capability") == "scholarly" and entry.get("facet_id") == "facet-1"
+        and entry.get("run_id") == "run-1" and entry.get("attempt_id") == "attempt-1"
+        for entry in logged
+    )

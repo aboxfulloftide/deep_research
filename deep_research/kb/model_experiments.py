@@ -31,6 +31,7 @@ def _serialize_source(source) -> dict:
         "title": source.title, "url": source.url, "content": source.content,
         "full_content": source.full_content, "level": source.level, "query": source.query,
         "source_kind": source.source_kind, "quality_score": source.quality_score,
+        "canonical_url": source.canonical_url,
     }
 
 
@@ -42,6 +43,7 @@ def _deserialize_sources(rows: list[dict]):
         full_content=str(row.get("full_content") or row["content"]), level=int(row["level"]),
         query=str(row["query"]), source_kind=str(row.get("source_kind") or "secondary"),
         quality_score=int(row.get("quality_score") or 0),
+        canonical_url=str(row.get("canonical_url") or ""),
     ) for row in rows]
 
 
@@ -268,6 +270,7 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
                     },
                     "coverage": research_bundle.coverage,
                     "source_assessments": research_bundle.assessments,
+                    "candidate_outcomes": research_bundle.candidate_outcomes,
                     "has_authoritative_source": has_authoritative_source(sources),
                     "elapsed_seconds": round(time.monotonic() - started_at, 1),
                     "answer": "Source collection complete; review this bundle before analysis.",

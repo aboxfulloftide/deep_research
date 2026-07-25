@@ -737,6 +737,7 @@ async def verify_claim(
                     results = await web_search(
                         query, config,
                         include_alternate_query_engines=include_alternate_query_engines,
+                        capability="claim_verification", attempt_id=claim_id,
                     )
             except Exception:
                 break

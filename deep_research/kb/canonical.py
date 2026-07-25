@@ -19,6 +19,19 @@ _TRACKING_PARAMS = {
 
 _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
+# arXiv serves the same paper as an abstract page (/abs/{id}) and a full HTML
+# rendering (/html/{id}); fold both to one canonical path so cross-provider
+# search merges and KB ingestion recognize them as the same source. Does not
+# match /pdf/{id} -- that is a distinct downloadable artifact, out of scope
+# here. A trailing version suffix (v2, etc) is intentionally ignored: this is
+# identity for dedup, not a claim that every version is byte-identical.
+_ARXIV_ID_RE = re.compile(r"^/(?:abs|html)/(\d{4}\.\d{4,5})(?:v\d+)?/?$")
+
+# AMP/print-page variant canonicalization (e.g. "/amp/", "?output=amp",
+# "/print/") is deliberately not handled here yet -- a rushed heuristic risks
+# folding together pages that only coincidentally share a query param name.
+# Left as a documented gap rather than an ad hoc rule.
+
 _FILE_SOURCE_TYPES = {
     ".pdf": "pdf",
     ".md": "markdown",
@@ -31,12 +44,14 @@ _FILE_SOURCE_TYPES = {
 
 
 def normalize_url(url: str) -> str:
-    """Normalize a URL for stable dedupe: lowercase host, drop default port,
-    drop fragment, strip tracking params, sort remaining params, drop trailing
-    slash (except root)."""
+    """Normalize a URL for stable dedupe: lowercase host, drop a leading
+    "www." prefix, drop default port, drop fragment, strip tracking params,
+    sort remaining params, drop trailing slash (except root), and fold
+    arXiv's abs/html rendering pair to one canonical path."""
     parts = urlsplit(url.strip())
     scheme = parts.scheme.lower() or "https"
     host = parts.hostname.lower() if parts.hostname else ""
+    host = host.removeprefix("www.")
     port = parts.port
     if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
         netloc = f"{host}:{port}"
@@ -49,6 +64,11 @@ def normalize_url(url: str) -> str:
     path = parts.path or "/"
     if len(path) > 1 and path.endswith("/"):
         path = path.rstrip("/")
+
+    if host == "arxiv.org":
+        arxiv_match = _ARXIV_ID_RE.match(path)
+        if arxiv_match:
+            path = f"/abs/{arxiv_match.group(1)}"
 
     query_pairs = [
         (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
