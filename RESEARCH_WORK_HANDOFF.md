@@ -12,13 +12,14 @@ Last verified against the running system and `main`: **July 25, 2026**.
 - The deletion of `PLAN_GPU_COORDINATOR.md` was intentionally committed and
   pushed in `5d76e4b`; it is no longer an outstanding worktree concern.
 - Interactive Extra Research is available. Batch 1 (evidence correctness and
-  observability), the domain-neutrality authority-gate fix, and all of
-  Batch 2 (RRF fusion, typed provider-failure classification, adaptive
-  waterfall, result caching, concurrent-request coalescing) are committed
-  (`e5c7db1`, `6cc32ab`, `1ab7dd3`, `d8c9866`). Capability routing is still
-  cosmetic (no `SourceAdapter` registry), and nothing Extra Research collects
-  is persisted to the KB yet -- it should still not be treated as a
-  source-native, KB-integrated research system.
+  observability), the domain-neutrality authority-gate fix, all of Batch 2
+  (RRF fusion, typed provider-failure classification, adaptive waterfall,
+  result caching, concurrent-request coalescing), and Batch 3 Round A (a
+  shared SSRF-safe fetch contract plus the PDF-ingestion routing fix) are
+  committed (`e5c7db1`, `6cc32ab`, `1ab7dd3`, `d8c9866`, `83ad2b1`).
+  Capability routing is still cosmetic (no `SourceAdapter` registry), and
+  nothing Extra Research collects is persisted to the KB yet -- it should
+  still not be treated as a source-native, KB-integrated research system.
 
 ## What We Were Working On
 
@@ -214,6 +215,41 @@ Batch 2 in full.
   `search_usage.py` logging), with real cache/coalescing behavior covered
   separately in the new `tests/test_search_cache.py`.
 
+### Batch 3, Round A — Shared Safe Fetch Contract + PDF Routing Fix (July 25, 2026)
+
+Commit `83ad2b1` covers the first piece of Batch 3 ("Reusable acquisition
+and passage retrieval"): the shared SSRF-safe/byte-bounded fetch contract
+and the PDF-ingestion routing fix it enables. Persisting Extra Research's
+sources into the KB, facet-relevant passage retrieval, structured
+`kb_search()` records, and OpenAlex/arXiv adapters are deliberately
+deferred to later rounds.
+
+- New `deep_research/tools/fetch.py`'s `safe_fetch()` is now the only fetch
+  path for `scrape_page()` (Extra Research) and `ingest_web_page()` (KB
+  ingestion) -- confirmed by grepping every `httpx.AsyncClient` call site in
+  the repo that these are the only two that fetch attacker-influenced
+  (search-result or user-supplied) URLs; every other call site hits a
+  fixed/deployment-configured/hardcoded trusted host.
+- SSRF protection resolves the hostname via `socket.getaddrinfo` and rejects
+  private/loopback/link-local/reserved/multicast addresses -- catching DNS
+  rebinding (a normal-looking hostname that resolves to an internal
+  address), not just literal-IP string matching -- and re-validates every
+  redirect hop, not just the initial URL.
+- The response body is streamed with a hard byte cap
+  (`config.scraping.max_response_bytes`, default 10 MB) enforced *during*
+  download, and redirects are capped
+  (`config.scraping.max_redirects`, default 5).
+- PDF routing fix: `kb/artifacts.py`'s `build_artifact_for_version()` now
+  checks the source *version's* own stored `mime_type` for
+  `application/pdf` when `source_type_code == "web"` and routes to the
+  existing `pypdf` extractor -- previously a PDF fetched at an ordinary URL
+  was always run through the HTML clean-text extractor because
+  `ingest_web_page()` registers every URL-based source as `"web"` before
+  the MIME type is even known. Turned out simpler than expected: no
+  reordering of fetch-before-source-creation was needed, since
+  `build_artifact_for_version()` already receives the `version` dict with
+  the correct `mime_type` on it -- `artifacts.py` just wasn't reading it.
+
 ### Existing Foundations Not Yet Integrated Into Routed Collection
 
 - `deep_research/tools/kb_search.py` already provides hybrid full-text and
@@ -398,13 +434,19 @@ deterministic result.
 - `ResearchSource` gained `canonical_url` (commit `e5c7db1`) but still lacks
   adapter provenance, source/version IDs, retrieval and publication dates,
   content hash, freshness, language, license, and parent seed.
-- PDF results are currently discarded before fetch, even though scholarly and
-  official evidence is frequently PDF-only. Simply removing that filter is not
-  sufficient: the interactive scraper assumes HTML, while KB URL ingestion
-  registers a source as `web` before inspecting its MIME type. A downloaded PDF
-  would therefore not reach the existing `pypdf` artifact path correctly. This
-  is still open; `collect_sources()`'s PDF skip now at least records a
-  `rejected_non_html` outcome instead of silently dropping the candidate.
+- PDF results are currently discarded before fetch in `collect_sources()`
+  (`_is_html_result()`), even though scholarly and official evidence is
+  frequently PDF-only -- still open, deliberately deferred past Batch 3
+  Round A. **Partially resolved (commit `83ad2b1`):** a downloaded PDF now
+  reaches the existing `pypdf` artifact path correctly -- `kb/ingest.py`
+  still registers every URL-based source as `web` before the MIME type is
+  known, but `kb/artifacts.py`'s `build_artifact_for_version()` now checks
+  the version's own stored `mime_type` and routes PDFs to the PDF extractor
+  regardless. What remains: `collect_sources()`'s `_is_html_result()` filter
+  itself still skips PDF candidates before ever fetching them (recording a
+  `rejected_non_html` outcome rather than silently dropping them) -- lifting
+  that filter, so Extra Research can actually collect PDF evidence, is the
+  remaining piece.
 - **Resolved (commit `e5c7db1`):** a failed page fetch no longer substitutes
   the search-result snippet for the page body. `collect_sources()` now
   backfills to the next ranked candidate on any duplicate/low-quality/
@@ -693,17 +735,25 @@ above). Items 2, 5, 6, 7, and 8 remain open exactly as described.
    a terminal outcome/reason, and collection walks `ranked_results` until
    `per_query_limit` *retrieved and usable* sources are found or the explicit
    fetch-attempt budget is exhausted.
-5. **PDFs need MIME-aware web ingestion, not just removal of a filter.**
-   `_is_html_result()` (`extra_research.py:120-121`) is used as a hard
-   candidate filter in `collect_sources` (`extra_research.py:216`), so PDF
-   search results are dropped before they are ever fetched. Because primary
-   evidence — papers, specs, whitepapers, official documentation — is
-   disproportionately PDF-only, this likely affects evidence quality more than
-   adding another general provider. The existing KB artifact builder already
-   parses sources typed as `pdf`, but `ingest_web_page()` creates a `web`
-   source before it sees the response MIME type. The common fetch/ingest
-   contract must sniff and validate MIME type, persist the raw PDF as a PDF
-   source version, extract page-located text, and return relevant passages.
+5. **[PARTIAL] PDFs need MIME-aware web ingestion, not just removal of a
+   filter.** `_is_html_result()` (`extra_research.py:120-121`) is used as a
+   hard candidate filter in `collect_sources` (`extra_research.py:216`), so
+   PDF search results are dropped before they are ever fetched. Because
+   primary evidence — papers, specs, whitepapers, official documentation —
+   is disproportionately PDF-only, this likely affects evidence quality more
+   than adding another general provider. The existing KB artifact builder
+   already parses sources typed as `pdf`, but `ingest_web_page()` creates a
+   `web` source before it sees the response MIME type. The common fetch/
+   ingest contract must sniff and validate MIME type, persist the raw PDF as
+   a PDF source version, extract page-located text, and return relevant
+   passages.
+   Resolved (commit `83ad2b1`): `build_artifact_for_version()` now reads the
+   source version's stored `mime_type` and correctly routes a web-fetched
+   PDF to the `pypdf` extractor — a downloaded PDF now reaches page-located
+   text extraction. Still open: `extra_research.py`'s `_is_html_result()`
+   filter still drops PDF candidates in `collect_sources()` before they're
+   ever fetched, so Extra Research itself still can't collect PDF evidence
+   even though the KB-side ingestion/artifact path now handles it correctly.
 6. **Ranking is pure lexical overlap, and RRF first needs provider-ranked
    observations.** `_rank_results`/`_relevance_score` (`search.py:340-364`)
    concatenate every provider's results and sort by title/snippet term
@@ -720,14 +770,25 @@ above). Items 2, 5, 6, 7, and 8 remain open exactly as described.
    scrape markers cover only a few observed strings, not the underlying
    failure mode. Structured product extraction should be opt-in for a product
    data task and stored alongside, not instead of, generic cleaned text.
-8. **The current fetch paths are not safe or reusable enough for expanded
-   collection.** `scrape_page()` and `ingest_web_page()` independently follow
-   redirects and read complete responses before applying content-length
-   truncation. They do not share redirect-target SSRF validation, a hard byte
-   limit, MIME policy, conditional request handling, or one fetched artifact.
-   Introduce one bounded `FetchedDocument` contract that validates every
-   redirect, rejects private/link-local destinations, streams to a byte cap,
-   records headers/final URL/hash, and feeds both KB snapshots and extraction.
+8. **[PARTIAL] The current fetch paths are not safe or reusable enough for
+   expanded collection.** `scrape_page()` and `ingest_web_page()`
+   independently follow redirects and read complete responses before
+   applying content-length truncation. They do not share redirect-target
+   SSRF validation, a hard byte limit, MIME policy, conditional request
+   handling, or one fetched artifact. Introduce one bounded
+   `FetchedDocument` contract that validates every redirect, rejects
+   private/link-local destinations, streams to a byte cap, records headers/
+   final URL/hash, and feeds both KB snapshots and extraction.
+   Resolved (commit `83ad2b1`): `tools/fetch.py`'s `safe_fetch()` is now the
+   one shared, bounded `FetchedDocument` contract both `scrape_page()` and
+   `ingest_web_page()` use — redirect-target SSRF validation (via DNS
+   resolution, not just literal-IP matching) and a streamed byte cap are
+   both done. Still open: no MIME allowlist/policy decision (any MIME type
+   is currently returned as-is to the caller), no conditional request
+   support (ETag/If-Modified-Since), and `FetchedDocument` doesn't carry a
+   content hash or the full response headers itself — callers that need a
+   hash (e.g. `ingest_web_page()`) still compute it themselves from
+   `.content` after the fetch returns.
 
 Removing Mojeek can land immediately. The highest-leverage correctness change
 is item 4, followed by the common result/fetch contracts required for items 2,
@@ -791,16 +852,28 @@ unblocked by nothing else in Batch 1.
   blocked on `candidate_outcomes` actually being persisted (Batch 3) so a
   real join against `search_calls` is possible.
 
-**Batch 3 — Reusable acquisition and passage retrieval**
+**Batch 3 — Reusable acquisition and passage retrieval — Round A DONE (commit `83ad2b1`, July 25, 2026)**
 
-- introduce the shared SSRF-safe, byte-bounded, MIME-aware fetch contract;
-- persist one raw snapshot and derived cleaned/PDF artifact in the existing KB;
+- introduce the shared SSRF-safe, byte-bounded, MIME-aware fetch contract; ✅
+  `tools/fetch.py`'s `safe_fetch()`/`FetchedDocument`. "MIME-aware" here
+  means the PDF-routing consequence below; the contract itself doesn't
+  enforce a MIME allowlist/policy.
+  Also lands the matching PDF-artifact routing fix in `kb/artifacts.py` (see
+  "Batch 3, Round A" above) — the actual PDF result was blocked on both the
+  fetch contract's byte/redirect safety *and* this routing fix together.
+- persist one raw snapshot and derived cleaned/PDF artifact in the existing
+  KB; ⬜ still open — this bullet is about Extra Research's own collected
+  sources, not KB URL ingestion (which already persists snapshots/artifacts
+  today, and now correctly routes PDFs per the fix above).
 - return complete structured records from local hybrid retrieval instead of
-  formatting them immediately as a string;
+  formatting them immediately as a string; ⬜ still open (`kb_search.py`).
 - retrieve facet-relevant chunks/passages with page, section, character, or
-  timestamp locators before claim extraction;
+  timestamp locators before claim extraction; ⬜ still open
+  (`extra_research.py`'s claim-ledger extraction still reads the first 2,500
+  characters, not facet-relevant passages).
 - add OpenAlex discovery and arXiv retrieval only after the common source
-  contract can store and replay their output.
+  contract can store and replay their output. ⬜ still open, still gated on
+  the item above.
 
 ## Recommended Next Steps
 
@@ -843,10 +916,13 @@ unblocked by nothing else in Batch 1.
 9. **Persist the common source contract.** Persist accepted and rejected
    candidates, raw snapshots, cleaned text, adapter/routing provenance,
    assessments, fallback reasons, and immutable bundle membership in the KB.
-10. **Process complete documents.** Add MIME-aware web PDF ingestion, clean and
-    chunk complete content, retrieve facet-relevant passages, optionally rerank
-    them, and build the claim ledger from those passages rather than document
-    openings.
+10. **[PARTIAL] (`83ad2b1`). Process complete documents.** Add MIME-aware web
+    PDF ingestion, clean and chunk complete content, retrieve facet-relevant
+    passages, optionally rerank them, and build the claim ledger from those
+    passages rather than document openings. MIME-aware web PDF ingestion is
+    done (KB URL ingestion now correctly routes a fetched PDF to the `pypdf`
+    extractor); facet-relevant passage retrieval and building the claim
+    ledger from passages rather than document openings remain open.
 11. **Make coverage and budgets auditable.** Distinguish `covered`, `partial`,
    and `uncovered`; expose provider calls, fetches, accepted sources, model
    calls, elapsed time, and remaining gaps before synthesis.
@@ -886,8 +962,12 @@ It is complete when (status as of July 25, 2026):
   carries provider observations -- but `CandidateOutcome` does not yet copy
   provider identity onto the outcome record, and nothing tracks whether
   accepted evidence was actually cited in the final synthesis;
-- ⬜ a web-hosted PDF can be stored, parsed, retrieved by relevant passage, and
-  cited with a page locator;
+- 🟡 a web-hosted PDF can be stored, parsed, retrieved by relevant passage, and
+  cited with a page locator. Stored and parsed with page-located chunks ✅
+  (`83ad2b1`, KB URL ingestion only); retrieval by relevant passage and
+  citation with a page locator are not implemented yet, and Extra
+  Research's own `_is_html_result()` filter still refuses to fetch a PDF
+  candidate in the first place;
 - 🟡 the web adapter uses canonical multi-provider fusion, an adaptive
   provider waterfall, and candidate backfill within explicit call/fetch
   budgets. Canonical fusion ✅, candidate backfill ✅, a first adaptive
