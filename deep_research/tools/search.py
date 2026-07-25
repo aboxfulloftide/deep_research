@@ -15,6 +15,32 @@ from deep_research.tools.search_usage import (
     timer,
 )
 
+def classify_http_error(exc: Exception) -> str:
+    """Best-effort category for a provider call failure -- stored alongside
+    the log row so later logic (monthly quota detection today, richer
+    waterfall/circuit-breaker decisions later) can tell "genuinely down"
+    apart from "rate-limited for a few seconds" without re-parsing free-text
+    error messages. Deliberately does not attempt a separate
+    "quota_exhausted" category here -- that's a *derived* state from several
+    rate_limited rows accumulating over a calendar month
+    (provider_monthly_quota_exhausted), not something visible from one
+    exception."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 429:
+            return "rate_limited"
+        if status in (401, 403):
+            return "auth_error"
+        if status == 404:
+            return "not_found"
+        if status >= 500:
+            return "server_error"
+        return "unknown"
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout)):
+        return "network_error"
+    return "unknown"
+
+
 BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search"
 TAVILY_API_URL = "https://api.tavily.com/search"
 SERPER_API_URL = "https://google.serper.dev/search"
@@ -35,10 +61,12 @@ _GENERIC_SENTENCE_OPENERS = {
     "a", "an", "as", "at", "by", "for", "from", "in", "it", "on",
     "proof", "that", "the", "these", "this", "those", "when", "while",
 }
-# Below this many combined SearXNG+Brave+Serper results, spend a metered
-# Tavily query to fill the gap. Serper's larger allowance makes it a routine
-# primary source now; Tavily keeps serving as the thin-results fallback.
-MIN_RESULTS_BEFORE_TAVILY_FALLBACK = 3
+# Below this many relevant results accumulated so far, the next waterfall
+# tier (Serper, then Brave, then Tavily) is worth its call; at or above it,
+# that tier is skipped -- "fewer, better provider calls" instead of firing
+# every configured provider on every search regardless of whether SearXNG
+# and Wikipedia already answered the question.
+MIN_SUFFICIENT_RELEVANT_RESULTS = 3
 
 # Google CSE and Startpage are intentionally not part of SearXNG's default
 # engine set: literal claim sentences caused sustained, repetitive traffic
@@ -123,7 +151,7 @@ async def _brave_api_search_with_retry(query: str, api_key: str) -> list[SearchR
     try:
         return await _brave_api_search(query, api_key)
     except httpx.HTTPStatusError as e:
-        if e.response.status_code != 429:
+        if classify_http_error(e) != "rate_limited":
             raise
     await asyncio.sleep(BRAVE_RATE_LIMIT_RETRY_SECONDS)
     return await _brave_api_search(query, api_key)
@@ -160,7 +188,8 @@ async def _brave_search_layered(
         except httpx.HTTPError as e:
             await log_search_call(
                 config, "brave", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+                error_category=classify_http_error(e), **search_ids,
             )
     if config.brave.fallback_api_key:
         t = timer()
@@ -174,7 +203,8 @@ async def _brave_search_layered(
         except httpx.HTTPError as e:
             await log_search_call(
                 config, "brave_fallback", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+                error_category=classify_http_error(e), **search_ids,
             )
     return []
 
@@ -400,9 +430,34 @@ def _is_relevant(result: SearchResult, terms: set[str]) -> bool:
     return _relevance_score(result, terms) >= minimum
 
 
+RRF_K = 60  # standard RRF damping constant, same value as kb_search.py's own
+            # RRF_K -- not imported from there to keep web search and KB
+            # search decoupled; the formula is generic enough to duplicate as
+            # a small local constant rather than create a cross-module
+            # dependency for one integer.
+
+
+def _rrf_score(result: SearchResult) -> float:
+    """Reciprocal-rank-fusion score summed across every provider that
+    surfaced this canonical URL -- rewards cross-provider agreement instead
+    of whichever single provider happened to rank a result first. Sourced
+    from the per-provider ranks _merge() already preserves on
+    SearchResult.observations."""
+    return sum(1.0 / (RRF_K + observation.rank) for observation in result.observations)
+
+
 def _rank_results(results: list[SearchResult], query: str, limit: int = 10) -> list[SearchResult]:
+    """Rank by cross-provider agreement (RRF) first, breaking ties with
+    lexical relevance -- RRF alone can't distinguish "providers agree on an
+    irrelevant stale result" from "providers agree on the right answer," so
+    relevance stays a real, transparent secondary signal instead of being
+    replaced outright."""
     terms = _query_terms(query)
-    return sorted(results, key=lambda result: _relevance_score(result, terms), reverse=True)[:limit]
+    return sorted(
+        results,
+        key=lambda result: (_rrf_score(result), _relevance_score(result, terms)),
+        reverse=True,
+    )[:limit]
 
 
 def _wikidata_entity_query(query: str, wikipedia_results: list[SearchResult]) -> str | None:
@@ -446,10 +501,15 @@ async def web_search(
     facet_id: str | None = None,
     attempt_id: str | None = None,
 ) -> list[SearchResult]:
-    """SearXNG + Brave + Serper as primary search, with Tavily as fallback. brave/
-    google cse/startpage are disabled in searxng/settings.yml -- they got
-    rate limited/CAPTCHA'd under sustained query volume and have no documented
-    quota to plan around, unlike Brave's and Tavily's metered APIs.
+    """SearXNG (Bing/DuckDuckGo) + Wikipedia unconditionally, then an adaptive
+    waterfall: Wikidata only when capability="grounding" (its yield is ~67%
+    empty on ordinary queries, see RESEARCH_WORK_HANDOFF.md); Serper, then
+    Brave, then Tavily each only called when the results accumulated so far
+    don't already meet MIN_SUFFICIENT_RELEVANT_RESULTS -- fewer, better
+    provider calls rather than firing every configured provider on every
+    search. google cse/startpage are disabled in searxng/settings.yml -- they
+    got rate limited/CAPTCHA'd under sustained query volume and have no
+    documented quota to plan around, unlike Brave's and Tavily's metered APIs.
 
     Every provider call is logged to search_usage.py's SQLite log (best
     effort, never raises) so /api/search-usage can answer "how many searches
@@ -460,7 +520,8 @@ async def web_search(
     forwarded to every logged call so a search can later be joined back to
     the research run/plan/facet/attempt (or claim verification) that made
     it -- callers with no such concept (e.g. the plain chat tool loop) simply
-    omit them."""
+    omit them. capability="grounding" additionally controls whether Wikidata
+    is consulted at all."""
     search_ids = {
         "capability": capability, "run_id": run_id, "plan_id": plan_id,
         "facet_id": facet_id, "attempt_id": attempt_id,
@@ -501,7 +562,8 @@ async def web_search(
     except httpx.HTTPError as e:
         await log_search_call(
             config, "searxng", "scrape", "error",
-            error_message=str(e), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+            error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+            error_category=classify_http_error(e), **search_ids,
         )
         # SearXNG is one provider, not a single point of failure. Continue to
         # the direct providers below when it is unavailable.
@@ -544,40 +606,47 @@ async def web_search(
         wiki_results = []
         await log_search_call(
             config, "wikipedia_api", "api", "error",
-            error_message=str(e), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+            error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+            error_category=classify_http_error(e), **search_ids,
         )
     results = _merge(results, wiki_results)
 
-    wikidata_query = _wikidata_entity_query(query, wiki_results)
-    wikidata_results = []
-    if wikidata_query:
-        t = timer()
-        try:
-            wikidata_results = await _wikidata_api_search(
-                wikidata_query, config.wikipedia.contact,
-            )
-            await log_search_call(
-                config, "wikidata_api", "api", "ok" if wikidata_results else "empty",
-                result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=wikidata_query,
-                **search_ids,
-            )
-        except httpx.HTTPError as e:
-            await log_search_call(
-                config, "wikidata_api", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=wikidata_query, **search_ids,
-            )
-    results = _merge(results, wikidata_results)
+    # Wikidata is an entity/reference lookup, not a general search -- only
+    # derive an entity query and call it when a facet/caller explicitly
+    # wants grounding (see RESEARCH_WORK_HANDOFF.md: ~67% of past Wikidata
+    # calls returned nothing, because most queries were never entity-shaped
+    # to begin with). Wikipedia stays unconditional above; its yield doesn't
+    # have the same waste problem.
+    if capability == "grounding":
+        wikidata_query = _wikidata_entity_query(query, wiki_results)
+        if wikidata_query:
+            t = timer()
+            try:
+                wikidata_results = await _wikidata_api_search(
+                    wikidata_query, config.wikipedia.contact,
+                )
+                await log_search_call(
+                    config, "wikidata_api", "api", "ok" if wikidata_results else "empty",
+                    result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=wikidata_query,
+                    **search_ids,
+                )
+                results = _merge(results, wikidata_results)
+            except httpx.HTTPError as e:
+                await log_search_call(
+                    config, "wikidata_api", "api", "error",
+                    error_message=str(e), elapsed_ms=t.elapsed_ms, query=wikidata_query,
+                    error_category=classify_http_error(e), **search_ids,
+                )
 
-    if config.brave.api_key or config.brave.fallback_api_key:
-        # Both keys erroring falls through with whatever the other providers
-        # already returned rather than losing the whole search -- each
-        # attempt is logged inside _brave_search_layered.
-        results = _merge(results, await _brave_search_layered(query, config, search_ids))
-
-    if config.serper.api_key:
-        # Serper's 50k-search allowance makes it a primary provider alongside
-        # Bing/SearXNG and Brave, not a last-resort fallback. Its failure is
-        # isolated like every other provider so the combined search survives.
+    # Adaptive waterfall from here: Serper, then Brave, then Tavily each only
+    # fire when the results accumulated so far aren't already sufficient --
+    # "fewer, better provider calls" instead of calling every configured
+    # provider on every search regardless of whether SearXNG/Wikipedia/
+    # Wikidata already answered the question.
+    if (
+        config.serper.api_key
+        and sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
+    ):
         t = timer()
         try:
             serper_results = await _serper_api_search(query, config.serper.api_key)
@@ -589,11 +658,21 @@ async def web_search(
             serper_results = []
             await log_search_call(
                 config, "serper", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+                error_category=classify_http_error(e), **search_ids,
             )
         results = _merge(results, serper_results)
 
-    if sum(_is_relevant(result, terms) for result in results) < MIN_RESULTS_BEFORE_TAVILY_FALLBACK and config.tavily.api_key:
+    if (
+        (config.brave.api_key or config.brave.fallback_api_key)
+        and sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
+    ):
+        # Both keys erroring falls through with whatever the other providers
+        # already returned rather than losing the whole search -- each
+        # attempt is logged inside _brave_search_layered.
+        results = _merge(results, await _brave_search_layered(query, config, search_ids))
+
+    if sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS and config.tavily.api_key:
         t = timer()
         try:
             tavily_results = await _tavily_api_search(query, config.tavily.api_key)
@@ -607,7 +686,8 @@ async def web_search(
             tavily_results = []
             await log_search_call(
                 config, "tavily", "api", "error",
-                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query, **search_ids,
+                error_message=str(e), elapsed_ms=t.elapsed_ms, query=query,
+                error_category=classify_http_error(e), **search_ids,
             )
         results = _merge(results, tavily_results)
 
@@ -656,7 +736,7 @@ async def check_providers_now(config: Config) -> dict:
             if engine not in out:
                 out[engine] = {"responding": False, "result_count": 0, "error": reason}
     except httpx.HTTPError as e:
-        await log_search_call(config, "searxng", "scrape", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
+        await log_search_call(config, "searxng", "scrape", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe, error_category=classify_http_error(e))
         out["searxng"] = {"responding": False, "result_count": 0, "error": str(e)}
 
     t = timer()
@@ -665,7 +745,7 @@ async def check_providers_now(config: Config) -> dict:
         await log_search_call(config, "wikipedia_api", "api", "ok" if wiki_results else "empty", result_count=len(wiki_results), elapsed_ms=t.elapsed_ms, query=probe)
         out["wikipedia_api"] = {"responding": len(wiki_results) > 0, "result_count": len(wiki_results), "error": None}
     except httpx.HTTPError as e:
-        await log_search_call(config, "wikipedia_api", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
+        await log_search_call(config, "wikipedia_api", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe, error_category=classify_http_error(e))
         out["wikipedia_api"] = {"responding": False, "result_count": 0, "error": str(e)}
 
     t = timer()
@@ -674,7 +754,7 @@ async def check_providers_now(config: Config) -> dict:
         await log_search_call(config, "wikidata_api", "api", "ok" if wikidata_results else "empty", result_count=len(wikidata_results), elapsed_ms=t.elapsed_ms, query=probe)
         out["wikidata_api"] = {"responding": len(wikidata_results) > 0, "result_count": len(wikidata_results), "error": None}
     except httpx.HTTPError as e:
-        await log_search_call(config, "wikidata_api", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
+        await log_search_call(config, "wikidata_api", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe, error_category=classify_http_error(e))
         out["wikidata_api"] = {"responding": False, "result_count": 0, "error": str(e)}
 
     primary_brave_paused = await provider_monthly_quota_exhausted(config, "brave")
@@ -695,7 +775,7 @@ async def check_providers_now(config: Config) -> dict:
             await log_search_call(config, provider, "api", "ok" if results else "empty", result_count=len(results), elapsed_ms=t.elapsed_ms, query=probe)
             out[provider] = {"responding": len(results) > 0, "result_count": len(results), "error": None}
         except httpx.HTTPError as e:
-            await log_search_call(config, provider, "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
+            await log_search_call(config, provider, "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe, error_category=classify_http_error(e))
             out[provider] = {"responding": False, "result_count": 0, "error": str(e)}
 
     if config.tavily.api_key:
@@ -705,7 +785,7 @@ async def check_providers_now(config: Config) -> dict:
             await log_search_call(config, "tavily", "api", "ok" if results else "empty", result_count=len(results), elapsed_ms=t.elapsed_ms, query=probe)
             out["tavily"] = {"responding": len(results) > 0, "result_count": len(results), "error": None}
         except httpx.HTTPError as e:
-            await log_search_call(config, "tavily", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
+            await log_search_call(config, "tavily", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe, error_category=classify_http_error(e))
             out["tavily"] = {"responding": False, "result_count": 0, "error": str(e)}
     else:
         out["tavily"] = {"responding": None, "result_count": 0, "error": "no api key configured"}
@@ -717,7 +797,7 @@ async def check_providers_now(config: Config) -> dict:
             await log_search_call(config, "serper", "api", "ok" if results else "empty", result_count=len(results), elapsed_ms=t.elapsed_ms, query=probe)
             out["serper"] = {"responding": len(results) > 0, "result_count": len(results), "error": None}
         except httpx.HTTPError as e:
-            await log_search_call(config, "serper", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe)
+            await log_search_call(config, "serper", "api", "error", error_message=str(e), elapsed_ms=t.elapsed_ms, query=probe, error_category=classify_http_error(e))
             out["serper"] = {"responding": False, "result_count": 0, "error": str(e)}
     else:
         out["serper"] = {"responding": None, "result_count": 0, "error": "no api key configured"}

@@ -55,16 +55,27 @@ async def test_monthly_quota_circuit_opens_only_for_logged_429(tmp_path):
     config = _config(tmp_path)
     await log_search_call(
         config, "brave", "api", "error",
-        error_message="500 Internal Server Error",
+        error_message="500 Internal Server Error", error_category="server_error",
     )
     assert await provider_monthly_quota_exhausted(config, "brave") is False
 
     await log_search_call(
         config, "brave", "api", "error",
-        error_message="429 Too Many Requests",
+        error_message="429 Too Many Requests", error_category="rate_limited",
     )
     assert await provider_monthly_quota_exhausted(config, "brave") is True
     assert await provider_monthly_quota_exhausted(config, "brave_fallback") is False
+
+
+async def test_monthly_quota_circuit_requires_the_typed_category_not_just_429_text(tmp_path):
+    """Guards against reintroducing the old string-matching heuristic --
+    a "429" substring in error_message alone must not open the circuit."""
+    config = _config(tmp_path)
+    await log_search_call(
+        config, "brave", "api", "error",
+        error_message="429 Too Many Requests",
+    )
+    assert await provider_monthly_quota_exhausted(config, "brave") is False
 
 
 async def test_log_search_call_persists_run_plan_facet_attempt_and_capability(tmp_path):

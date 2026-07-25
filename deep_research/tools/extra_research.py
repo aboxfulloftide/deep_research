@@ -129,7 +129,8 @@ class ResearchBudget:
 
 
 SOURCE_CAPABILITIES = {
-    "web", "primary", "scholarly", "official_documentation", "repository", "news", "local_knowledge",
+    "web", "primary", "scholarly", "official_documentation", "repository", "news",
+    "local_knowledge", "grounding",
 }
 
 
@@ -146,6 +147,10 @@ def _adapter_query(capability: str, question: str) -> str:
         "repository": "official repository documentation",
         "news": "reputable news publication date",
         "local_knowledge": "",  # No local-KB adapter is registered yet; web remains transparent fallback.
+        # web_search() reads capability="grounding" directly to decide whether
+        # to consult Wikidata at all; Wikidata's own entity-query derivation
+        # already narrows the query, so no extra suffix is needed here.
+        "grounding": "",
         "web": "",
     }
     return f"{question} {suffixes.get(capability, '')}".strip()
@@ -352,6 +357,8 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
         {"role": "system", "content": (
             "/no_think\nPlan research for any question. Return ONLY JSON: "
             '{"ambiguities":["..."],"facets":[{"id":"short_slug","question":"evidence need","search_query":"short search-engine query, not a restatement of the user question","purpose":"why this evidence matters","capabilities":["web","primary"]}]}. '
+            "Capabilities may be web, primary, scholarly, official_documentation, repository, news, or grounding "
+            "(grounding is for basic entity/definition lookups, not general search). "
             "Return 2-4 complementary facets. Facets must cover the central answer, constraints/definitions where relevant, "
             "and corroboration or tradeoffs where relevant. Do not assume a domain or answer the question."
         )},
@@ -387,7 +394,7 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
         {"role": "system", "content": (
             "/no_think\nCreate exactly three research-plan lines. Each line must be: "
             "short-id | evidence need | short search query | comma-separated capabilities. "
-            "Capabilities may be web, primary, scholarly, official_documentation, repository, or news. "
+            "Capabilities may be web, primary, scholarly, official_documentation, repository, news, or grounding. "
             "Do not repeat the user's full question as a search query and do not answer it."
         )},
         {"role": "user", "content": question},

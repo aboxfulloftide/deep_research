@@ -40,7 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_search_calls_provider_created ON search_calls(pro
 # "ALTER TABLE ... ADD COLUMN IF NOT EXISTS" -- it errors with a syntax error,
 # not a silent no-op -- so each missing column is added individually via
 # PRAGMA table_info, safe to run on every connect.
-_ADDITIVE_COLUMNS = ("run_id", "plan_id", "facet_id", "attempt_id", "capability")
+_ADDITIVE_COLUMNS = ("run_id", "plan_id", "facet_id", "attempt_id", "capability", "error_category")
 
 
 async def _ensure_additive_columns(db: aiosqlite.Connection) -> None:
@@ -87,7 +87,7 @@ async def log_search_call(
     elapsed_ms: int | None = None, query: str | None = None,
     run_id: str | None = None, plan_id: str | None = None,
     facet_id: str | None = None, attempt_id: str | None = None,
-    capability: str | None = None,
+    capability: str | None = None, error_category: str | None = None,
 ) -> None:
     """Best-effort -- a logging hiccup must never break the actual search
     call it's describing, so this swallows its own errors rather than
@@ -96,17 +96,22 @@ async def log_search_call(
     run_id/plan_id/facet_id/attempt_id/capability are optional context IDs so
     a search call can later be joined back to the research run/plan/facet/
     attempt (or claim verification) that made it -- callers with no such
-    concept (e.g. the plain chat tool loop) simply leave them unset."""
+    concept (e.g. the plain chat tool loop) simply leave them unset.
+
+    error_category is the caller's classify_http_error(exc) result (e.g.
+    "rate_limited", "server_error") -- a typed field instead of re-parsing
+    the free-text error_message later, used by provider_monthly_quota_exhausted
+    below."""
     try:
         async with _connect(config) as db:
             await db.execute(
                 "INSERT INTO search_calls (provider, mode, status, result_count, error_message, "
-                "elapsed_ms, query, run_id, plan_id, facet_id, attempt_id, capability, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "elapsed_ms, query, run_id, plan_id, facet_id, attempt_id, capability, error_category, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     provider, mode, status, result_count, error_message, elapsed_ms,
                     (query or "")[:200], run_id, plan_id, facet_id, attempt_id, capability,
-                    datetime.now(timezone.utc).isoformat(),
+                    error_category, datetime.now(timezone.utc).isoformat(),
                 ),
             )
             await db.commit()
@@ -143,18 +148,21 @@ async def providers_allowed_by_circuit_breaker(
 async def provider_monthly_quota_exhausted(config: Config, provider: str) -> bool:
     """Return whether a metered provider has exhausted this month's quota.
 
-    A Brave per-second 429 is retried before it is logged, so a stored 429
-    means that retry also failed. Treat that as monthly exhaustion and keep
-    the decision durable across worker restarts. The calendar-month query
-    naturally makes the provider eligible again on the first day of the next
-    UTC month without a cleanup job or mutable cooldown record.
+    A Brave per-second 429 is retried before it is logged, so a stored
+    rate-limited row means that retry also failed. Treat that as monthly
+    exhaustion and keep the decision durable across worker restarts. The
+    calendar-month query naturally makes the provider eligible again on the
+    first day of the next UTC month without a cleanup job or mutable cooldown
+    record. Uses the typed error_category column (classify_http_error's
+    "rate_limited") rather than string-matching "429" in error_message --
+    the caller must pass error_category to log_search_call for this to see it.
     """
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     async with _connect(config) as db:
         rows = await db.execute_fetchall(
             "SELECT 1 FROM search_calls "
             "WHERE provider = ? AND status = 'error' AND created_at LIKE ? "
-            "AND error_message LIKE '%429%' LIMIT 1",
+            "AND error_category = 'rate_limited' LIMIT 1",
             (provider, f"{month}%"),
         )
     return bool(rows)

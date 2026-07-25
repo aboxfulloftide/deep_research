@@ -39,6 +39,28 @@ def test_rank_results_keeps_single_term_queries_searchable():
     assert _rank_results([result], "Qwen") == [result]
 
 
+def test_rank_results_prefers_cross_provider_agreement_over_lexical_relevance():
+    query = "python packaging tools"
+    agreed = SearchResult(
+        title="Widely referenced overview", url="https://example.test/agreed", snippet="",
+        canonical_url="https://example.test/agreed",
+        observations=[
+            ProviderObservation(provider="bing", rank=2, query=query),
+            ProviderObservation(provider="serper", rank=2, query=query),
+            ProviderObservation(provider="brave", rank=2, query=query),
+        ],
+    )
+    solo = SearchResult(
+        title="python packaging tools guide", url="https://example.test/solo", snippet="",
+        canonical_url="https://example.test/solo",
+        observations=[ProviderObservation(provider="serper", rank=1, query=query)],
+    )
+
+    ranked = _rank_results([solo, agreed], query)
+
+    assert ranked[0].url == "https://example.test/agreed"
+
+
 def test_wikidata_uses_relevant_wikipedia_title_instead_of_claim_sentence():
     query = "The global financial crisis of 2008 took out a lot of hedge funds."
     wikipedia_results = [
@@ -122,6 +144,26 @@ def _http_error(status_code: int) -> httpx.HTTPStatusError:
     request = httpx.Request("GET", "https://api.search.brave.com/res/v1/web/search")
     response = httpx.Response(status_code, request=request)
     return httpx.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
+
+
+@pytest.mark.parametrize(
+    "status_code,expected_category",
+    [(429, "rate_limited"), (401, "auth_error"), (403, "auth_error"),
+     (404, "not_found"), (500, "server_error"), (503, "server_error"),
+     (418, "unknown")],
+)
+def test_classify_http_error_categorizes_status_codes(status_code, expected_category):
+    assert search_module.classify_http_error(_http_error(status_code)) == expected_category
+
+
+def test_classify_http_error_categorizes_network_failures():
+    request = httpx.Request("GET", "https://api.search.brave.com/res/v1/web/search")
+    assert search_module.classify_http_error(httpx.ConnectTimeout("timed out", request=request)) == "network_error"
+    assert search_module.classify_http_error(httpx.ConnectError("refused", request=request)) == "network_error"
+
+
+def test_classify_http_error_falls_back_to_unknown_for_unrecognized_exceptions():
+    assert search_module.classify_http_error(ValueError("not an http error")) == "unknown"
 
 
 @pytest.fixture
@@ -379,22 +421,25 @@ async def test_health_probe_still_checks_mojeek_while_ordinary_search_omits_it(m
     assert "mojeek" not in requested_params[0]["engines"]
 
 
-async def test_serper_is_primary_and_tavily_remains_thin_results_fallback(monkeypatch):
-    class FakeResponse:
+def _searxng_response(count: int, query_words: str = "PostgreSQL index documentation") -> "FakeSearxngResponse":
+    class FakeSearxngResponse:
         def raise_for_status(self):
             pass
 
         def json(self):
             return {
                 "results": [
-                    {"title": f"PostgreSQL index documentation {i}",
-                     "url": f"https://postgresql.example/{i}",
-                     "content": "PostgreSQL index documentation", "engine": "bing"}
-                    for i in range(3)
+                    {"title": f"{query_words} {i}", "url": f"https://postgresql.example/{i}",
+                     "content": query_words, "engine": "bing"}
+                    for i in range(count)
                 ],
                 "unresponsive_engines": [],
             }
 
+    return FakeSearxngResponse()
+
+
+def _fake_client(response) -> "FakeClient":
     class FakeClient:
         async def __aenter__(self):
             return self
@@ -403,17 +448,25 @@ async def test_serper_is_primary_and_tavily_remains_thin_results_fallback(monkey
             pass
 
         async def get(self, url, params=None, headers=None):
-            return FakeResponse()
+            return response
 
-    calls = {"serper": 0, "tavily": 0}
+    return FakeClient()
+
+
+async def test_serper_and_brave_skipped_when_searxng_already_sufficient(monkeypatch):
+    calls = {"serper": 0, "brave": 0, "tavily": 0}
 
     async def fake_serper(*args, **kwargs):
         calls["serper"] += 1
         return [_result("PostgreSQL primary result", "index documentation")]
 
+    async def fake_brave(*args, **kwargs):
+        calls["brave"] += 1
+        return []
+
     async def fake_tavily(*args, **kwargs):
         calls["tavily"] += 1
-        return [_result("PostgreSQL fallback result", "index documentation")]
+        return []
 
     async def no_results(*args, **kwargs):
         return []
@@ -421,22 +474,168 @@ async def test_serper_is_primary_and_tavily_remains_thin_results_fallback(monkey
     async def noop(*args, **kwargs):
         pass
 
-    monkeypatch.setattr(search_module.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr(
+        search_module.httpx, "AsyncClient",
+        lambda *args, **kwargs: _fake_client(_searxng_response(3)),
+    )
     monkeypatch.setattr(search_module, "_throttle_searxng", noop)
     monkeypatch.setattr(search_module, "_log_searxng_engines", noop)
     monkeypatch.setattr(search_module, "log_search_call", noop)
     monkeypatch.setattr(search_module, "_wikipedia_api_search", no_results)
     monkeypatch.setattr(search_module, "_wikidata_api_search", no_results)
     monkeypatch.setattr(search_module, "_serper_api_search", fake_serper)
+    monkeypatch.setattr(search_module, "_brave_api_search", fake_brave)
     monkeypatch.setattr(search_module, "_tavily_api_search", fake_tavily)
 
     config = Config(
         serper=SerperConfig(api_key="serper-key"),
+        brave=BraveConfig(api_key="brave-key"),
         tavily=TavilyConfig(api_key="tavily-key"),
     )
     await web_search("PostgreSQL index documentation", config)
 
-    assert calls == {"serper": 1, "tavily": 0}
+    assert calls == {"serper": 0, "brave": 0, "tavily": 0}
+
+
+async def test_serper_called_when_searxng_alone_is_thin(monkeypatch):
+    calls = {"serper": 0}
+
+    async def fake_serper(*args, **kwargs):
+        calls["serper"] += 1
+        return [_result("PostgreSQL primary result", "index documentation")]
+
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(
+        search_module.httpx, "AsyncClient",
+        lambda *args, **kwargs: _fake_client(_searxng_response(1)),
+    )
+    monkeypatch.setattr(search_module, "_throttle_searxng", noop)
+    monkeypatch.setattr(search_module, "_log_searxng_engines", noop)
+    monkeypatch.setattr(search_module, "log_search_call", noop)
+    monkeypatch.setattr(search_module, "_wikipedia_api_search", no_results)
+    monkeypatch.setattr(search_module, "_wikidata_api_search", no_results)
+    monkeypatch.setattr(search_module, "_serper_api_search", fake_serper)
+
+    config = Config(serper=SerperConfig(api_key="serper-key"))
+    await web_search("PostgreSQL index documentation", config)
+
+    assert calls == {"serper": 1}
+
+
+async def test_brave_skipped_when_serper_already_reaches_sufficiency(monkeypatch):
+    calls = {"brave": 0}
+
+    async def fake_serper(*args, **kwargs):
+        # Distinct canonical_url values matter here -- _merge() keys on
+        # canonical_url, and two results both left at the "" default would
+        # collide and collapse into one, undercounting relevant results.
+        return [
+            SearchResult(
+                title="PostgreSQL index documentation extra one", url="https://postgresql.example/extra1",
+                snippet="index documentation", canonical_url="https://postgresql.example/extra1",
+            ),
+            SearchResult(
+                title="PostgreSQL index documentation extra two", url="https://postgresql.example/extra2",
+                snippet="index documentation", canonical_url="https://postgresql.example/extra2",
+            ),
+        ]
+
+    async def fake_brave(*args, **kwargs):
+        calls["brave"] += 1
+        return []
+
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(
+        search_module.httpx, "AsyncClient",
+        lambda *args, **kwargs: _fake_client(_searxng_response(1)),
+    )
+    monkeypatch.setattr(search_module, "_throttle_searxng", noop)
+    monkeypatch.setattr(search_module, "_log_searxng_engines", noop)
+    monkeypatch.setattr(search_module, "log_search_call", noop)
+    monkeypatch.setattr(search_module, "_wikipedia_api_search", no_results)
+    monkeypatch.setattr(search_module, "_wikidata_api_search", no_results)
+    monkeypatch.setattr(search_module, "_serper_api_search", fake_serper)
+    monkeypatch.setattr(search_module, "_brave_api_search", fake_brave)
+
+    config = Config(
+        serper=SerperConfig(api_key="serper-key"),
+        brave=BraveConfig(api_key="brave-key"),
+    )
+    await web_search("PostgreSQL index documentation", config)
+
+    assert calls == {"brave": 0}
+
+
+async def test_wikidata_not_called_without_grounding_capability(monkeypatch):
+    calls = {"wikidata": 0}
+
+    async def fake_wikidata(*args, **kwargs):
+        calls["wikidata"] += 1
+        return []
+
+    async def wikipedia_with_a_relevant_page(*args, **kwargs):
+        return [_result("Masayoshi Son", "entrepreneur")]
+
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(
+        search_module.httpx, "AsyncClient",
+        lambda *args, **kwargs: _fake_client(_searxng_response(0)),
+    )
+    monkeypatch.setattr(search_module, "_throttle_searxng", noop)
+    monkeypatch.setattr(search_module, "_log_searxng_engines", noop)
+    monkeypatch.setattr(search_module, "log_search_call", noop)
+    monkeypatch.setattr(search_module, "_wikipedia_api_search", wikipedia_with_a_relevant_page)
+    monkeypatch.setattr(search_module, "_wikidata_api_search", fake_wikidata)
+
+    await web_search("Masayoshi Son", Config())
+
+    assert calls == {"wikidata": 0}
+
+
+async def test_wikidata_called_with_grounding_capability(monkeypatch):
+    calls = {"wikidata": 0}
+
+    async def fake_wikidata(*args, **kwargs):
+        calls["wikidata"] += 1
+        return []
+
+    async def wikipedia_with_a_relevant_page(*args, **kwargs):
+        return [_result("Masayoshi Son", "entrepreneur")]
+
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(
+        search_module.httpx, "AsyncClient",
+        lambda *args, **kwargs: _fake_client(_searxng_response(0)),
+    )
+    monkeypatch.setattr(search_module, "_throttle_searxng", noop)
+    monkeypatch.setattr(search_module, "_log_searxng_engines", noop)
+    monkeypatch.setattr(search_module, "log_search_call", noop)
+    monkeypatch.setattr(search_module, "_wikipedia_api_search", wikipedia_with_a_relevant_page)
+    monkeypatch.setattr(search_module, "_wikidata_api_search", fake_wikidata)
+
+    await web_search("Masayoshi Son", Config(), capability="grounding")
+
+    assert calls == {"wikidata": 1}
 
 
 async def test_web_search_forwards_capability_and_ids_to_search_usage_log(monkeypatch):
