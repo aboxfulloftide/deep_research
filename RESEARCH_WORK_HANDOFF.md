@@ -12,12 +12,12 @@ Last verified against the running system and `main`: **July 25, 2026**.
 - The deletion of `PLAN_GPU_COORDINATOR.md` was intentionally committed and
   pushed in `5d76e4b`; it is no longer an outstanding worktree concern.
 - Interactive Extra Research is available. Batch 1 (evidence correctness and
-  observability), the domain-neutrality authority-gate fix, and Batch 2a
-  (RRF fusion, typed provider-failure classification, adaptive waterfall) are
-  all committed (`e5c7db1`, `6cc32ab`, `1ab7dd3`). Capability routing is
-  still cosmetic (no `SourceAdapter` registry), nothing Extra Research
-  collects is persisted to the KB yet, and result caching/concurrent-request
-  coalescing do not exist yet -- it should still not be treated as a
+  observability), the domain-neutrality authority-gate fix, and all of
+  Batch 2 (RRF fusion, typed provider-failure classification, adaptive
+  waterfall, result caching, concurrent-request coalescing) are committed
+  (`e5c7db1`, `6cc32ab`, `1ab7dd3`, `d8c9866`). Capability routing is still
+  cosmetic (no `SourceAdapter` registry), and nothing Extra Research collects
+  is persisted to the KB yet -- it should still not be treated as a
   source-native, KB-integrated research system.
 
 ## What We Were Working On
@@ -172,6 +172,47 @@ design pass.
   `kb/verification.py` deliberately keeps `capability="claim_verification"`,
   not `"grounding"` -- its LLM-generated natural-language queries were a poor
   match for Wikidata's entity-label-shaped `wbsearchentities` endpoint anyway.
+
+### Batch 2b — Result Caching and Concurrent-Request Coalescing (July 25, 2026)
+
+Commit `d8c9866` closed out the two items Batch 2a deferred, completing
+Batch 2 in full.
+
+- New `deep_research/tools/search_cache.py`: a self-contained SQLite file
+  (`search_cache.db`), the same pattern as `search_usage.py` and for the
+  same reason -- confirmed directly in code that `web_search()` and every
+  caller above it (`agent.py`'s `ResearchAgent`, `extra_research.py`'s
+  `collect_sources()`/`collect_research_bundle()`, `web/app.py`'s
+  `_extra_research_answer()`) only ever receive `Config`, never a
+  `KBDatabase` handle (`cli/main.py`'s `_init_kb_db()` returns `None` on any
+  connection failure by design, and the web server checks
+  `kb_routes.kb_db` for truthiness everywhere). Putting the cache in the KB
+  Postgres DB would have meant threading `kb_db` through all of those call
+  sites first.
+- Cache key: normalized query (casefold + collapsed whitespace) + capability
+  + `include_alternate_query_engines` + freshness tier. Deliberately
+  excludes `run_id`/`plan_id`/`facet_id`/`attempt_id` -- those identify the
+  *run*, not what was searched, and including them would make every call a
+  unique key.
+- Three freshness tiers via a new `freshness` parameter on `web_search()`
+  (`"volatile"` 10min / `"default"` 2h / `"stable"` 7d) -- no caller passes
+  anything but the default yet; the plumbing exists for a future caller
+  (e.g. a "current events" capability) to opt into a shorter/longer TTL.
+- Concurrent identical searches are coalesced in-process (module-level
+  `dict[str, asyncio.Future]` + lock in `search.py`, same locality as the
+  existing SearXNG throttle) instead of each spending their own provider
+  calls -- no cross-process coordination, which would need a much heavier
+  mechanism this doesn't need yet.
+- New `config.search_cache.enabled` (default `True`, env-overridable) is a
+  real on/off switch. A cache hit logs a `provider="cache"` row via the
+  existing `log_search_call` so `/api/search-usage` can show cache
+  effectiveness alongside real provider calls.
+- Test-isolation fix: bare `Config()` resolves to a fixed real on-disk path,
+  not a per-test tmp_path, and several `tests/test_search.py` tests reuse
+  the same query text -- one autouse fixture neutralizes caching for that
+  whole file (mirrors how those tests already neutralize
+  `search_usage.py` logging), with real cache/coalescing behavior covered
+  separately in the new `tests/test_search_cache.py`.
 
 ### Existing Foundations Not Yet Integrated Into Routed Collection
 
@@ -494,16 +535,18 @@ The main operational conclusions are:
 
 ### Required Web Search Changes
 
-**Status update, July 25, 2026 (commit `1ab7dd3`):** items 1, 2, and 3 are
-partially resolved: item 1's Serper/Brave/
-Wikidata gating exists, but the richer "unique publishers, source diversity,
-or required authority" signals for advancing to Brave are not implemented
-(gating still reuses the same relevant-results count for every tier); item
-2's canonical URL and provider/rank/query observations exist (Batch 1), but
-result type, publication date, retrieval date, and freshness metadata do
-not. Item 8 is partially resolved (typed failure categories exist; the
-cross-process durable lease, `retry_after` storage, and half-open health
-probes do not). Items 4-7, 9, and 10 remain open exactly as described.
+**Status update, July 25, 2026 (commits `1ab7dd3`, `d8c9866`):** items 1, 2,
+3, 7, and 8 are partially resolved: item 1's Serper/Brave/Wikidata gating
+exists, but the richer "unique publishers, source diversity, or required
+authority" signals for advancing to Brave are not implemented (gating still
+reuses the same relevant-results count for every tier); item 2's canonical
+URL and provider/rank/query observations exist (Batch 1), but result type,
+publication date, retrieval date, and freshness metadata do not; item 7's
+whole-call caching and in-process coalescing exist, but not per-provider/
+per-language-region caching or cross-process coalescing; item 8 is partially
+resolved (typed failure categories exist; the cross-process durable lease,
+`retry_after` storage, and half-open health probes do not). Items 4-6, 9,
+and 10 remain open exactly as described.
 
 1. **[PARTIAL] Use an adaptive provider waterfall.** Start with Bing, then use Serper
    when candidate sufficiency is not met or cross-provider ranking evidence is
@@ -549,11 +592,17 @@ probes do not). Items 4-7, 9, and 10 remain open exactly as described.
    optional short quotation. Keep a literal-claim query as one possible
    variant, not the universal first attempt. Use the local model for a
    meaningfully different follow-up query when the structured query is thin.
-7. **Cache and coalesce.** Cache provider results by normalized query, provider,
-   language/region, and freshness window. Give current-event queries short
-   TTLs and stable historical queries longer TTLs. Coalesce identical
-   concurrent requests so verification workers do not independently spend the
-   same call.
+7. **[PARTIAL] Cache and coalesce.** Cache provider results by normalized
+   query, provider, language/region, and freshness window. Give current-event
+   queries short TTLs and stable historical queries longer TTLs. Coalesce
+   identical concurrent requests so verification workers do not independently
+   spend the same call. `search_cache.py` (commit `d8c9866`) caches by
+   normalized query/capability/engine-set/freshness with three TTL tiers, and
+   coalescing is in-process via shared `asyncio.Future`s -- caching by
+   provider and by language/region individually is not implemented (the
+   cache is keyed at the whole-`web_search()`-call level, not per provider),
+   and coalescing does not cross process boundaries (a durable cross-process
+   lease, per item 8, would be needed for that).
 8. **[PARTIAL] Use shared, typed rate controls.** Replace the process-local
    SearXNG throttle with a durable cross-process lease. Distinguish short
    rate limits, monthly quota exhaustion, authentication errors, DNS/network
@@ -717,7 +766,7 @@ Signals" above). This is "Remove domain-specific gates" from Recommended Next
 Steps below, pulled forward because it was small, contained, and directly
 unblocked by nothing else in Batch 1.
 
-**Batch 2 — Fewer, better provider calls — Batch 2a DONE (commit `1ab7dd3`, July 25, 2026); caching/coalescing/metrics still open**
+**Batch 2 — Fewer, better provider calls — DONE except metrics (commits `1ab7dd3`, `d8c9866`, July 25, 2026)**
 
 - try Bing first, then call Serper when candidate sufficiency is not met or
   cross-provider ranking evidence is requested; ✅ (sufficiency-only; "cross-
@@ -733,9 +782,10 @@ unblocked by nothing else in Batch 1.
   above -- so read this as "select Wikidata," not both)
 - add canonical merge, RRF, deterministic reranking, typed provider failures,
   result caching, and concurrent-request coalescing; 🟡 canonical merge
-  (Batch 1), RRF, and typed provider failures ✅ done; deterministic
-  reranking beyond existing lexical relevance, result caching, and
-  concurrent-request coalescing remain open;
+  (Batch 1), RRF, typed provider failures, result caching, and (in-process)
+  concurrent-request coalescing ✅ done (`d8c9866`); deterministic reranking
+  beyond existing lexical relevance remains open, and coalescing doesn't
+  cross process boundaries;
 - measure accepted evidence per provider call, time to first usable source,
   unique publishers, cited-claim yield, and facet coverage. ⬜ not started --
   blocked on `candidate_outcomes` actually being persisted (Batch 3) so a
@@ -769,12 +819,14 @@ unblocked by nothing else in Batch 1.
    cost/rate-limit metadata, and structured diagnostics, plus the shared
    bounded `FetchedDocument` contract. Wrap the existing layered search as
    `WebSearchAdapter`.
-4. **PARTIAL (`1ab7dd3`). Apply the adaptive web waterfall.** Implement
-   Batch 2 using preserved provider observations and terminal evidence
-   outcomes. Do not optimize provider order from HTTP success or raw result
-   counts alone. Batch 2a's Serper/Brave/Wikidata gating and RRF fusion are
-   done; result caching, concurrent-request coalescing, and evidence-outcome
-   metrics (item 9 in "Required Web Search Changes") remain open.
+4. **DONE except metrics (`1ab7dd3`, `d8c9866`). Apply the adaptive web
+   waterfall.** Implement Batch 2 using preserved provider observations and
+   terminal evidence outcomes. Do not optimize provider order from HTTP
+   success or raw result counts alone. Serper/Brave/Wikidata gating, RRF
+   fusion, result caching, and in-process concurrent-request coalescing are
+   all done; evidence-outcome metrics (item 9 in "Required Web Search
+   Changes") remain open, blocked on `candidate_outcomes` actually being
+   persisted (Batch 3).
 5. **Integrate local retrieval first.** Build `LocalKBAdapter` on the existing
    full-text/semantic chunk search, returning structured source/version,
    retrieval date, passage locator, freshness, and trust metadata. Keep it
@@ -838,10 +890,11 @@ It is complete when (status as of July 25, 2026):
   cited with a page locator;
 - 🟡 the web adapter uses canonical multi-provider fusion, an adaptive
   provider waterfall, and candidate backfill within explicit call/fetch
-  budgets. Canonical fusion ✅, candidate backfill ✅, and a first adaptive
-  waterfall (Serper/Brave/Wikidata gating, RRF fusion) ✅ are done
-  (`1ab7dd3`); the richer diversity/authority-aware gating signals, result
-  caching, and concurrent-request coalescing are not;
+  budgets. Canonical fusion ✅, candidate backfill ✅, a first adaptive
+  waterfall (Serper/Brave/Wikidata gating, RRF fusion) ✅, result caching ✅,
+  and in-process concurrent-request coalescing ✅ are all done (`1ab7dd3`,
+  `d8c9866`); only the richer diversity/authority-aware gating signals and
+  cross-process coalescing are not;
 - ✅ authority and completion work for at least three non-LLM domains
   (`classify_source`'s gov/edu/scholarly/docs tiers are domain-neutral;
   completion criteria are still universal-generic rather than
