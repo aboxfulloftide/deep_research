@@ -1,4 +1,5 @@
 import asyncio
+import math
 import re
 import time
 import urllib.parse
@@ -462,8 +463,23 @@ def _relevance_score(result: SearchResult, terms: set[str]) -> int:
 def _is_relevant(result: SearchResult, terms: set[str]) -> bool:
     # A multi-word question needs at least two signals. One-term questions
     # (names, identifiers, product codes) should still be allowed through.
-    minimum = 1 if len(terms) <= 1 else 2
-    return _relevance_score(result, terms) >= minimum
+    if len(terms) <= 1:
+        return _relevance_score(result, terms) >= 1
+    # _relevance_score's title weighting (2x) means a flat score threshold of
+    # 2 is satisfied by a single incidentally-shared title word, regardless
+    # of how many distinct terms the query actually has -- a page titled
+    # "Potential" is not evidence for a 7-term query about "potential risks
+    # and benefits of intermittent fasting for metabolic health" just
+    # because they share that one word. Require distinct-term coverage that
+    # scales with query specificity instead, so a genuinely on-topic page
+    # (sharing several of the query's words, even reworded) still passes,
+    # but a single coincidental match cannot no matter its title placement.
+    matched = terms & (
+        set(_QUERY_TOKEN_RE.findall(result.title.lower()))
+        | set(_QUERY_TOKEN_RE.findall(result.snippet.lower()))
+    )
+    required = min(len(terms), max(2, math.ceil(len(terms) / 3)))
+    return len(matched) >= required
 
 
 RRF_K = 60  # standard RRF damping constant, same value as kb_search.py's own
@@ -582,33 +598,9 @@ async def web_search(
             )
             return cached
 
-    async def _compute() -> list[SearchResult]:
+    async def _searxng_call(engines: tuple[str, ...]) -> list[SearchResult]:
         url = f"{config.searxng.url.rstrip('/')}/search"
-        params = {
-            "q": query,
-            "format": "json",
-        }
-        duckduckgo_allowed = await providers_allowed_by_circuit_breaker(
-            config, ("duckduckgo",), max_attempts=None,
-            cooldown_hours=SEARXNG_DUCKDUCKGO_COOLDOWN_HOURS,
-        )
-        selected_engines = tuple(
-            engine for engine in SEARXNG_BASE_ENGINES
-            if engine != "duckduckgo" or engine in duckduckgo_allowed
-        )
-        if include_alternate_query_engines:
-            recovered = await providers_allowed_by_circuit_breaker(
-                config, SEARXNG_RECOVERED_ENGINES,
-                max_attempts=SEARXNG_ALTERNATE_QUERY_ENGINE_MAX_ATTEMPTS,
-                cooldown_hours=SEARXNG_ALTERNATE_QUERY_ENGINE_COOLDOWN_HOURS,
-            )
-            selected_engines += tuple(
-                engine for engine in SEARXNG_RECOVERED_ENGINES if engine in recovered
-            )
-        # Always select the base engines explicitly. Otherwise omitting
-        # DuckDuckGo here would merely make SearXNG's default configuration add it
-        # back, defeating the cooldown while Bing remains healthy.
-        params["engines"] = ",".join(selected_engines)
+        params = {"q": query, "format": "json", "engines": ",".join(engines)}
         await _throttle_searxng(config.searxng.min_interval_seconds)
         t = timer()
         try:
@@ -627,29 +619,55 @@ async def web_search(
             data = {"results": []}
 
         await _log_searxng_engines(
-            config, data, t.elapsed_ms, query, selected_engines=selected_engines,
+            config, data, t.elapsed_ms, query, selected_engines=engines,
             search_ids=search_ids,
         )
 
-        results = []
+        engine_results = []
         for rank, item in enumerate(data.get("results", [])[:10], start=1):
             item_url = item.get("url", "")
             # SearXNG already fuses per-engine duplicates before returning this
             # list, so `rank` here is the merged SearXNG position, not each
             # individual engine's own rank -- good enough for observability;
             # true per-engine ranks would require querying engines directly.
-            engines = [engine for engine in (item.get("engines") or [item.get("engine")]) if engine]
-            results.append(SearchResult(
+            hit_engines = [engine for engine in (item.get("engines") or [item.get("engine")]) if engine]
+            engine_results.append(SearchResult(
                 title=item.get("title", ""),
                 url=item_url,
                 snippet=item.get("content", ""),
                 canonical_url=normalize_url(item_url),
                 observations=[
                     ProviderObservation(provider=f"searxng:{engine}", rank=rank, query=query)
-                    for engine in engines
+                    for engine in hit_engines
                 ] or [ProviderObservation(provider="searxng", rank=rank, query=query)],
             ))
+        return engine_results
 
+    async def _compute() -> list[SearchResult]:
+        duckduckgo_allowed = await providers_allowed_by_circuit_breaker(
+            config, ("duckduckgo",), max_attempts=None,
+            cooldown_hours=SEARXNG_DUCKDUCKGO_COOLDOWN_HOURS,
+        )
+        # Always select the base engines explicitly. Otherwise omitting
+        # DuckDuckGo here would merely make SearXNG's default configuration add it
+        # back, defeating the cooldown while Bing remains healthy.
+        selected_engines = tuple(
+            engine for engine in SEARXNG_BASE_ENGINES
+            if engine != "duckduckgo" or engine in duckduckgo_allowed
+        )
+        included_recovered_engines = False
+        if include_alternate_query_engines:
+            recovered = await providers_allowed_by_circuit_breaker(
+                config, SEARXNG_RECOVERED_ENGINES,
+                max_attempts=SEARXNG_ALTERNATE_QUERY_ENGINE_MAX_ATTEMPTS,
+                cooldown_hours=SEARXNG_ALTERNATE_QUERY_ENGINE_COOLDOWN_HOURS,
+            )
+            selected_engines += tuple(
+                engine for engine in SEARXNG_RECOVERED_ENGINES if engine in recovered
+            )
+            included_recovered_engines = True
+
+        results = await _searxng_call(selected_engines)
         terms = _query_terms(query)
 
         t = timer()
@@ -694,6 +712,31 @@ async def web_search(
                         error_message=str(e), elapsed_ms=t.elapsed_ms, query=wikidata_query,
                         error_category=classify_http_error(e), **search_ids,
                     )
+
+        # SearXNG's base engines (duckduckgo/bing) sometimes degrade silently --
+        # not an HTTP error, just irrelevant results (e.g. a scraper serving a
+        # dictionary "instant answer" page instead of real organic results) --
+        # so this checks actual relevance, not just whether the call succeeded.
+        # Only escalate to startpage/google_cse here if the caller didn't
+        # already fold them into the first call above (include_alternate_query_
+        # engines=True); otherwise this would just repeat that same call.
+        # Gated by the same circuit breaker as that opt-in path, so if these
+        # engines are already rate-limited/CAPTCHA'd this is a no-op, not a
+        # second way to hammer them.
+        if (
+            not included_recovered_engines
+            and sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
+        ):
+            recovered = await providers_allowed_by_circuit_breaker(
+                config, SEARXNG_RECOVERED_ENGINES,
+                max_attempts=SEARXNG_ALTERNATE_QUERY_ENGINE_MAX_ATTEMPTS,
+                cooldown_hours=SEARXNG_ALTERNATE_QUERY_ENGINE_COOLDOWN_HOURS,
+            )
+            recovered_engines = tuple(
+                engine for engine in SEARXNG_RECOVERED_ENGINES if engine in recovered
+            )
+            if recovered_engines:
+                results = _merge(results, await _searxng_call(recovered_engines))
 
         # Adaptive waterfall from here: Serper, then Brave, then Tavily each only
         # fire when the results accumulated so far aren't already sufficient --

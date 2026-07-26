@@ -302,7 +302,20 @@ async def test_web_search_only_opts_recovered_engines_into_alternate_queries(mon
             pass
 
         def json(self):
-            return {"results": [], "unresponsive_engines": []}
+            # Sufficiently relevant results from the base engines so the
+            # automatic recovery escalation (which fires on insufficiency,
+            # see test_web_search_auto_escalates_to_recovered_engines_when_
+            # base_tier_is_thin below) doesn't add a third call here --
+            # this test is only about include_alternate_query_engines's own
+            # inline engine-merging behavior.
+            return {
+                "results": [
+                    {"title": "A literal claim sentence result", "url": f"https://example.test/{i}",
+                     "content": "concise alternate keywords", "engines": ["bing"]}
+                    for i in range(3)
+                ],
+                "unresponsive_engines": [],
+            }
 
     class FakeClient:
         async def __aenter__(self):
@@ -391,6 +404,77 @@ async def test_web_search_omits_duckduckgo_while_its_circuit_is_open(monkeypatch
     await web_search("literal claim", Config())
 
     assert requested_params[0]["engines"] == "bing"
+
+
+async def test_web_search_auto_escalates_to_recovered_engines_when_base_tier_is_thin(monkeypatch):
+    """A degraded base-engine response (e.g. bing serving an unrelated
+    dictionary "instant answer" page instead of real organic results) isn't
+    an HTTP error -- it looks like a normal, successful SearXNG call. Only a
+    relevance check on the actual results catches it, and only then should
+    the deliberately-rationed recovered engines (startpage/google_cse) get a
+    second look, without the caller needing to ask for them explicitly."""
+    requested_params = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, params=None, headers=None):
+            requested_params.append(params)
+            if params["engines"] == ",".join(SEARXNG_BASE_ENGINES):
+                return FakeResponse({
+                    "results": [
+                        {"title": "Potential - definition", "url": "https://dictionary.example/potential",
+                         "content": "meaning of a word", "engines": ["bing"]},
+                    ],
+                    "unresponsive_engines": [],
+                })
+            return FakeResponse({
+                "results": [
+                    {"title": "Intermittent fasting metabolic health study", "url": f"https://example.test/{i}",
+                     "content": "intermittent fasting metabolic health results", "engines": ["startpage"]}
+                    for i in range(3)
+                ],
+                "unresponsive_engines": [],
+            })
+
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    async def allow_engines(config, providers, **kwargs):
+        return set(providers)
+
+    monkeypatch.setattr(search_module.httpx, "AsyncClient", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr(search_module, "_throttle_searxng", noop)
+    monkeypatch.setattr(search_module, "_log_searxng_engines", noop)
+    monkeypatch.setattr(search_module, "log_search_call", noop)
+    monkeypatch.setattr(search_module, "_wikipedia_api_search", no_results)
+    monkeypatch.setattr(search_module, "_wikidata_api_search", no_results)
+    monkeypatch.setattr(
+        search_module, "providers_allowed_by_circuit_breaker", allow_engines,
+    )
+
+    results = await web_search("intermittent fasting metabolic health", Config())
+
+    assert requested_params[0]["engines"] == ",".join(SEARXNG_BASE_ENGINES)
+    assert requested_params[1]["engines"] == ",".join(SEARXNG_RECOVERED_ENGINES)
+    assert any("intermittent-fasting" in result.url or "example.test" in result.url for result in results)
 
 
 async def test_health_probe_still_checks_mojeek_while_ordinary_search_omits_it(monkeypatch):
