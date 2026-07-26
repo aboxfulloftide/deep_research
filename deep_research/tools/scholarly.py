@@ -18,7 +18,7 @@ from deep_research.tools.search import _merge
 from deep_research.tools.search_usage import log_search_call, timer
 
 OPENALEX_API_URL = "https://api.openalex.org/works"
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
 _ARXIV_ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 _USER_AGENT = "deep-research-kb-bot/1.0 (scholarly discovery) httpx"
 
