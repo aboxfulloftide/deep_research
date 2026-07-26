@@ -401,6 +401,34 @@ def _fallback_research_plan(question: str) -> ResearchPlan:
     ])
 
 
+def _is_prompt_echo(text: str, prompt: str) -> bool:
+    """Reject a field copied verbatim from the instructions rather than
+    genuinely written for this question. Smaller local models sometimes
+    parrot a JSON schema's own example value back (observed live: the
+    literal strings "short_slug" and "evidence need" from an earlier,
+    abstractly-worded version of this prompt showed up as real facet ids/
+    questions across many runs, silently corrupting downstream directness
+    scoring since it embeds source.query against that placeholder text).
+    Checking containment against the prompt itself, rather than a fixed
+    denylist of past-observed strings, keeps this self-maintaining if the
+    prompt's own wording changes later. Only meaningful for longer, full-
+    phrase fields (question/purpose/search_query, already length-gated
+    upstream) -- a short id like "evidence" would trivially collide with
+    ordinary prompt vocabulary, so ids are checked separately by exact match
+    against the example's own ids instead."""
+    normalised = _normalise(text)
+    return bool(normalised) and normalised in _normalise(prompt)
+
+
+# Exact-match only (not substring containment, unlike _is_prompt_echo) --
+# these are this file's own example facet ids, short enough that
+# containment-checking them against the prompt would false-positive on any
+# real id that happens to share a common word with the surrounding
+# instructions (e.g. a genuine id like "evidence" is itself a substring of
+# "evidence needs" in the prompt text).
+_EXAMPLE_FACET_IDS = {"target_temperature", "food_safety_limits", "second_source_check"}
+
+
 async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
     """Turn any research question into evidence needs before searching.
 
@@ -408,15 +436,41 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
     rather than assuming that all questions need model cards, papers, prices,
     or a particular source type.
     """
+    # Deliberately verbose, steak-specific phrasing in this example (rather
+    # than short generic labels like "constraints" or "corroboration") --
+    # _is_prompt_echo() below only checks new facets against this block, not
+    # the surrounding instructions, but a generic-enough example phrase
+    # could still legitimately recur in an unrelated real question's own
+    # wording. Distinctive wording keeps that collision effectively
+    # impossible while still being rejected if copied verbatim.
+    example_json = (
+        '{"ambiguities":["Does \\"medium-rare\\" mean a specific USDA temperature or a restaurant\'s own scale?"],'
+        '"facets":['
+        '{"id":"target_temperature","question":"What internal temperature range defines medium-rare steak?",'
+        '"search_query":"medium-rare steak internal temperature range",'
+        '"purpose":"Gives the specific temperature figure this steak question is asking for.",'
+        '"capabilities":["web","primary"]},'
+        '{"id":"food_safety_limits","question":"What food-safety guidance applies to beef doneness temperatures?",'
+        '"search_query":"USDA beef doneness temperature guidelines",'
+        '"purpose":"Adds the official food-safety limit around this steak temperature range.",'
+        '"capabilities":["official_documentation","primary"]},'
+        '{"id":"second_source_check","question":"Do independent culinary sources agree on this temperature range?",'
+        '"search_query":"chef recommended medium-rare steak temperature",'
+        '"purpose":"Confirms the steak temperature figure via a second, independent culinary source.",'
+        '"capabilities":["web"]}'
+        "]}"
+    )
+    system_prompt = (
+        "/no_think\nPlan research for any question. Return ONLY JSON in this shape, with facets "
+        "specific to the ACTUAL question below -- never reuse this example's wording, it is for a "
+        f"different, unrelated question:\n{example_json}. "
+        "Capabilities may be web, primary, scholarly, official_documentation, repository, news, or grounding "
+        "(grounding is for basic entity/definition lookups, not general search). "
+        "Return 2-4 complementary facets. Facets must cover the central answer, constraints/definitions where relevant, "
+        "and corroboration or tradeoffs where relevant. Do not assume a domain or answer the question."
+    )
     messages = [
-        {"role": "system", "content": (
-            "/no_think\nPlan research for any question. Return ONLY JSON: "
-            '{"ambiguities":["..."],"facets":[{"id":"short_slug","question":"evidence need","search_query":"short search-engine query, not a restatement of the user question","purpose":"why this evidence matters","capabilities":["web","primary"]}]}. '
-            "Capabilities may be web, primary, scholarly, official_documentation, repository, news, or grounding "
-            "(grounding is for basic entity/definition lookups, not general search). "
-            "Return 2-4 complementary facets. Facets must cover the central answer, constraints/definitions where relevant, "
-            "and corroboration or tradeoffs where relevant. Do not assume a domain or answer the question."
-        )},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": question},
     ]
     try:
@@ -431,10 +485,19 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
                 facet_question = str(row.get("question") or "").strip()
                 search_query = str(row.get("search_query") or "").strip()
                 purpose = str(row.get("purpose") or "").strip()
-                facet_id = re.sub(r"[^a-z0-9_-]+", "-", str(row.get("id") or f"facet-{index}").lower()).strip("-")
+                raw_id = str(row.get("id") or "").strip()
+                facet_id = re.sub(r"[^a-z0-9_-]+", "-", raw_id or f"facet-{index}").strip("-")
                 raw_capabilities = row.get("capabilities", ["web"])
                 capabilities = [str(capability) for capability in raw_capabilities if str(capability) in SOURCE_CAPABILITIES] if isinstance(raw_capabilities, list) else []
-                if len(facet_question) >= 12 and len(purpose) >= 8 and facet_id and _normalise(search_query) != _normalise(question) and 12 <= len(search_query) <= 220:
+                if (
+                    len(facet_question) >= 12 and len(purpose) >= 8 and facet_id
+                    and _normalise(search_query) != _normalise(question)
+                    and 12 <= len(search_query) <= 220
+                    and not _is_prompt_echo(facet_question, example_json)
+                    and not _is_prompt_echo(purpose, example_json)
+                    and not _is_prompt_echo(search_query, example_json)
+                    and raw_id.strip().lower() not in _EXAMPLE_FACET_IDS
+                ):
                     facets.append(ResearchFacet(facet_id, facet_question[:260], purpose[:260], capabilities or ["web"], search_query))
         if len(facets) >= 2:
             ambiguities = payload.get("ambiguities", [])
@@ -445,13 +508,20 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
     # Smaller local models frequently produce useful prose but malformed JSON.
     # Repair with a deliberately simple line protocol before falling back to
     # keyword heuristics. This remains plan-only and never issues a search.
+    example_line = (
+        "target_temperature | What internal temperature range defines medium-rare steak | "
+        "medium-rare steak internal temperature range | web,primary"
+    )
+    repair_prompt = (
+        "/no_think\nCreate exactly three research-plan lines describing THIS question's evidence needs "
+        "(not a template -- write real content specific to the question). Each line must be: "
+        "short-id | what this piece of evidence must show | short search query | comma-separated capabilities. "
+        f"Example line for a different, unrelated question: {example_line}\n"
+        "Capabilities may be web, primary, scholarly, official_documentation, repository, news, or grounding. "
+        "Do not repeat the user's full question as a search query and do not answer it."
+    )
     repair_messages = [
-        {"role": "system", "content": (
-            "/no_think\nCreate exactly three research-plan lines. Each line must be: "
-            "short-id | evidence need | short search query | comma-separated capabilities. "
-            "Capabilities may be web, primary, scholarly, official_documentation, repository, news, or grounding. "
-            "Do not repeat the user's full question as a search query and do not answer it."
-        )},
+        {"role": "system", "content": repair_prompt},
         {"role": "user", "content": question},
     ]
     try:
@@ -463,7 +533,13 @@ async def plan_research(llm: LLMClient, question: str) -> ResearchPlan:
                 continue
             facet_id = re.sub(r"[^a-z0-9_-]+", "-", fields[0].lower()).strip("-")
             capabilities = [item.strip() for item in fields[3].split(",") if item.strip() in SOURCE_CAPABILITIES]
-            if facet_id and len(fields[1]) >= 12 and 12 <= len(fields[2]) <= 220 and _normalise(fields[2]) != _normalise(question):
+            if (
+                facet_id and len(fields[1]) >= 12 and 12 <= len(fields[2]) <= 220
+                and _normalise(fields[2]) != _normalise(question)
+                and not _is_prompt_echo(fields[1], example_line)
+                and not _is_prompt_echo(fields[2], example_line)
+                and fields[0].strip().lower() not in _EXAMPLE_FACET_IDS
+            ):
                 facets.append(ResearchFacet(facet_id, fields[1][:260], "Evidence required for this research facet.", capabilities or ["web"], fields[2]))
         if len(facets) >= 2:
             return ResearchPlan(question, [], facets[:4])

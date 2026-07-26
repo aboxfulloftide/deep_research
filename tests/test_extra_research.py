@@ -371,6 +371,13 @@ def test_broken_marketplace_scrape_is_not_usable_evidence():
     assert not extra._usable_scrape("Found 2 products: participant risks " * 30)
 
 
+def test_is_prompt_echo_flags_verbatim_copies_but_not_coincidental_words():
+    prompt = "Write a purpose covering constraints and corroboration for the facet."
+    assert extra._is_prompt_echo("Write a purpose covering constraints", prompt) is True
+    assert extra._is_prompt_echo("Confirms the reported figure via a second source", prompt) is False
+    assert extra._is_prompt_echo("", prompt) is False
+
+
 @pytest.mark.asyncio
 async def test_research_bundle_routes_facets_and_records_fitness(monkeypatch):
     class Planner:
@@ -441,6 +448,39 @@ async def test_research_plan_rejects_a_facet_that_searches_the_raw_user_question
 
     assert all(facet.search_query.lower() != question.lower() for facet in plan.facets)
     assert all(facet.search_query for facet in plan.facets)
+
+
+@pytest.mark.asyncio
+async def test_research_plan_rejects_a_facet_copied_verbatim_from_the_prompt_example():
+    """Live testing found smaller local models sometimes parrot the JSON
+    schema's own example content back instead of writing something specific
+    to the real question -- silently corrupting downstream directness
+    scoring, since it embeds that copied text as the facet's own "evidence
+    need". Two real, distinct facets plus one verbatim copy of the prompt's
+    example content should keep the two real facets and drop only the
+    copy."""
+    class EchoPlanner:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": (
+                '{"ambiguities":[],"facets":['
+                '{"id":"pricing_tiers","question":"What pricing tiers does this API offer?",'
+                '"search_query":"API pricing tiers plans comparison","purpose":"Direct answer to the pricing question.",'
+                '"capabilities":["web"]},'
+                '{"id":"rate_limits","question":"What rate limits apply to each pricing tier?",'
+                '"search_query":"API rate limits by pricing tier","purpose":"Constraint relevant to the pricing question.",'
+                '"capabilities":["official_documentation"]},'
+                '{"id":"target_temperature","question":"What internal temperature range defines medium-rare steak?",'
+                '"search_query":"medium-rare steak internal temperature range",'
+                '"purpose":"Gives the specific temperature figure this steak question is asking for.",'
+                '"capabilities":["web"]}'
+                "]}"
+            )}}]}
+
+    plan = await extra.plan_research(EchoPlanner(), "What pricing tiers does this API offer?")
+
+    facet_ids = [facet.id for facet in plan.facets]
+    assert "target_temperature" not in facet_ids
+    assert {"pricing_tiers", "rate_limits"} <= set(facet_ids)
 
 
 @pytest.mark.asyncio
