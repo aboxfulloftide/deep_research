@@ -14,12 +14,16 @@ Last verified against the running system and `main`: **July 25, 2026**.
 - Interactive Extra Research is available. Batch 1 (evidence correctness and
   observability), the domain-neutrality authority-gate fix, all of Batch 2
   (RRF fusion, typed provider-failure classification, adaptive waterfall,
-  result caching, concurrent-request coalescing), and Batch 3 Round A (a
-  shared SSRF-safe fetch contract plus the PDF-ingestion routing fix) are
-  committed (`e5c7db1`, `6cc32ab`, `1ab7dd3`, `d8c9866`, `83ad2b1`).
-  Capability routing is still cosmetic (no `SourceAdapter` registry), and
-  nothing Extra Research collects is persisted to the KB yet -- it should
-  still not be treated as a source-native, KB-integrated research system.
+  result caching, concurrent-request coalescing), and all of Batch 3 (the
+  shared SSRF-safe fetch contract, the PDF-ingestion routing fix, KB
+  persistence of Extra Research's accepted sources, facet-relevant passage
+  retrieval, and structured `kb_search()` records) except the OpenAlex/arXiv
+  adapters are committed (`e5c7db1`, `6cc32ab`, `1ab7dd3`, `d8c9866`,
+  `83ad2b1`, `f76e373`). Capability routing is still cosmetic (no
+  `SourceAdapter` registry) -- Extra Research's accepted sources are now
+  persisted into the KB, but nothing routes facet collection *through* the
+  KB first yet (`LocalKBAdapter` is still future work), so this still isn't
+  a source-native, KB-integrated research system end-to-end.
 
 ## What We Were Working On
 
@@ -250,12 +254,64 @@ deferred to later rounds.
   `build_artifact_for_version()` already receives the `version` dict with
   the correct `mime_type` on it -- `artifacts.py` just wasn't reading it.
 
+### Batch 3, Round B — KB Persistence, Facet-Relevant Passages, Structured kb_search (July 25, 2026)
+
+Commit `f76e373` covers three of the four remaining Batch 3 items.
+OpenAlex/arXiv adapters remain deferred, still gated on the common source
+contract this round establishes.
+
+- **KB persistence:** `collect_research_bundle()`/`collect_for()`/
+  `collect_sources()` all take an optional `kb_db: KBDatabase | None = None`
+  (mirrors `agent.py`'s own optional-KB pattern), defaulting to `None`
+  everywhere so standalone operation is unaffected. When provided, every
+  *accepted* source is persisted via the existing, tested
+  `ingest_web_page()` + `build_artifact_for_version()` path with a new
+  `source_purpose` value, `"extra_research_evidence"` (the column is
+  free-text, no schema change needed) -- best-effort, wrapped so a
+  persistence failure never changes what `collect_sources()` returns.
+  `web/app.py`'s `_extra_research_answer()` now passes `kb_routes.kb_db`
+  through. **Known, accepted tradeoff:** persisting an accepted source
+  re-fetches its URL a second time (`collect_sources()` already fetched it
+  once via `scrape_page()` to decide whether to accept it) -- bounded to at
+  most `budget.max_sources` (10) extra fetches per bundle; a shared
+  fetch-once primitive is a documented future optimization, not built this
+  round. **Deliberately not done:** `kb/model_experiments.py`'s
+  `collect_research_bundle()` calls do *not* pass `kb_db` -- model-
+  comparison benchmarks should not write their (LLM-vendor-specific,
+  non-representative) collected sources into the real KB, the same
+  reasoning already stated for keeping `LocalKBAdapter` disabled in
+  benchmarks.
+- **Facet-relevant passages:** `build_claim_ledger()`/
+  `analyze_sources_separately()` now call a new `_facet_relevant_passage()`,
+  which chunks a source's full content and ranks chunks by embedding
+  similarity to the facet question the source was collected for
+  (mirroring `kb/verification.py`'s `_rank_chunks_by_similarity`, simplified
+  since these chunks are ephemeral with no cached embeddings to reuse),
+  instead of the document's first 2,500 characters. Falls back to the old
+  behavior if the embedding backend is unreachable. This surfaced a real
+  bug: `_parse_ledger()`'s verbatim-quote check validated a claim's quote
+  against the *truncated* `.content`, not the full document -- a valid quote
+  from later in a document (now reachable since extraction isn't limited to
+  the opening characters) would have been silently rejected. Fixed to check
+  against `full_content`.
+- **Structured `kb_search()`:** split into `kb_search_records()` (returns
+  structured dicts -- chunk_id, rrf_score, location, title, full
+  `chunk_text`) and `kb_search()` (now a thin formatting wrapper, output
+  byte-identical to before). This surfaced a real data gap: `search_chunks()`
+  (the FTS retrieval path in `kb/db.py`) never selected `chunk_text` at all
+  -- only the semantic path did -- so an FTS-only hit's structured record had
+  no chunk text, just the truncated `ts_headline` snippet. Fixed by adding
+  `c.chunk_text` to `search_chunks()`'s query for symmetry with
+  `search_chunks_semantic()`.
+
 ### Existing Foundations Not Yet Integrated Into Routed Collection
 
-- `deep_research/tools/kb_search.py` already provides hybrid full-text and
-  semantic retrieval over current KB chunks using reciprocal-rank fusion.
-  The missing work is returning structured provenance and exposing it through
-  Extra Research's adapter boundary.
+- `deep_research/tools/kb_search.py` provides hybrid full-text and semantic
+  retrieval over current KB chunks using reciprocal-rank fusion, now
+  returning structured records (`kb_search_records()`, commit `f76e373`) as
+  well as its original formatted string. Still not exposed through Extra
+  Research's adapter boundary -- there is no `LocalKBAdapter` consuming it
+  for "local corpus first" facet routing yet.
 - The KB already stores versioned sources, immutable artifacts, chunks,
   embeddings, transcript timestamps, and claim evidence. Extend this storage
   rather than creating a parallel research-source database.
@@ -455,11 +511,16 @@ deterministic result.
   for every candidate considered -- in-memory on `ResearchBundle.candidate_outcomes`
   only; not yet persisted to the KB (see "Persist the common source contract"
   below).
-- Claim-ledger extraction sees only the first 2,500 characters of each
-  accepted source instead of facet-relevant passages from the complete
-  document.
-- Extra Research saves fetched pages to session storage, not to the versioned
-  KB corpus, so later runs cannot reliably reuse or revalidate them.
+- **Resolved (commit `f76e373`):** claim-ledger extraction now retrieves
+  facet-relevant passages (embedding-ranked chunks) from the complete
+  document instead of only the first 2,500 characters.
+- **Resolved (commit `f76e373`):** Extra Research now also persists fetched
+  pages into the versioned KB corpus (`source_purpose = 'extra_research_evidence'`)
+  when a KB connection is available, so later runs can reuse/revalidate
+  them -- the session-storage write (`db.save_scraped_page`) stays too, for
+  the chat session's own "sources consulted" display, a separate concern.
+  Not yet done: nothing *reads from* the KB before searching the web (no
+  `LocalKBAdapter`), so "local corpus first" routing itself remains open.
 - Generic page scraping always attempts product-card extraction before normal
   main-content extraction. On pages with product-like grids this can replace
   useful research text with a synthetic product list. Structured product
@@ -852,7 +913,7 @@ unblocked by nothing else in Batch 1.
   blocked on `candidate_outcomes` actually being persisted (Batch 3) so a
   real join against `search_calls` is possible.
 
-**Batch 3 — Reusable acquisition and passage retrieval — Round A DONE (commit `83ad2b1`, July 25, 2026)**
+**Batch 3 — Reusable acquisition and passage retrieval — DONE except OpenAlex/arXiv (commits `83ad2b1`, `f76e373`, July 25, 2026)**
 
 - introduce the shared SSRF-safe, byte-bounded, MIME-aware fetch contract; ✅
   `tools/fetch.py`'s `safe_fetch()`/`FetchedDocument`. "MIME-aware" here
@@ -862,18 +923,27 @@ unblocked by nothing else in Batch 1.
   "Batch 3, Round A" above) — the actual PDF result was blocked on both the
   fetch contract's byte/redirect safety *and* this routing fix together.
 - persist one raw snapshot and derived cleaned/PDF artifact in the existing
-  KB; ⬜ still open — this bullet is about Extra Research's own collected
-  sources, not KB URL ingestion (which already persists snapshots/artifacts
-  today, and now correctly routes PDFs per the fix above).
+  KB; ✅ Extra Research's accepted sources are now persisted via
+  `ingest_web_page()`/`build_artifact_for_version()` (`f76e373`,
+  `source_purpose = 'extra_research_evidence'`), best-effort, at the cost of
+  a documented double-fetch for accepted sources (see "Batch 3, Round B"
+  above). KB URL ingestion already persisted snapshots/artifacts before
+  this and now correctly routes PDFs per Round A's fix.
 - return complete structured records from local hybrid retrieval instead of
-  formatting them immediately as a string; ⬜ still open (`kb_search.py`).
+  formatting them immediately as a string; ✅ `kb_search_records()`
+  (`f76e373`) — not yet consumed by anything new (no `LocalKBAdapter` yet),
+  but the structured shape itself is done, plus a real gap it surfaced
+  (`search_chunks()`'s FTS path never returned `chunk_text`) is fixed.
 - retrieve facet-relevant chunks/passages with page, section, character, or
-  timestamp locators before claim extraction; ⬜ still open
-  (`extra_research.py`'s claim-ledger extraction still reads the first 2,500
-  characters, not facet-relevant passages).
+  timestamp locators before claim extraction; ✅ `_facet_relevant_passage()`
+  (`f76e373`), embedding-ranked chunks instead of the document's opening
+  characters — character-range locators specifically (vs. just "which
+  chunks") are not separately surfaced, since the passage is concatenated
+  before being shown to the model.
 - add OpenAlex discovery and arXiv retrieval only after the common source
-  contract can store and replay their output. ⬜ still open, still gated on
-  the item above.
+  contract can store and replay their output. ⬜ still open -- the common
+  source contract (KB persistence) now exists, so this is unblocked but not
+  started.
 
 ## Recommended Next Steps
 
@@ -900,10 +970,16 @@ unblocked by nothing else in Batch 1.
    all done; evidence-outcome metrics (item 9 in "Required Web Search
    Changes") remain open, blocked on `candidate_outcomes` actually being
    persisted (Batch 3).
-5. **Integrate local retrieval first.** Build `LocalKBAdapter` on the existing
-   full-text/semantic chunk search, returning structured source/version,
-   retrieval date, passage locator, freshness, and trust metadata. Keep it
-   disabled in collection-model benchmarks where reuse would bias results.
+5. **[PARTIAL] (`f76e373`). Integrate local retrieval first.** Build
+   `LocalKBAdapter` on the existing full-text/semantic chunk search,
+   returning structured source/version, retrieval date, passage locator,
+   freshness, and trust metadata. Keep it disabled in collection-model
+   benchmarks where reuse would bias results. `kb_search_records()` now
+   returns structured records this adapter would consume, and
+   `kb/model_experiments.py` is already kept KB-free (both by not reading
+   from and, as of this round, not writing to the KB) -- the adapter
+   itself, and Extra Research actually checking the KB before searching the
+   web, are not built yet.
 6. **Persist and approve plans.** Give each plan a stable ID and
    `draft -> approved -> executing -> completed` lifecycle. Add an editable
    review screen and make collection execute the exact approved plan.
@@ -913,16 +989,22 @@ unblocked by nothing else in Batch 1.
 8. **Add one scholarly slice.** Implement OpenAlex discovery plus arXiv
    metadata/content retrieval before attempting the entire adapter list.
    Preserve DOI/arXiv identifiers and deduplicate alternate renderings.
-9. **Persist the common source contract.** Persist accepted and rejected
-   candidates, raw snapshots, cleaned text, adapter/routing provenance,
-   assessments, fallback reasons, and immutable bundle membership in the KB.
-10. **[PARTIAL] (`83ad2b1`). Process complete documents.** Add MIME-aware web
-    PDF ingestion, clean and chunk complete content, retrieve facet-relevant
-    passages, optionally rerank them, and build the claim ledger from those
-    passages rather than document openings. MIME-aware web PDF ingestion is
-    done (KB URL ingestion now correctly routes a fetched PDF to the `pypdf`
-    extractor); facet-relevant passage retrieval and building the claim
-    ledger from passages rather than document openings remain open.
+9. **[PARTIAL] (`f76e373`). Persist the common source contract.** Persist
+   accepted and rejected candidates, raw snapshots, cleaned text, adapter/
+   routing provenance, assessments, fallback reasons, and immutable bundle
+   membership in the KB. *Accepted* sources' raw snapshots and
+   chunked/PDF artifacts are now persisted (`source_purpose =
+   'extra_research_evidence'`). Not yet in the KB: rejected candidates
+   (`candidate_outcomes` stays in-memory only), adapter/routing provenance,
+   assessments, fallback reasons, and bundle-membership records -- so a
+   bundle still cannot be fully replayed from the KB alone.
+10. **DONE (`83ad2b1`, `f76e373`). Process complete documents.** Add
+    MIME-aware web PDF ingestion, clean and chunk complete content, retrieve
+    facet-relevant passages, optionally rerank them, and build the claim
+    ledger from those passages rather than document openings. All done:
+    MIME-aware PDF routing (`83ad2b1`), facet-relevant passage retrieval
+    feeding claim-ledger extraction (`f76e373`). "Optionally rerank"
+    beyond embedding-similarity ranking was not added separately.
 11. **Make coverage and budgets auditable.** Distinguish `covered`, `partial`,
    and `uncovered`; expose provider calls, fetches, accepted sources, model
    calls, elapsed time, and remaining gaps before synthesis.
@@ -964,10 +1046,11 @@ It is complete when (status as of July 25, 2026):
   accepted evidence was actually cited in the final synthesis;
 - 🟡 a web-hosted PDF can be stored, parsed, retrieved by relevant passage, and
   cited with a page locator. Stored and parsed with page-located chunks ✅
-  (`83ad2b1`, KB URL ingestion only); retrieval by relevant passage and
-  citation with a page locator are not implemented yet, and Extra
+  (`83ad2b1`, KB URL ingestion only); facet-relevant passage retrieval now
+  exists in general (`f76e373`) but never runs on PDF content, since Extra
   Research's own `_is_html_result()` filter still refuses to fetch a PDF
-  candidate in the first place;
+  candidate in the first place -- citation with a page locator is also not
+  implemented;
 - 🟡 the web adapter uses canonical multi-provider fusion, an adaptive
   provider waterfall, and candidate backfill within explicit call/fetch
   budgets. Canonical fusion ✅, candidate backfill ✅, a first adaptive
@@ -983,9 +1066,13 @@ It is complete when (status as of July 25, 2026):
 - 🟡 rejected candidates and reasons remain inspectable -- true in-memory
   (`candidate_outcomes`) for the duration of one run; not persisted, not
   exposed in any UI/API yet;
-- ⬜ the resulting evidence bundle can be replayed without network access
-  (nothing Extra Research collects is persisted to the KB; fetched pages
-  still only live in the session-scoped `scraped_pages` table).
+- 🟡 the resulting evidence bundle can be replayed without network access.
+  Accepted sources' raw snapshots and chunked artifacts are now persisted
+  to the KB (`f76e373`), but rejected candidates, adapter/routing
+  provenance, assessments, and bundle membership are not -- so accepted
+  evidence could be replayed from the KB in principle, but not yet the
+  whole bundle (including why anything was rejected), and nothing actually
+  implements that replay path yet.
 
 ## Relevant Documents
 
