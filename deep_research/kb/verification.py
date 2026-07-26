@@ -873,7 +873,9 @@ def _unverified_retry_due(claim: dict) -> bool:
     return datetime.now(timezone.utc) - attempted_at >= timedelta(hours=UNVERIFIED_RETRY_COOLDOWN_HOURS)
 
 
-def is_claim_eligible_for_verification(claim: dict, threshold: float, force: bool = False) -> bool:
+def is_claim_eligible_for_verification(
+    claim: dict, threshold: float, force: bool = False, only_status: str | None = None,
+) -> bool:
     """Single source of truth for "should this claim be auto-verified,"
     used by the nightly sweep, verify-source, and the paste-a-conversation
     flow alike -- not every extracted statement is worth checking, and a
@@ -886,7 +888,15 @@ def is_claim_eligible_for_verification(claim: dict, threshold: float, force: boo
     exactly as if it were never attempted. A deprecated claim (the losing
     side of a claim merge, see kb.merge) is never eligible at all -- it's
     just a pointer to the real, canonical claim now, not a live fact worth
-    spending a verification pass on."""
+    spending a verification pass on.
+
+    only_status narrows eligibility to claims currently in that status --
+    e.g. "unverified" for a backlog sweep that should touch only claims
+    still lacking a settled verdict, without force=True (needed to bypass
+    the retry cooldown for ones already attempted once) also reopening
+    already-settled supported/contradicted claims across the whole KB."""
+    if only_status is not None and claim.get("status") != only_status:
+        return False
     if claim.get("status") == "deprecated":
         return False
     if not force and claim.get("verification_attempted_at") is not None and not _unverified_retry_due(claim):
@@ -982,6 +992,7 @@ async def verify_claims_concurrently(
 async def run_verification_sweep(
     kb_db: KBDatabase, config: Config, *, trigger: str, threshold: float | None = None,
     limit: int | None = None, force: bool = False, on_result=None, concurrency: int | None = None,
+    only_status: str | None = None, run_max_web_searches: int | None = None,
 ) -> dict:
     """KB-wide verification sweep: every claim at/above the importance
     threshold gets checked against independent sources, same eligibility
@@ -991,6 +1002,18 @@ async def run_verification_sweep(
     in one place. `on_result(claim, status, result_or_exception)` is called
     (synchronously) after each claim, in case the caller wants to report
     progress (e.g. console output) as it happens.
+
+    only_status restricts the sweep to claims currently in that status (see
+    is_claim_eligible_for_verification) -- e.g. a one-off backlog sweep of
+    every currently-unverified claim with force=True to bypass the retry
+    cooldown, without force also reopening the whole KB's already-settled
+    supported/contradicted claims.
+
+    run_max_web_searches overrides config.kb.verification_run_max_web_searches
+    for this run only -- the configured default is sized for a routine
+    nightly sweep, not a one-off backlog of hundreds/thousands of claims,
+    where the default would exhaust itself in the first few dozen claims and
+    leave the rest checked against internal KB data alone.
 
     Refuses to start a second sweep while one is already in progress --
     verify_claim makes real LLM calls against a single shared GPU, so
@@ -1017,12 +1040,18 @@ async def run_verification_sweep(
         key=lambda claim: (bool(claim.get("topics")), claim.get("importance_score") or 0), reverse=True,
     )
     eff_threshold = threshold if threshold is not None else config.kb.verification_importance_threshold
-    eligible = [c for c in all_claims if is_claim_eligible_for_verification(c, eff_threshold, force=force)]
+    eligible = [
+        c for c in all_claims
+        if is_claim_eligible_for_verification(c, eff_threshold, force=force, only_status=only_status)
+    ]
     if limit is not None:
         eligible = eligible[:limit]
 
     counts = {"supported": 0, "contradicted": 0, "mixed": 0, "unverified": 0, "skipped": 0, "failed": 0}
-    run_search_budget = _RunSearchBudget(config.kb.verification_run_max_web_searches)
+    eff_run_max_web_searches = (
+        run_max_web_searches if run_max_web_searches is not None else config.kb.verification_run_max_web_searches
+    )
+    run_search_budget = _RunSearchBudget(eff_run_max_web_searches)
     run = await kb_db.create_verification_run(trigger, claims_total=len(eligible))
     in_flight: dict[str, str] = {}
     in_flight_lock = asyncio.Lock()

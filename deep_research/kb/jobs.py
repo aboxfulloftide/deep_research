@@ -501,6 +501,8 @@ class ProcessingJobWorker:
             self.kb_db, self.config, trigger=payload.get("trigger") or "job_worker",
             threshold=payload.get("verification_threshold"),
             limit=payload.get("limit"), force=bool(payload.get("force")),
+            only_status=payload.get("only_status"),
+            run_max_web_searches=payload.get("run_max_web_searches"),
         )
         counter_evidence = None
         if payload.get("trigger") == "cron":

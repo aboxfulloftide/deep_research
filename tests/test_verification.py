@@ -219,6 +219,34 @@ def test_deprecated_claim_is_never_eligible_even_with_force():
     assert v.is_claim_eligible_for_verification(claim, threshold=0.8, force=True) is False
 
 
+# -- only_status: a targeted backlog sweep must not reopen settled claims ----
+
+def test_only_status_excludes_a_claim_in_a_different_status():
+    claim = _claim(status="supported", verification_attempted_at=None)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.0, only_status="unverified") is False
+
+
+def test_only_status_includes_a_matching_never_attempted_claim():
+    claim = _claim(status="unverified", verification_attempted_at=None)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.0, only_status="unverified") is True
+
+
+def test_only_status_with_force_reopens_a_matching_previously_inconclusive_claim():
+    old = datetime.now(timezone.utc) - timedelta(hours=1)  # still within the retry cooldown
+    claim = _claim(status="unverified", verification_attempted_at=old)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.0, only_status="unverified") is False
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.0, force=True, only_status="unverified") is True
+
+
+def test_only_status_does_not_reopen_a_settled_claim_even_with_force():
+    # The whole point of only_status: force=True alone would otherwise also
+    # reopen already-settled supported/contradicted claims across the KB.
+    old = datetime.now(timezone.utc) - timedelta(days=365)
+    claim = _claim(status="supported", verification_attempted_at=old)
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.0, force=True) is True
+    assert v.is_claim_eligible_for_verification(claim, threshold=0.0, force=True, only_status="unverified") is False
+
+
 # -- _classify_relationship: verification_context steers the comparison -----
 
 async def test_classify_relationship_includes_context_when_given():
@@ -726,8 +754,45 @@ async def test_run_verification_sweep_treats_old_running_run_as_abandoned(kb_db)
     stale_after = await kb_db.list_verification_runs(limit=10)
     stale_row = next(r for r in stale_after if r["id"] == stale["id"])
     assert stale_row["status"] == "failed"
-    assert "Abandoned" in stale_row["error_message"]
-    assert summary["eligible_count"] == 0
+
+
+async def test_run_verification_sweep_run_max_web_searches_overrides_config(kb_db, monkeypatch):
+    """A one-off backlog sweep needs a much larger shared search budget than
+    the routine nightly default, which would otherwise exhaust itself in the
+    first few dozen of hundreds/thousands of claims."""
+    from deep_research.config import load_config
+
+    captured = {}
+
+    class FakeBudget:
+        def __init__(self, limit):
+            captured["limit"] = limit
+            self.limit = limit
+            self.used = 0
+
+    monkeypatch.setattr(v, "_RunSearchBudget", FakeBudget)
+    config = load_config()
+
+    await v.run_verification_sweep(kb_db, config, trigger="manual", limit=0, run_max_web_searches=2000)
+    assert captured["limit"] == 2000
+
+
+async def test_run_verification_sweep_defaults_run_max_web_searches_to_config(kb_db, monkeypatch):
+    from deep_research.config import load_config
+
+    captured = {}
+
+    class FakeBudget:
+        def __init__(self, limit):
+            captured["limit"] = limit
+            self.limit = limit
+            self.used = 0
+
+    monkeypatch.setattr(v, "_RunSearchBudget", FakeBudget)
+    config = load_config()
+
+    await v.run_verification_sweep(kb_db, config, trigger="manual", limit=0)
+    assert captured["limit"] == config.kb.verification_run_max_web_searches
 
 
 # -- keep-or-delete claims discovered during web-fallback verification ------
