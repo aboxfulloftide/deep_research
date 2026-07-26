@@ -1,6 +1,7 @@
 import pytest
 
 from deep_research.config import Config
+from deep_research.kb.ingest import IngestResult
 from deep_research.models import ScrapedPage, SearchResult
 from deep_research.tools import extra_research as extra
 from web import app
@@ -161,11 +162,86 @@ async def test_collect_sources_records_a_terminal_outcome_for_every_considered_c
     assert len(sources) == 1
 
 
+async def test_collect_sources_persists_each_accepted_source_when_kb_db_is_provided(monkeypatch):
+    async def fake_search(query, config, **kwargs):
+        return [SearchResult(title="Paper", url="https://arxiv.org/abs/1111.11111", snippet="paper")]
+
+    async def fake_scrape(url, config):
+        return ScrapedPage(url=url, title="Paper", text_content="source text " * 30)
+
+    calls = {"ingest": 0, "artifact": 0}
+
+    async def fake_ingest_web_page(url, config, kb_db, snapshot_store, source_purpose=None):
+        calls["ingest"] += 1
+        assert source_purpose == "extra_research_evidence"
+        return IngestResult(status="ingested", source_id="src-1", source_created=True, version_id="ver-1")
+
+    async def fake_build_artifact(kb_db, snapshot_store, source, version, config=None):
+        calls["artifact"] += 1
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+    monkeypatch.setattr(extra, "ingest_web_page", fake_ingest_web_page)
+    monkeypatch.setattr(extra, "build_artifact_for_version", fake_build_artifact)
+
+    class _FakeKBDB:
+        async def get_source(self, source_id):
+            return {"id": source_id}
+
+        async def get_source_version(self, version_id):
+            return {"id": version_id}
+
+    sources = await extra.collect_sources(["question"], Config(), 1, set(), kb_db=_FakeKBDB())
+
+    assert len(sources) == 1
+    assert calls == {"ingest": 1, "artifact": 1}
+
+
+async def test_collect_sources_does_not_persist_when_kb_db_is_none(monkeypatch):
+    async def fake_search(query, config, **kwargs):
+        return [SearchResult(title="Paper", url="https://arxiv.org/abs/2222.22222", snippet="paper")]
+
+    async def fake_scrape(url, config):
+        return ScrapedPage(url=url, title="Paper", text_content="source text " * 30)
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("should not persist to the KB when kb_db is None")
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+    monkeypatch.setattr(extra, "ingest_web_page", fail_if_called)
+    monkeypatch.setattr(extra, "build_artifact_for_version", fail_if_called)
+
+    sources = await extra.collect_sources(["question"], Config(), 1, set())
+
+    assert len(sources) == 1
+
+
+async def test_collect_sources_returns_accepted_sources_even_if_kb_persistence_fails(monkeypatch):
+    async def fake_search(query, config, **kwargs):
+        return [SearchResult(title="Paper", url="https://arxiv.org/abs/3333.33333", snippet="paper")]
+
+    async def fake_scrape(url, config):
+        return ScrapedPage(url=url, title="Paper", text_content="source text " * 30)
+
+    async def raising_ingest(*args, **kwargs):
+        raise ConnectionError("KB unreachable")
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+    monkeypatch.setattr(extra, "ingest_web_page", raising_ingest)
+
+    sources = await extra.collect_sources(["question"], Config(), 1, set(), kb_db=object())
+
+    assert len(sources) == 1
+    assert sources[0].url == "https://arxiv.org/abs/3333.33333"
+
+
 @pytest.mark.asyncio
 async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check(monkeypatch):
     source = extra.ResearchSource("Source", "https://huggingface.co/Qwen/example", "source evidence text", 1, "core evidence", quality_score=5, source_kind="primary")
     plan = extra.ResearchPlan("question", [], [extra.ResearchFacet("core", "core evidence", "Direct evidence")])
-    async def fake_bundle(*args):
+    async def fake_bundle(*args, **kwargs):
         return extra.ResearchBundle(plan, [source], [], extra._coverage_for(plan, [source]))
     monkeypatch.setattr(extra, "collect_research_bundle", fake_bundle)
     events = [event async for event in app._extra_research_answer(_FakeLLM(), "question", Config())]
@@ -301,3 +377,39 @@ async def test_claim_ledger_keeps_source_attributed_verbatim_evidence():
     )
     assert claims[0].source_url == "https://huggingface.co/example"
     assert "[Source](https://huggingface.co/example)" in extra.claim_ledger_context(claims)
+
+
+@pytest.mark.asyncio
+async def test_facet_relevant_passage_prefers_the_chunk_matching_the_facet_question(monkeypatch):
+    filler = "filler word here just padding content. " * 40  # ~1600 chars
+    full_content = filler + " RELEVANT MARKER SENTENCE FOR PYTHON PACKAGING. " + filler
+    source = extra.ResearchSource(
+        "Source", "https://example.test/doc", full_content[:extra.SOURCE_EXCERPT_CHARS],
+        1, "python packaging tools", full_content=full_content,
+    )
+
+    async def fake_embed_texts(texts, base_url, model):
+        return [[1.0, 0.0] if text == source.query or "RELEVANT MARKER" in text else [0.0, 1.0] for text in texts]
+
+    monkeypatch.setattr(extra, "embed_texts", fake_embed_texts)
+
+    passage = await extra._facet_relevant_passage(source, Config())
+
+    assert "RELEVANT MARKER SENTENCE FOR PYTHON PACKAGING" in passage
+
+
+@pytest.mark.asyncio
+async def test_facet_relevant_passage_falls_back_when_the_embedding_backend_is_unreachable(monkeypatch):
+    source = extra.ResearchSource(
+        "Source", "https://example.test/doc", "opening text " * 300,
+        1, "query", full_content="opening text " * 300,
+    )
+
+    async def failing_embed_texts(*args, **kwargs):
+        raise ConnectionError("embedding backend unreachable")
+
+    monkeypatch.setattr(extra, "embed_texts", failing_embed_texts)
+
+    passage = await extra._facet_relevant_passage(source, Config())
+
+    assert passage == source.content[:extra.SOURCE_ANALYSIS_CHARS]

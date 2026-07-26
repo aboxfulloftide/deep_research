@@ -1133,7 +1133,7 @@ class KBDatabase:
                 """
                 SELECT
                     c.id AS chunk_id, c.chunk_index, c.page_number,
-                    c.time_start_seconds, c.time_end_seconds,
+                    c.time_start_seconds, c.time_end_seconds, c.chunk_text,
                     a.id AS artifact_id, a.artifact_type,
                     sv.id AS source_version_id, sv.version_number,
                     s.id AS source_id, s.title AS source_title, s.canonical_uri,

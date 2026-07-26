@@ -13,6 +13,12 @@ from dataclasses import asdict, dataclass, field
 from urllib.parse import urlparse
 
 from deep_research.config import Config
+from deep_research.kb.artifacts import build_artifact_for_version
+from deep_research.kb.chunking import chunk_text
+from deep_research.kb.db import KBDatabase
+from deep_research.kb.embeddings import cosine, embed_texts
+from deep_research.kb.ingest import ingest_web_page
+from deep_research.kb.storage import SnapshotStore
 from deep_research.llm import LLMClient
 from deep_research.models import SearchResult
 from deep_research.tools.scrape import scrape_page
@@ -25,6 +31,8 @@ FOLLOW_UP_QUERY_LIMIT = 2
 INITIAL_QUERY_LIMIT = 2
 GAP_CLOSING_QUERY_LIMIT = 1
 SOURCE_ANALYSIS_CHARS = 2_500
+FACET_PASSAGE_CHUNK_SIZE = 1200  # matches kb/artifacts.py's own chunking default
+FACET_PASSAGE_CHUNK_COUNT = 4    # top-N chunks fed to extraction/analysis
 # Bounds worst case when several top-ranked candidates for one query turn out
 # to be duplicates, low-quality, or unusable -- without this, a single query
 # could keep walking an entire ranked-results list one fetch at a time.
@@ -195,12 +203,37 @@ def classify_source(url: str) -> tuple[str, int]:
     return "secondary", 2
 
 
+async def _persist_accepted_source(url: str, config: Config, kb_db: KBDatabase) -> None:
+    """Best-effort KB persistence for a source Extra Research already
+    accepted -- failure here must never affect what collect_sources()
+    returns; the in-memory ResearchSource is already built regardless.
+    Reuses the existing, tested KB ingestion path (ingest_web_page +
+    build_artifact_for_version) rather than a new lower-level primitive, at
+    the cost of fetching the URL a second time (collect_sources() already
+    fetched it once via scrape_page() to decide whether to accept it) --
+    accepted tradeoff, bounded to at most budget.max_sources fetches per
+    bundle; a shared fetch-once primitive is a documented future
+    optimization, not built here."""
+    try:
+        snapshot_store = SnapshotStore(config.kb_snapshot_dir)
+        ingest_result = await ingest_web_page(
+            url, config, kb_db, snapshot_store, source_purpose="extra_research_evidence",
+        )
+        if ingest_result.status in ("ingested", "unchanged"):
+            source = await kb_db.get_source(ingest_result.source_id)
+            version = await kb_db.get_source_version(ingest_result.version_id)
+            await build_artifact_for_version(kb_db, snapshot_store, source, version, config=config)
+    except Exception:
+        pass
+
+
 async def collect_sources(
     queries: list[str], config: Config, level: int, seen_urls: set[str], *,
     sources_per_query: int | None = None,
     facet_id: str = "", capability: str = "",
     run_id: str | None = None, attempt_id: str | None = None,
     outcomes: list[dict] | None = None,
+    kb_db: KBDatabase | None = None,
 ) -> list[ResearchSource]:
     """Search each query and read new HTML sources from it, walking the
     ranked candidate list in order per query until per_query_limit usable
@@ -213,6 +246,12 @@ async def collect_sources(
     dict appended to `outcomes` if the caller supplies a list -- this is
     in-memory observability today; the field names mirror what a future KB
     candidate-ledger row would need.
+
+    When `kb_db` is provided, every accepted source is also persisted into
+    the KB (see _persist_accepted_source) so later runs can reuse or
+    revalidate it instead of only living in this run's in-memory bundle.
+    Persistence is best-effort and never affects which sources this
+    function returns.
 
     The first level combines the original wording with planned subquestions.
     Follow-up levels use focused evidence branches; the final level uses one
@@ -300,6 +339,8 @@ async def collect_sources(
             pending_titles.add(title_key)
             accepted_this_query += 1
             _record("accepted")
+            if kb_db is not None:
+                await _persist_accepted_source(result.url, config, kb_db)
 
     for source in sources:
         seen_urls.add(source.canonical_url or source.url)
@@ -454,12 +495,20 @@ def _coverage_for(plan: ResearchPlan, sources: list[ResearchSource], assessments
     }
 
 
-async def collect_research_bundle(llm: LLMClient, question: str, config: Config, budget: ResearchBudget | None = None) -> ResearchBundle:
+async def collect_research_bundle(
+    llm: LLMClient, question: str, config: Config, budget: ResearchBudget | None = None, *,
+    kb_db: KBDatabase | None = None,
+) -> ResearchBundle:
     """Collect diverse evidence by research facet, then close uncovered facets.
 
     This is the common source-collection stage used before any analysis. Its
     output is intentionally preserved so users and evaluators can reject a
     weak bundle rather than mistaking a polished synthesis for research.
+
+    kb_db is optional (mirrors agent.py's own ResearchAgent(kb_db=None)
+    pattern) -- when provided, every accepted source is also persisted into
+    the KB (see collect_sources/_persist_accepted_source) so later runs can
+    reuse it; standalone operation without a KB connection is unaffected.
     """
     budget = budget or ResearchBudget()
     plan = await plan_research(llm, question)
@@ -485,7 +534,7 @@ async def collect_research_bundle(llm: LLMClient, question: str, config: Config,
         found = await collect_sources(
             [query], config, level, seen_urls, sources_per_query=1,
             facet_id=facet.id, capability=capability, run_id=run_id, attempt_id=attempt_id,
-            outcomes=outcomes,
+            outcomes=outcomes, kb_db=kb_db,
         )
         found = found[:max(0, budget.max_sources - len(sources))]
         sources.extend(found)
@@ -637,13 +686,40 @@ async def derive_gap_closing_query(
     return queries[:GAP_CLOSING_QUERY_LIMIT]
 
 
+async def _facet_relevant_passage(source: ResearchSource, config: Config) -> str:
+    """Chunk the source's full content and rank chunks by embedding
+    similarity to the facet question this source was collected for
+    (source.query, set in collect_for()), instead of trusting a document's
+    opening characters to be the relevant part -- mirrors
+    kb/verification.py's _rank_chunks_by_similarity, simplified since these
+    chunks are ephemeral (never persisted, so no cached embeddings to
+    reuse). Best-effort: any embedding-backend failure falls back to the
+    previous first-N-characters behavior."""
+    chunks = chunk_text(source.full_content or source.content, FACET_PASSAGE_CHUNK_SIZE)
+    if not chunks:
+        return source.content[:SOURCE_ANALYSIS_CHARS]
+    try:
+        vectors = await embed_texts(
+            [source.query] + [chunk_str for chunk_str, _, _ in chunks],
+            config.kb.embedding_base_url, config.kb.embedding_model,
+        )
+    except Exception:
+        return source.content[:SOURCE_ANALYSIS_CHARS]
+    target_vec, chunk_vecs = vectors[0], vectors[1:]
+    ranked = sorted(
+        zip(chunks, chunk_vecs), key=lambda pair: cosine(target_vec, pair[1]), reverse=True,
+    )
+    return "\n\n".join(chunk_str for (chunk_str, _, _), _ in ranked[:FACET_PASSAGE_CHUNK_COUNT])
+
+
 async def analyze_sources_separately(
-    llm: LLMClient, original_query: str, sources: list[ResearchSource],
+    llm: LLMClient, original_query: str, sources: list[ResearchSource], config: Config,
 ) -> list[str]:
     """Create compact, source-attributed briefs before cross-source synthesis."""
     semaphore = asyncio.Semaphore(2)
 
     async def analyze(source: ResearchSource) -> str:
+        passage = await _facet_relevant_passage(source, config)
         messages = [
             {
                 "role": "system",
@@ -658,7 +734,7 @@ async def analyze_sources_separately(
                 "content": (
                     f"Original question: {original_query}\n"
                     f"Source: {source.title} ({source.url})\n\n"
-                    f"Source text:\n{source.content[:SOURCE_ANALYSIS_CHARS]}"
+                    f"Source text:\n{passage}"
                 ),
             },
         ]
@@ -684,14 +760,19 @@ def _normalise(text: str) -> str:
 
 
 def _parse_ledger(content: str, source: ResearchSource) -> list[EvidenceClaim]:
-    """Accept only claims whose quoted evidence actually occurs in that source."""
+    """Accept only claims whose quoted evidence actually occurs in that
+    source. Checks against the full document (falling back to the
+    truncated .content only if full_content wasn't captured) -- the passage
+    actually shown to the extraction model can now come from anywhere in
+    the document via _facet_relevant_passage(), not just its first
+    SOURCE_EXCERPT_CHARS."""
     try:
         rows = json.loads(content.strip())
     except (TypeError, json.JSONDecodeError):
         return []
     if not isinstance(rows, list):
         return []
-    source_text = _normalise(source.content)
+    source_text = _normalise(source.full_content or source.content)
     claims: list[EvidenceClaim] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -712,7 +793,7 @@ def _parse_ledger(content: str, source: ResearchSource) -> list[EvidenceClaim]:
 
 
 async def build_claim_ledger(
-    llm: LLMClient, original_query: str, sources: list[ResearchSource],
+    llm: LLMClient, original_query: str, sources: list[ResearchSource], config: Config,
 ) -> list[EvidenceClaim]:
     """Extract auditable claims before synthesis; unsupported prose never enters the answer context."""
     semaphore = asyncio.Semaphore(2)
@@ -720,6 +801,7 @@ async def build_claim_ledger(
     async def extract(source: ResearchSource) -> list[EvidenceClaim]:
         if source.quality_score < MIN_EVIDENCE_QUALITY:
             return []
+        passage = await _facet_relevant_passage(source, config)
         messages = [
             {
                 "role": "system",
@@ -730,7 +812,7 @@ async def build_claim_ledger(
                     "For numerical claims, preserve the exact units and qualifiers."
                 ),
             },
-            {"role": "user", "content": f"Question: {original_query}\n\nSource text:\n{source.content[:SOURCE_ANALYSIS_CHARS]}"},
+            {"role": "user", "content": f"Question: {original_query}\n\nSource text:\n{passage}"},
         ]
         try:
             async with semaphore:

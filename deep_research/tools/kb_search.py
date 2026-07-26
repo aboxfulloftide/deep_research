@@ -21,9 +21,22 @@ from deep_research.kb.embeddings import embed_texts
 RRF_K = 60  # standard RRF damping constant; de-emphasizes rank differences past the top few
 
 
-async def kb_search(query: str, kb_db: KBDatabase, config: Config, limit: int = 5) -> str:
-    """Search the local knowledge base's chunked content. Formatted like
-    web_search's output so the agent can reason about/cite it the same way."""
+def _location_string(record: dict) -> str:
+    location = f"chunk {record['chunk_index']}"
+    if record.get("page_number") is not None:
+        location += f", page {record['page_number']}"
+    if record.get("time_start_seconds") is not None:
+        location += f", t={record['time_start_seconds']:.0f}s"
+    return location
+
+
+async def kb_search_records(query: str, kb_db: KBDatabase, config: Config, limit: int = 5) -> list[dict]:
+    """Structured hybrid (FTS + semantic, RRF-fused) chunk records, most
+    relevant first -- each dict carries chunk_id, rrf_score, location
+    (chunk/page/timestamp), title, canonical_uri, and the full chunk_text
+    (not just a rendered snippet), so a structured consumer (e.g. a future
+    local-KB-first research adapter) doesn't need to re-parse kb_search()'s
+    formatted string."""
     fts_results = await kb_db.search_chunks(query, limit=limit * 4)
 
     semantic_results = []
@@ -40,20 +53,35 @@ async def kb_search(query: str, kb_db: KBDatabase, config: Config, limit: int = 
             scores[r["chunk_id"]] = scores.get(r["chunk_id"], 0.0) + 1 / (RRF_K + rank + 1)
             rows.setdefault(r["chunk_id"], r)
 
-    if not scores:
-        return "No results found in the local knowledge base."
-
     ranked_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)[:limit]
 
-    lines = []
+    records = []
     for chunk_id in ranked_ids:
         r = rows[chunk_id]
-        location = f"chunk {r['chunk_index']}"
-        if r.get("page_number") is not None:
-            location += f", page {r['page_number']}"
-        if r.get("time_start_seconds") is not None:
-            location += f", t={r['time_start_seconds']:.0f}s"
-        title = r.get("source_title") or r.get("canonical_uri")
-        snippet = r.get("snippet") or (r.get("chunk_text") or "")[:400]
-        lines.append(f"**{title}** ({location})\n{snippet}\n")
-    return "\n".join(lines)
+        records.append({
+            "chunk_id": chunk_id,
+            "rrf_score": scores[chunk_id],
+            "chunk_index": r["chunk_index"],
+            "page_number": r.get("page_number"),
+            "time_start_seconds": r.get("time_start_seconds"),
+            "title": r.get("source_title") or r.get("canonical_uri"),
+            "canonical_uri": r.get("canonical_uri"),
+            "chunk_text": r.get("chunk_text") or "",
+            "snippet": r.get("snippet") or (r.get("chunk_text") or "")[:400],
+        })
+    return records
+
+
+async def kb_search(query: str, kb_db: KBDatabase, config: Config, limit: int = 5) -> str:
+    """Search the local knowledge base's chunked content. Formatted like
+    web_search's output so the agent can reason about/cite it the same way.
+    Output is unchanged from before kb_search_records() was split out --
+    this is now a thin formatting wrapper over it."""
+    records = await kb_search_records(query, kb_db, config, limit=limit)
+    if not records:
+        return "No results found in the local knowledge base."
+
+    return "\n".join(
+        f"**{record['title']}** ({_location_string(record)})\n{record['snippet']}\n"
+        for record in records
+    )

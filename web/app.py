@@ -316,7 +316,7 @@ async def _stream_research(
 
         if research_mode == "extra":
             answer = ""
-            async for event in _extra_research_answer(llm, query, cfg, session_id):
+            async for event in _extra_research_answer(llm, query, cfg, session_id, kb_routes.kb_db):
                 if event.get("event") == "answer":
                     answer = event["data"]
                 else:
@@ -356,8 +356,12 @@ async def _stream_research(
         await llm.close()
 
 
-async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: str | None = None):
-    """Run a bounded, source-preserving, four-level Extra Research workflow."""
+async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: str | None = None, kb_db=None):
+    """Run a bounded, source-preserving, four-level Extra Research workflow.
+
+    kb_db is optional -- when a KB connection is available (kb_routes.kb_db),
+    accepted sources are also persisted into the KB for reuse by later runs;
+    standalone operation without one is unaffected."""
     from deep_research.tools.extra_research import (
         analysis_context,
         analyze_sources_separately,
@@ -373,7 +377,7 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
         "data": json.dumps({"step": "thinking", "detail": "Planning question-specific evidence facets with the local model..."}),
     }
     yield {"event": "status", "data": json.dumps({"step": "researching", "detail": "Collecting evidence for each facet, then closing uncovered facets..."})}
-    research_bundle = await collect_research_bundle(llm, query, cfg)
+    research_bundle = await collect_research_bundle(llm, query, cfg, kb_db=kb_db)
     sources = research_bundle.sources
     if session_id:
         for source in sources:
@@ -390,12 +394,12 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
         "event": "status",
         "data": json.dumps({"step": "thinking", "detail": f"Analyzing {len(sources)} sources separately before combining them..."}),
     }
-    analyses = await analyze_sources_separately(llm, query, sources)
+    analyses = await analyze_sources_separately(llm, query, sources, cfg)
     yield {
         "event": "status",
         "data": json.dumps({"step": "thinking", "detail": "Building a source-quoted claim ledger and excluding unsupported facts..."}),
     }
-    claims = await build_claim_ledger(llm, query, sources)
+    claims = await build_claim_ledger(llm, query, sources, cfg)
     if not claims:
         yield {"event": "answer", "data": "I found sources but could not extract source-quoted evidence reliably enough to produce a research answer."}
         return

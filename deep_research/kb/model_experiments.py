@@ -282,8 +282,8 @@ async def run_model_experiment(kb_db, config: Config, job: dict) -> dict:
             await kb_db.update_processing_job_progress(
                 job["id"], "evaluate", {"source_count": len(sources), "context_size": context_size}, lease_seconds=900,
             )
-            briefs = analysis_context(await analyze_sources_separately(llm, prompt, sources))
-            claims = await build_claim_ledger(llm, prompt, sources)
+            briefs = analysis_context(await analyze_sources_separately(llm, prompt, sources, config))
+            claims = await build_claim_ledger(llm, prompt, sources, config)
             if not claims:
                 raise RuntimeError("Could not extract source-quoted claims for the experiment")
             ledger = claim_ledger_context(claims)
