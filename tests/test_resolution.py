@@ -724,6 +724,77 @@ async def test_candidates_suppressed_when_claims_cite_different_numbers(kb_db, m
     assert matching == []
 
 
+# -- percentage rounding leniency ---------------------------------------------
+# Live KB data found two articles paraphrasing one original survey stat as
+# "76% of executives..." and "77 percent of C-suite executives..." -- the
+# strict disjoint veto above silently dropped this pair before the LLM
+# classifier ever got a chance to see it, even though the classifier itself
+# (run manually against the real pair) correctly said "same" at 0.95
+# confidence. _numbers_conflict() rescues only this specific rounding-noise
+# case, not genuine numeric conflicts.
+
+def test_extract_percentages_finds_percent_sign_and_word_forms():
+    assert r._extract_percentages("76% of executives agreed.") == {76.0}
+    assert r._extract_percentages("77 percent of C-suite executives believe X.") == {77.0}
+    assert r._extract_percentages("Three-quarters (76%) of executives state X.") == {76.0}
+
+
+def test_extract_percentages_ignores_non_percentage_numbers():
+    assert r._extract_percentages("There were 140 bank failures in 2009.") == set()
+
+
+def test_numbers_conflict_rescues_close_percentages():
+    text_a = "76% of executives said employee sabotage poses a serious threat to their company's future."
+    text_b = "77 percent of C-suite executives believe employee sabotage poses a serious threat to their company's future."
+    assert not r._numbers_conflict(text_a, r._extract_numbers(text_a), text_b, r._extract_numbers(text_b))
+
+
+def test_numbers_conflict_still_flags_percentages_far_apart():
+    text_a = "12% of respondents agreed."
+    text_b = "88% of respondents agreed."
+    assert r._numbers_conflict(text_a, r._extract_numbers(text_a), text_b, r._extract_numbers(text_b))
+
+
+def test_numbers_conflict_unaffected_for_non_percentage_numbers():
+    # The original bank-failures false positive this filter exists for must
+    # still be caught -- percentage leniency must not leak into plain counts/years.
+    text_a = "There were 140 bank failures in 2009."
+    text_b = "There were 157 bank failures in 2010."
+    assert r._numbers_conflict(text_a, r._extract_numbers(text_a), text_b, r._extract_numbers(text_b))
+
+
+async def test_candidates_not_suppressed_for_claims_citing_close_percentages(kb_db, monkeypatch):
+    """The live bug this fix targets: two claims citing 76% and 77% of the
+    same underlying stat must reach the candidate/classifier stage instead
+    of being silently vetoed as a numeric conflict."""
+    claim_a, _ = await kb_db.get_or_create_claim(
+        "fact", "76% of executives said employee sabotage poses a serious threat to their company's future.",
+    )
+    claim_b, _ = await kb_db.get_or_create_claim(
+        "fact", "77 percent of C-suite executives believe employee sabotage poses a serious threat to their company's future.",
+    )
+
+    fake_vectors_in_order = [
+        [1.0, 0.0, 0.0] + [0.0] * 765,
+        [0.99, 0.01, 0.0] + [0.0] * 765,
+    ]
+
+    async def fake_embed_texts(texts, base_url, model, instruction_prefix="clustering: "):
+        return fake_vectors_in_order
+
+    monkeypatch.setattr(r, "embed_texts", fake_embed_texts)
+
+    config = _fake_config()
+    await r.embed_new_claims(kb_db, config, [claim_a["id"], claim_b["id"]])
+    count = await r.generate_claim_resolution_candidates(kb_db, config, [claim_a["id"], claim_b["id"]])
+
+    assert count >= 1
+    candidates = await kb_db.list_resolution_candidates(candidate_type="claim_duplicate", status="open")
+    ids_involved = {claim_a["id"], claim_b["id"]}
+    matching = [c for c in candidates if {c["left_claim_id"], c["right_claim_id"]} == ids_involved]
+    assert matching != []
+
+
 async def test_candidates_not_suppressed_when_only_one_side_has_numbers(kb_db, monkeypatch):
     """A number appearing on only one side isn't a disagreement -- there's
     nothing on the other side to conflict with, so the filter must not

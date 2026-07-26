@@ -181,6 +181,39 @@ def _extract_numbers(text: str) -> set[str]:
     return {m.replace(",", "") for m in _NUMBER_RE.findall(text)}
 
 
+_PERCENT_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(?:%|percent\b|per\s+cent\b)", re.IGNORECASE)
+# Independently-rounded restatements of one original survey/report figure
+# routinely differ by a point or two across secondhand summaries ("76%" vs
+# "77%" vs "three-quarters (76%)" all describing the same underlying stat,
+# confirmed live: two different articles paraphrasing one report). This is
+# unlike the bank-failure-count/year example above, where a differing number
+# means a genuinely different event -- so only percentages get this leniency.
+PERCENTAGE_ROUNDING_TOLERANCE = 2.0
+
+
+def _extract_percentages(text: str) -> set[float]:
+    return {float(m.replace(",", "")) for m in _PERCENT_RE.findall(text)}
+
+
+def _numbers_conflict(claim_text: str, claim_numbers: set[str], other_text: str, other_numbers: set[str]) -> bool:
+    """True only for a genuine numeric conflict between two claims that both
+    cite numbers -- a disjoint pair is rescued from the veto when the only
+    numbers present are percentages within PERCENTAGE_ROUNDING_TOLERANCE of
+    each other. Any other disjoint numeric mismatch (years, counts, dollar
+    amounts) keeps the original strict behavior, including a percentage
+    claim that also disagrees on some other, non-percentage number."""
+    if claim_numbers.isdisjoint(other_numbers):
+        claim_percentages = _extract_percentages(claim_text)
+        other_percentages = _extract_percentages(other_text)
+        if claim_percentages and other_percentages and any(
+            abs(a - b) <= PERCENTAGE_ROUNDING_TOLERANCE
+            for a in claim_percentages for b in other_percentages
+        ):
+            return False
+        return True
+    return False
+
+
 @dataclass
 class PromotionResult:
     promoted_count: int = 0
@@ -422,8 +455,10 @@ async def generate_claim_resolution_candidates(
                     break
                 continue
             other_numbers = _extract_numbers(other["canonical_text"])
-            if claim_numbers and other_numbers and claim_numbers.isdisjoint(other_numbers):
-                continue  # both claims cite numbers, but share none -- not the same fact
+            if claim_numbers and other_numbers and _numbers_conflict(
+                claim["canonical_text"], claim_numbers, other["canonical_text"], other_numbers,
+            ):
+                continue  # numbers disagree and aren't a rounding variant of the same percentage
 
             if llm is not None:
                 try:
