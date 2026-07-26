@@ -237,6 +237,68 @@ async def test_collect_sources_returns_accepted_sources_even_if_kb_persistence_f
     assert sources[0].url == "https://arxiv.org/abs/3333.33333"
 
 
+async def test_collect_sources_supplements_with_scholarly_search_for_scholarly_capability(monkeypatch):
+    async def fake_search(query, config, **kwargs):
+        return []  # general web search finds nothing on its own
+
+    async def fake_scholarly(query, config, **kwargs):
+        return [SearchResult(
+            title="Scholarly Paper", url="https://arxiv.org/abs/9999.99999", snippet="paper",
+            canonical_url="https://arxiv.org/abs/9999.99999",
+        )]
+
+    async def fake_scrape(url, config):
+        return ScrapedPage(url=url, title="Scholarly Paper", text_content="source text " * 30)
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scholarly_search", fake_scholarly)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+
+    sources = await extra.collect_sources(["question"], Config(), 1, set(), capability="scholarly")
+
+    assert len(sources) == 1
+    assert sources[0].url == "https://arxiv.org/abs/9999.99999"
+
+
+async def test_collect_sources_does_not_call_scholarly_search_for_other_capabilities(monkeypatch):
+    async def fake_search(query, config, **kwargs):
+        return [SearchResult(title="Result", url="https://github.com/example", snippet="")]
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("scholarly_search should not be called for a non-scholarly capability")
+
+    async def fake_scrape(url, config):
+        return ScrapedPage(url=url, title="Result", text_content="source text " * 30)
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scholarly_search", fail_if_called)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+
+    sources = await extra.collect_sources(["question"], Config(), 1, set(), capability="repository")
+
+    assert len(sources) == 1
+
+
+async def test_collect_sources_falls_back_to_web_results_when_scholarly_search_fails(monkeypatch):
+    async def fake_search(query, config, **kwargs):
+        return [SearchResult(title="Web result", url="https://arxiv.org/abs/8888.88888", snippet="paper")]
+
+    async def raising_scholarly(*args, **kwargs):
+        raise ConnectionError("both scholarly APIs unreachable")
+
+    async def fake_scrape(url, config):
+        return ScrapedPage(url=url, title="Web result", text_content="source text " * 30)
+
+    monkeypatch.setattr(extra, "web_search", fake_search)
+    monkeypatch.setattr(extra, "scholarly_search", raising_scholarly)
+    monkeypatch.setattr(extra, "scrape_page", fake_scrape)
+
+    sources = await extra.collect_sources(["question"], Config(), 1, set(), capability="scholarly")
+
+    assert len(sources) == 1
+    assert sources[0].url == "https://arxiv.org/abs/8888.88888"
+
+
 @pytest.mark.asyncio
 async def test_extra_research_runs_four_levels_with_source_briefs_and_fact_check(monkeypatch):
     source = extra.ResearchSource("Source", "https://huggingface.co/Qwen/example", "source evidence text", 1, "core evidence", quality_score=5, source_kind="primary")

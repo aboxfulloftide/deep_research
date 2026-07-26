@@ -21,8 +21,9 @@ from deep_research.kb.ingest import ingest_web_page
 from deep_research.kb.storage import SnapshotStore
 from deep_research.llm import LLMClient
 from deep_research.models import SearchResult
+from deep_research.tools.scholarly import scholarly_search
 from deep_research.tools.scrape import scrape_page
-from deep_research.tools.search import web_search
+from deep_research.tools.search import _merge, web_search
 
 SOURCES_PER_QUERY = 1
 MIN_EVIDENCE_QUALITY = 3
@@ -277,6 +278,19 @@ async def collect_sources(
                 level=level, rank=0, decision="fetch_failed", reason=f"web_search raised: {exc}"[:200],
             )))
             continue
+
+        if capability == "scholarly":
+            # Supplement, not replace: OpenAlex/arXiv don't cover every
+            # discipline a "scholarly" facet might need (e.g. legal case
+            # law), so general web results still stand on their own if both
+            # APIs come back empty or fail.
+            try:
+                scholarly_results = await scholarly_search(
+                    query, config, run_id=run_id, facet_id=facet_id or None, attempt_id=attempt_id,
+                )
+                results = _merge(results, scholarly_results)
+            except Exception:
+                pass
 
         ranked_results = sorted(results, key=lambda result: classify_source(result.url)[1], reverse=True)
         accepted_this_query = 0
