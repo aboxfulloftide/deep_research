@@ -391,6 +391,46 @@ async def test_research_bundle_routes_facets_and_records_fitness(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_research_bundle_excludes_off_topic_sources_despite_high_authority(monkeypatch):
+    """A quality_score of 5 (domain/authority tier) must not be enough on its
+    own -- classify_source() is topic-blind, so a scholarly-domain source
+    about a completely unrelated subject should never reach claim extraction
+    just because it happens to be hosted on doi.org/arxiv.org/etc."""
+    class Planner:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": '{"ambiguities":[],"facets":[{"id":"core","question":"health effects of intermittent fasting on metabolic markers","search_query":"intermittent fasting metabolic health","purpose":"direct evidence","capabilities":["scholarly"]},{"id":"other","question":"other evidence for intermittent fasting","search_query":"intermittent fasting other evidence","purpose":"corroboration","capabilities":["scholarly"]}]}'}}]}
+
+    async def fake_collect(queries, config, level, seen_urls, **kwargs):
+        return [extra.ResearchSource(
+            "Surviving Sepsis Campaign Guidelines", "https://doi.org/10.1007/s00134-012-2769-8",
+            "international guidelines for management of severe sepsis and septic shock in critical care patients", level, queries[0],
+            quality_score=5, source_kind="paper",
+        )]
+
+    monkeypatch.setattr(extra, "collect_sources", fake_collect)
+    bundle = await extra.collect_research_bundle(Planner(), "example question", Config(), extra.ResearchBudget(max_gap_rounds=0))
+
+    assert bundle.sources == []
+    assert any(outcome["decision"] == "rejected_low_directness" for outcome in bundle.candidate_outcomes)
+    assert set(bundle.coverage["missing_facet_ids"]) == {"core", "other"}
+
+
+def test_coverage_gap_context_lists_missing_facet_purposes():
+    coverage = {
+        "facets": [
+            {"id": "core", "purpose": "Direct evidence for the question.", "question": "q1"},
+            {"id": "constraints", "purpose": "Definitions and limits.", "question": "q2"},
+        ],
+        "missing_facet_ids": ["constraints"],
+    }
+    assert extra.coverage_gap_context(coverage) == "- Definitions and limits."
+
+
+def test_coverage_gap_context_returns_empty_string_when_nothing_missing():
+    assert extra.coverage_gap_context({"facets": [], "missing_facet_ids": []}) == ""
+
+
+@pytest.mark.asyncio
 async def test_research_plan_rejects_a_facet_that_searches_the_raw_user_question():
     class BadPlanner:
         async def chat(self, messages):

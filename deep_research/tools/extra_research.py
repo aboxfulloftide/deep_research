@@ -551,12 +551,29 @@ async def collect_research_bundle(
             outcomes=outcomes, kb_db=kb_db,
         )
         found = found[:max(0, budget.max_sources - len(sources))]
-        sources.extend(found)
         # Attribute retrieved evidence to its facet even if a recovery query
         # supplied the wording, so coverage remains inspectable.
         for source in found:
             source.query = facet.question
-            assessments.append(_source_assessment(source, facet))
+            assessment = _source_assessment(source, facet)
+            assessments.append(assessment)
+            # Authority tier alone (classify_source's domain-based quality_score)
+            # says nothing about whether a source is actually about this
+            # facet's question -- OpenAlex/general search can rank a
+            # structurally "paper"-tier source for an unrelated topic above a
+            # genuinely relevant one. Only topically-direct sources enter the
+            # bundle that claim extraction and synthesis will treat as
+            # evidence; low-directness candidates are still recorded for
+            # visibility, just not trusted as answer material.
+            if assessment["accepted"]:
+                sources.append(source)
+            else:
+                candidate_outcomes.append(asdict(CandidateOutcome(
+                    query=source.query, url=source.url, canonical_url=source.canonical_url,
+                    facet_id=facet.id, capability=capability, level=level, rank=0,
+                    decision="rejected_low_directness",
+                    reason=f"directness={assessment['directness']}",
+                )))
         candidate_outcomes.extend(outcomes)
         attempts.append({
             "level": level, "facet_id": facet.id, "adapter": capability, "queries": [query],
@@ -845,6 +862,19 @@ def claim_ledger_context(claims: list[EvidenceClaim]) -> str:
         f"(evidence tier: {claim.source_kind}; confidence {claim.confidence:.2f})"
         for claim in claims
     )
+
+
+def coverage_gap_context(coverage: dict) -> str:
+    """Surface which evidence needs went unmet so synthesis can say so
+    instead of silently answering only from whichever facets happened to
+    turn up direct, authoritative sources."""
+    missing_ids = set(coverage.get("missing_facet_ids", []))
+    if not missing_ids:
+        return ""
+    missing = [facet for facet in coverage.get("facets", []) if facet["id"] in missing_ids]
+    if not missing:
+        return ""
+    return "\n".join(f"- {facet['purpose']}" for facet in missing)
 
 
 def has_authoritative_source(sources: list[ResearchSource]) -> bool:

@@ -367,6 +367,7 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
         analyze_sources_separately,
         build_claim_ledger,
         claim_ledger_context,
+        coverage_gap_context,
         has_authoritative_source,
         collect_research_bundle,
         source_context,
@@ -409,6 +410,12 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
     }
     briefs = analysis_context(analyses)
     ledger = claim_ledger_context(claims)
+    gaps = coverage_gap_context(research_bundle.coverage)
+    gaps_note = (
+        f"\n\nEvidence needs this run could NOT find direct, authoritative sources for "
+        f"(state plainly that these are unanswered, do not guess):\n{gaps}"
+        if gaps else ""
+    )
     messages = [
         {
             "role": "system",
@@ -427,7 +434,7 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
             "role": "user",
             "content": (
                 f"Research question: {query}\n\nClaim ledger (authoritative):\n{ledger}\n\n"
-                f"Source analyses (context only; not evidence):\n{briefs}\n\nWrite the decision memo now."
+                f"Source analyses (context only; not evidence):\n{briefs}{gaps_note}\n\nWrite the decision memo now."
             ),
         },
     ]
@@ -446,7 +453,8 @@ async def _extra_research_answer(llm: LLMClient, query: str, cfg, session_id: st
                 "does not support it, it overstates certainty, has an uncited number, or uses a citation not present in "
                 "the ledger. Remove a claim rather than guessing. Keep only facts that map to a ledger row, preserve exact "
                 "Markdown source links, and return the corrected final answer only. Never output [citation: N] or "
-                "label secondary/technical-reference evidence as official."
+                "label secondary/technical-reference evidence as official. Statements that plainly say evidence was "
+                "not found for something are not factual claims and need no ledger citation -- keep them."
             ),
         },
         {
