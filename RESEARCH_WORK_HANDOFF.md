@@ -14,16 +14,17 @@ Last verified against the running system and `main`: **July 25, 2026**.
 - Interactive Extra Research is available. Batch 1 (evidence correctness and
   observability), the domain-neutrality authority-gate fix, all of Batch 2
   (RRF fusion, typed provider-failure classification, adaptive waterfall,
-  result caching, concurrent-request coalescing), and all of Batch 3 (the
-  shared SSRF-safe fetch contract, the PDF-ingestion routing fix, KB
-  persistence of Extra Research's accepted sources, facet-relevant passage
-  retrieval, and structured `kb_search()` records) except the OpenAlex/arXiv
-  adapters are committed (`e5c7db1`, `6cc32ab`, `1ab7dd3`, `d8c9866`,
-  `83ad2b1`, `f76e373`). Capability routing is still cosmetic (no
-  `SourceAdapter` registry) -- Extra Research's accepted sources are now
-  persisted into the KB, but nothing routes facet collection *through* the
-  KB first yet (`LocalKBAdapter` is still future work), so this still isn't
-  a source-native, KB-integrated research system end-to-end.
+  result caching, concurrent-request coalescing), and now all of Batch 3
+  in full (the shared SSRF-safe fetch contract, the PDF-ingestion routing
+  fix, KB persistence of Extra Research's accepted sources, facet-relevant
+  passage retrieval, structured `kb_search()` records, and OpenAlex/arXiv
+  scholarly adapters) are committed (`e5c7db1`, `6cc32ab`, `1ab7dd3`,
+  `d8c9866`, `83ad2b1`, `f76e373`, `557ba20`). Capability routing is still
+  cosmetic (no `SourceAdapter` registry) -- Extra Research's accepted
+  sources are now persisted into the KB and `"scholarly"` facets now query
+  OpenAlex/arXiv directly, but nothing routes facet collection *through*
+  the KB first yet (`LocalKBAdapter` is still future work), so this still
+  isn't a source-native, KB-integrated research system end-to-end.
 
 ## What We Were Working On
 
@@ -303,6 +304,36 @@ contract this round establishes.
   no chunk text, just the truncated `ts_headline` snippet. Fixed by adding
   `c.chunk_text` to `search_chunks()`'s query for symmetry with
   `search_chunks_semantic()`.
+
+### OpenAlex + arXiv Scholarly Adapters — Batch 3 Complete (July 26, 2026)
+
+Commit `557ba20` implemented the last remaining Batch 3 item, unblocked by
+Round B's KB persistence work.
+
+- New `deep_research/tools/scholarly.py`: direct, keyless clients for
+  OpenAlex Works search and arXiv's Atom export API, following the same
+  pattern as `search.py`'s direct Wikipedia/Wikidata clients (no SearXNG
+  scraping, no API key). OpenAlex results prefer the DOI URL as identity
+  (already tiered `"paper", 5` by `classify_source()` from the
+  domain-neutrality fix), falling back to the landing/open-access URL then
+  the OpenAlex work ID; abstracts are rebuilt from OpenAlex's word->position
+  inverted-index format into readable snippets. arXiv results use the
+  feed's own `/abs/{id}` URL, which `normalize_url()` already folds against
+  the `/html/{id}` rendering (existing arXiv folding from Batch 1) -- no new
+  canonicalization needed for either identifier scheme.
+- Both stamp `canonical_url`/`observations` exactly like every other
+  provider in `search.py`, so they participate in RRF fusion and canonical
+  dedup for free once merged.
+- `collect_sources()` calls the new `scholarly_search()` as a *supplement*
+  (not a replacement) whenever a facet's capability is `"scholarly"` --
+  general web search results still stand on their own if both APIs return
+  nothing or fail, since OpenAlex/arXiv don't cover every discipline a
+  "scholarly" facet might need (e.g. legal case law).
+- Not attempted: true cross-provider same-paper dedup when OpenAlex and
+  arXiv return genuinely different URLs for the same paper (DOI vs. arXiv
+  abs URL) -- would need fuzzy title/author matching, a separate feature
+  beyond "deduplicate alternate renderings" (which is about the same URL
+  rendered differently, already handled).
 
 ### Existing Foundations Not Yet Integrated Into Routed Collection
 
@@ -913,7 +944,7 @@ unblocked by nothing else in Batch 1.
   blocked on `candidate_outcomes` actually being persisted (Batch 3) so a
   real join against `search_calls` is possible.
 
-**Batch 3 — Reusable acquisition and passage retrieval — DONE except OpenAlex/arXiv (commits `83ad2b1`, `f76e373`, July 25, 2026)**
+**Batch 3 — Reusable acquisition and passage retrieval — ALL DONE (commits `83ad2b1`, `f76e373`, `557ba20`, July 25-26, 2026)**
 
 - introduce the shared SSRF-safe, byte-bounded, MIME-aware fetch contract; ✅
   `tools/fetch.py`'s `safe_fetch()`/`FetchedDocument`. "MIME-aware" here
@@ -941,9 +972,11 @@ unblocked by nothing else in Batch 1.
   chunks") are not separately surfaced, since the passage is concatenated
   before being shown to the model.
 - add OpenAlex discovery and arXiv retrieval only after the common source
-  contract can store and replay their output. ⬜ still open -- the common
-  source contract (KB persistence) now exists, so this is unblocked but not
-  started.
+  contract can store and replay their output. ✅ `tools/scholarly.py`
+  (`557ba20`), supplementing general web search for `"scholarly"` facets
+  rather than replacing it. Cross-provider same-paper dedup between OpenAlex
+  and arXiv when they return genuinely different URLs (DOI vs. arXiv abs)
+  is not attempted -- out of scope, would need fuzzy title/author matching.
 
 ## Recommended Next Steps
 
@@ -986,9 +1019,14 @@ unblocked by nothing else in Batch 1.
 7. **Separate reference adapters.** Route Wikipedia and Wikidata deliberately
    for grounding/reference facets rather than calling both for every general
    search.
-8. **Add one scholarly slice.** Implement OpenAlex discovery plus arXiv
-   metadata/content retrieval before attempting the entire adapter list.
-   Preserve DOI/arXiv identifiers and deduplicate alternate renderings.
+8. **DONE (`557ba20`). Add one scholarly slice.** Implement OpenAlex
+   discovery plus arXiv metadata/content retrieval before attempting the
+   entire adapter list. Preserve DOI/arXiv identifiers and deduplicate
+   alternate renderings. DOI/arXiv identifiers are preserved by
+   construction (DOI preferred as identity; arXiv's own `/abs/{id}` reused
+   as-is); alternate-rendering dedup reuses the existing `normalize_url()`
+   arXiv folding. Fuzzy same-paper matching across genuinely different
+   OpenAlex/arXiv URLs was not attempted -- a separate, larger feature.
 9. **[PARTIAL] (`f76e373`). Persist the common source contract.** Persist
    accepted and rejected candidates, raw snapshots, cleaned text, adapter/
    routing provenance, assessments, fallback reasons, and immutable bundle
