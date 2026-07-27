@@ -335,6 +335,198 @@ Round B's KB persistence work.
   beyond "deduplicate alternate renderings" (which is about the same URL
   rendered differently, already handled).
 
+### Live Validation Round — Search and Verification Fixes (July 26–27, 2026)
+
+After Batch 3 shipped, this round tested the whole pipeline live against the
+running stack (llama.cpp, SearXNG, Postgres KB, the web app) instead of
+mocked unit tests, specifically to see whether the night's changes actually
+improved real results. They found and fixed several real bugs that no unit
+test had caught, several of them predating this batch entirely:
+
+- **`f49af69`** — arXiv's export API now permanently redirects HTTP→HTTPS;
+  `httpx`'s `follow_redirects=False` default made `raise_for_status()` treat
+  the redirect itself as an error, so every real arXiv call was silently
+  failing despite passing all mocked tests. Fixed by requesting HTTPS
+  directly.
+- **`8c895bf`** — `classify_source()`'s domain-based quality tier is
+  topic-blind: OpenAlex/general search can rank an off-topic "paper"/
+  "primary"-tier source above a genuinely relevant one (confirmed live: a
+  sepsis-guidelines paper and an unrelated dysphagia paper both scored
+  quality-5 for an intermittent-fasting question). `_source_assessment()`
+  already computed a `directness` signal but only used it for coverage
+  bookkeeping — sources now must also clear `directness >= 0.45` to enter
+  `bundle.sources`, with rejects recorded as `candidate_outcomes` for
+  visibility. Also threads `coverage.missing_facet_ids` into the synthesis
+  and fact-check prompts so a partially-covered answer can say what it
+  couldn't confirm.
+- **`f174e0b`** — Two compounding bugs were making the Batch 2a adaptive
+  waterfall believe degraded results were sufficient, so it never escalated:
+  (1) `_is_relevant()`'s flat threshold of 2 was satisfied by a *single*
+  query term matching in the title (weighted 2x), regardless of how many
+  distinct terms the query had — a page titled "POTENTIAL Definition &
+  Meaning" satisfied a 7-term query about "potential risks and benefits of
+  intermittent fasting..." purely by sharing the word "potential". Now
+  requires distinct-term coverage that scales with query length. (2)
+  Confirmed live: DuckDuckGo is CAPTCHA'd and SearXNG's `bing` engine was
+  serving dictionary "instant answer" junk for several real queries —
+  `startpage`/`google_cse` (already in the codebase, previously offered only
+  via the caller-opt-in `include_alternate_query_engines` flag Extra
+  Research never set) return genuinely relevant results for the same
+  queries. `web_search()` now auto-escalates to them when the base tier
+  proves insufficient, reusing the existing circuit breaker so this is
+  bounded, not a new way to hammer already-fragile engines.
+- **`ab3c297`** — The research planner's JSON-schema prompt used abstract
+  placeholders (`"question":"evidence need"`, `"id":"short_slug"`) that the
+  local model sometimes echoed back verbatim instead of writing real
+  content — undetected because "evidence need" (13 chars) cleared the
+  length floor meant to catch too-short junk. This silently corrupted
+  `_facet_relevant_passage()`'s embedding target downstream. Fixed with a
+  concrete, fully-written example for an unrelated question (steak
+  temperature) plus `_is_prompt_echo()`, a hard backstop rejecting any field
+  copied verbatim from the example (checked narrowly against the example's
+  own text, not the surrounding instructions, since those reuse ordinary
+  words like "constraints"/"corroboration" real facets should still use).
+  Verified live: 5/5 planning trials for the same question produced
+  genuine, specific facet questions afterward, versus roughly half showing
+  placeholder leakage before.
+- **`1bc7c44`** — Live KB claims-page duplication report: "76% of
+  executives..." and "77 percent of C-suite executives..." (same underlying
+  survey stat, independently rounded by two articles) never merged, because
+  `generate_claim_resolution_candidates()`'s numeric-mismatch veto treated
+  76 and 77 as a hard conflict and dropped the pair before the LLM
+  duplicate-classifier ever saw it — confirmed live that the classifier
+  itself, run unfiltered, correctly says "same" at 0.95 confidence.
+  `_numbers_conflict()` now rescues a disjoint pair only when every number
+  in play is a percentage within 2 points of one in the other claim; other
+  numeric mismatches (years, counts, dollar amounts — what this veto exists
+  for) are unaffected. Also fixed a real regex bug found along the way:
+  `_PERCENT_RE`'s trailing `\b` after the `%` alternative could never match
+  (both `%` and a following space are non-word characters), so "76%" was
+  invisible to percentage extraction while "77 percent" worked. Applied
+  live to the reported pair — they merged, consolidating evidence from all
+  4 source articles onto the surviving claim.
+- **`f279b90`** — Live KB verification data showed literal fabricated
+  queries being sent to search providers, e.g. "Goldman Sachs risk
+  assessment and advocacy for the deal in `[specific event or time
+  period]`". Root cause: the underlying claim never names a specific
+  company/deal/date to begin with (an extraction gap, see below), and
+  `_suggest_search_query`'s "don't repeat prior queries" instruction leaves
+  the model nothing real left to vary after a couple of attempts, so it
+  fabricates a fill-in-the-blank instead of admitting there's nothing more
+  specific available. `_suggest_search_query` now rejects any suggestion
+  containing a `[...]` bracket the same way it already rejects an empty or
+  unparseable one, falling back to the safe raw claim text.
+- **`0354fce`** — Live investigation of "unverified" claims found a
+  structural tension between claim verification and claim resolution:
+  `verify_claim()`'s supports/`support_weight` only ever grow by finding
+  *new*, separately-discovered claim rows to agree with the one being
+  checked — never the claim's own pre-existing `claim_evidence`, even when
+  it already spans several independent, reputable sources. Claim merging
+  (the previous fix in this list) actively works against this: consolidating
+  near-duplicate claims from different outlets into one canonical claim
+  removes exactly the separate comparison rows verification depends on.
+  Concrete example traced live: "The Wall Street Crash occurred on October
+  29th, 1929" already had evidence from history.com (twice), ebsco.com, and
+  explaininghistory.org — four independent, clearly reputable outlets — yet
+  sat "unverified" after burning its search budget hunting for a claim that,
+  in effect, already existed as its own evidence. Added
+  `KBDatabase.get_claim_own_evidence_sources()` and
+  `_own_evidence_corroboration()` (deduplicated by domain, excluding social
+  media) to seed `budget.supports`/`support_weight` at the start of
+  `verify_claim`, reusing the exact same threshold `_examine_candidates`
+  already uses rather than a parallel rule. Verified live across 5 claims:
+  4 of 5 resolved to "supported" immediately from their own evidence with
+  zero web searches spent.
+- **`6429979`** — Investigating why a Wikipedia-sourced claim (Penn
+  Central's 1968 debt) stayed unverified despite Wikipedia's own article on
+  the subject being ingested found `safe_fetch()` 403ing on the article
+  page itself — confirmed live, identical request, only the User-Agent
+  changed, 403 → 200. `safe_fetch()` always sent a generic browser-spoofing
+  User-Agent regardless of target domain; right for arbitrary sites (many
+  defensively block non-browser UAs) but exactly backwards for Wikimedia,
+  whose policy wants honest bot identification instead (already handled
+  correctly for the REST search API by `search.py`'s
+  `_wikipedia_user_agent()`, but never for actual page fetches). This
+  silently broke ingestion of any Wikimedia page across the whole system —
+  Extra Research's `scrape_page()`, verification's web-fallback
+  `ingest_web_page()`, everything that fetches an arbitrary URL. Fixed by
+  making `safe_fetch()` domain-aware; also removed `kb/ingest.py`'s own
+  redundant hardcoded User-Agent override, which was silently blocking the
+  new behavior for that caller specifically.
+- **`62f635a`** — Added `only_status` and `run_max_web_searches` to
+  `run_verification_sweep()`/the `verification_sweep` job payload, needed to
+  clear the ~1,100-claim unverified backlog with these fixes in place: the
+  existing `force=True` bypasses the retry cooldown but not the importance
+  threshold, and does so regardless of a claim's *current* status — there
+  was no way to say "only claims still lacking a settled verdict" without
+  also reopening the whole KB's already-settled claims. The default
+  run-wide search budget (`verification_run_max_web_searches`, sized for a
+  routine nightly sweep) would also exhaust itself in the first few dozen
+  of a large backlog and leave the rest checked against internal KB data
+  alone, never exercising the search fixes above.
+
+**Live-tested provider/config corrections along the way, not code bugs**:
+confirmed all three search API keys (Serper/Brave/Tavily) and
+`DEEP_RESEARCH_WIKIPEDIA_CONTACT` are genuinely configured in this
+deployment (`~/.bashrc`) — earlier ad-hoc diagnostic scripts had wrongly
+concluded they were missing because they constructed `Config()` directly
+instead of calling `load_config()`, which is the only path that applies
+`DEEP_RESEARCH_*` environment overrides. `Config()` alone is bare defaults;
+always use `load_config()` (or `apply_backend(load_config()..., "llama_cpp")`
+for a real LLM client) when writing a diagnostic script against this
+codebase, or the script will silently test a crippled configuration and
+produce misleading conclusions. Also: `nohup`-launched background processes
+in this environment do not reliably inherit the invoking shell's
+environment even when the shell itself has the variables set — pass
+`VAR=value` explicitly on the launch command line, then verify via
+`/proc/<pid>/environ` after starting, not just a successful health-check
+curl (a stale process from a failed "address already in use" restart can
+make a health check pass while serving old code/config).
+
+**Priority item found, not fixed — claim extraction loses referential
+context.** Three separate live examples this round (the "AI sabotage"
+mislabeling in the resolution-fix section above, "Goldman Sachs... the deal"
+producing a fabricated search query, and "Lee was found guilty of financial
+misbehavior in 2007" — entity-tagged only as `{"name": "Lee", "type":
+"person"}`, no first name or company, sourced from a YouTube video transcript
+whose actual excerpt reads "*he* was found guilty..." almost certainly
+referring to Lee Kun-hee, Samsung's chairman) show the same root pattern:
+extraction only sees a narrow chunk of a document/transcript at a time, so a
+pronoun or bare surname established earlier in the source never gets
+resolved before a claim is extracted from a later chunk. This is a different
+shape of problem from everything else in this list — not a search, resolution,
+or fetch bug, but an extraction-context/coreference gap — and fixing it
+properly means giving the extraction step more context (a document/video
+summary, or the preceding chunk) before it extracts a claim, which won't
+retroactively repair claims already sitting in the KB with the identity
+already lost. Not started; a good next-session focus.
+
+**Verification backlog sweep — enqueued, then paused, not currently
+running.** A `verification_sweep` job targeting all ~1,100
+`status='unverified'` claims (`only_status="unverified"`, `force=True`,
+`run_max_web_searches=2500`) was run partway (processed a few hundred
+claims, confirmed several of the fixes above working live) before being
+deliberately cancelled mid-run at the user's request, both to apply
+`f279b90`/`0354fce`/`6429979` before spending more of the shared search
+budget on claims that would benefit from them, and then explicitly paused
+("don't start yet") pending further live-claim spot checks. **Whoever picks
+this up next**: the web server process needs restarting with all five
+`DEEP_RESEARCH_*` env vars set explicitly on the launch command (see above)
+to pick up every fix in this section, and `verification_concurrency` should
+be set to `3` via `DEEP_RESEARCH_KB_VERIFICATION_CONCURRENCY=3` to match
+llama.cpp's actual `--parallel 3` (the code default is 2, leaving one
+parallel slot idle the whole sweep). Re-enqueuing is simply another
+`enqueue_manual_job(db, "verification_sweep", "claim", "unverified_backlog",
+payload={...})` call with the same payload shape — already-resolved claims
+are automatically excluded since they're no longer `status='unverified'`,
+so nothing needs to be tracked manually between runs. Watch for the nightly
+cron sweep (`trigger="cron"`, fires ~03:00) colliding with a long-running
+manual sweep — only one `verification_sweep`-tracked run can be "in
+progress" at a time (`get_current_verification_run()`), so whichever
+enqueues first blocks the other until it completes or is cancelled via
+`complete_verification_run(run_id, error_message=...)` +
+`request_processing_job_cancel(job_id)`.
+
 ### Existing Foundations Not Yet Integrated Into Routed Collection
 
 - `deep_research/tools/kb_search.py` provides hybrid full-text and semantic
