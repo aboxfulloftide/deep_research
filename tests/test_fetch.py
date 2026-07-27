@@ -200,3 +200,61 @@ async def test_safe_fetch_rejects_a_private_host_before_any_network_call(monkeyp
 
     with pytest.raises(UnsafeURLError):
         await safe_fetch("http://127.0.0.1:8080/", Config())
+
+
+class _HeaderCapturingClient:
+    """Same shape as _FakeClient but records the headers each stream() call
+    actually used, for the Wikimedia-vs-generic User-Agent tests below."""
+
+    def __init__(self, response):
+        self._response = response
+        self.seen_headers: list[dict] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def stream(self, method, url, headers=None):
+        self.seen_headers.append(headers or {})
+        return _FakeStreamContext(self._response)
+
+
+# -- Wikimedia's edge WAF 403s a generic browser-spoofing User-Agent on its
+# article pages the same way it does its REST search API (see
+# tools/search.py's _wikipedia_user_agent) -- confirmed live: identical
+# request, only the User-Agent changed, 403 -> 200. safe_fetch() must send
+# the compliant bot identity for the whole Wikimedia family, and the
+# ordinary browser-spoofing default everywhere else.
+
+async def test_safe_fetch_uses_the_compliant_wikipedia_user_agent(monkeypatch):
+    response = _FakeStreamResponse(200, {"content-type": "text/html"}, "https://en.wikipedia.org/wiki/Example", chunks=[b"ok"])
+    client = _HeaderCapturingClient(response)
+    monkeypatch.setattr(fetch_module.httpx, "AsyncClient", lambda **kwargs: client)
+
+    config = Config()
+    config.wikipedia.contact = "me@example.com"
+    await safe_fetch("https://en.wikipedia.org/wiki/Example", config)
+
+    assert client.seen_headers[0]["User-Agent"] == "deep-research-kb-bot/1.0 (me@example.com) httpx"
+
+
+async def test_safe_fetch_uses_the_generic_browser_user_agent_for_non_wikimedia_sites(monkeypatch):
+    response = _FakeStreamResponse(200, {"content-type": "text/html"}, "https://example.test/page", chunks=[b"ok"])
+    client = _HeaderCapturingClient(response)
+    monkeypatch.setattr(fetch_module.httpx, "AsyncClient", lambda **kwargs: client)
+
+    await safe_fetch("https://example.test/page", Config())
+
+    assert "Mozilla" in client.seen_headers[0]["User-Agent"]
+
+
+async def test_safe_fetch_lets_an_explicit_header_override_the_wikimedia_default(monkeypatch):
+    response = _FakeStreamResponse(200, {"content-type": "text/html"}, "https://en.wikipedia.org/wiki/Example", chunks=[b"ok"])
+    client = _HeaderCapturingClient(response)
+    monkeypatch.setattr(fetch_module.httpx, "AsyncClient", lambda **kwargs: client)
+
+    await safe_fetch("https://en.wikipedia.org/wiki/Example", Config(), headers={"User-Agent": "custom-agent/1.0"})
+
+    assert client.seen_headers[0]["User-Agent"] == "custom-agent/1.0"

@@ -34,11 +34,6 @@ from deep_research.kb.db import KBDatabase
 from deep_research.kb.storage import SnapshotStore
 from deep_research.tools.fetch import FetchTooLargeError, UnsafeURLError, safe_fetch
 
-_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
-
 _FILE_MIME_TYPES = {
     "pdf": "application/pdf",
     "markdown": "text/markdown",
@@ -128,7 +123,7 @@ async def ingest_web_page(
     source_id = source["id"]
 
     try:
-        doc = await safe_fetch(url, config, headers={"User-Agent": _USER_AGENT})
+        doc = await safe_fetch(url, config)
     except UnsafeURLError as e:
         await kb_db.add_fetch_attempt(
             source_id=source_id, attempt_type="fetch", status="failed",

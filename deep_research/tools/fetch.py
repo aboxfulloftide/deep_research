@@ -22,6 +22,29 @@ _USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+# Wikimedia's edge WAF 403s a generic browser-spoofing User-Agent on its
+# article/file pages the same way it does its REST search API (see
+# tools/search.py's _wikipedia_user_agent) -- confirmed live: identical
+# request, only the User-Agent changed, 403 -> 200. Every other site gets
+# the browser-spoofing default above, which is what most non-Wikimedia
+# sites actually expect from an anonymous fetch.
+_WIKIMEDIA_DOMAIN_SUFFIXES = (
+    "wikipedia.org", "wikimedia.org", "wiktionary.org", "wikidata.org",
+    "wikibooks.org", "wikiquote.org", "wikisource.org", "wikinews.org",
+    "wikiversity.org", "wikivoyage.org",
+)
+
+
+def _is_wikimedia_domain(hostname: str) -> bool:
+    return hostname.lower().endswith(_WIKIMEDIA_DOMAIN_SUFFIXES)
+
+
+def _default_user_agent(url: str, config: Config) -> str:
+    hostname = urlparse(url).hostname or ""
+    if _is_wikimedia_domain(hostname):
+        contact = config.wikipedia.contact or "no contact configured"
+        return f"deep-research-kb-bot/1.0 ({contact}) httpx"
+    return _USER_AGENT
 
 
 class UnsafeURLError(Exception):
@@ -84,7 +107,7 @@ async def safe_fetch(
     httpx-exception handling and add the two new types."""
     max_bytes = config.scraping.max_response_bytes
     max_redirects = config.scraping.max_redirects
-    request_headers = {"User-Agent": _USER_AGENT, **(headers or {})}
+    request_headers = {"User-Agent": _default_user_agent(url, config), **(headers or {})}
     current_url = url
     _validate_url(current_url)  # fail fast before opening any connection
 
