@@ -328,10 +328,17 @@ actually use.
 If additional context is given, it is a human's note about a specific angle
 to look for -- make sure the query actually targets that, not just the
 literal claim text. If prior queries are listed, suggest something
-meaningfully different from all of them, not a minor rephrasing of one.
+meaningfully different from all of them, not a minor rephrasing of one --
+but never invent a placeholder like "[specific event]" or "[time period]"
+for a detail the claim doesn't actually give you. If the claim itself never
+names the specific company/deal/date, you cannot search for one either --
+use only the words and entities the claim text actually contains, even if
+that means a query similar to one already tried.
 
 Return ONLY a JSON object: {"query": "..."}
 """
+
+_PLACEHOLDER_BRACKET_RE = re.compile(r"\[[^\[\]]{0,80}\]")
 
 
 async def _suggest_search_query(
@@ -349,7 +356,14 @@ async def _suggest_search_query(
     + context "compare against datacenter usage" -- a plain search of the
     claim text would never surface a datacenter-specific comparison). Falls
     back to the raw claim text (the original, always-safe default) on any
-    parse failure or an empty suggestion."""
+    parse failure, an empty suggestion, or a suggestion containing a literal
+    "[placeholder]" bracket -- observed live: when a claim never names the
+    specific company/deal/date to begin with (an extraction gap, not
+    something this step can fix) and "don't repeat prior queries" leaves the
+    model with nothing left to vary, it can fabricate a fill-in-the-blank
+    query like "...for the deal in [specific event or time period]" instead
+    of admitting there's no more specific detail available -- a query like
+    that would search for the literal bracket text, not real content."""
     parts = [f"Claim: {claim_text}"]
     if context:
         parts.append(f"Additional context (what to specifically look for): {context}")
@@ -365,7 +379,10 @@ async def _suggest_search_query(
     content = resp["choices"][0]["message"]["content"] or ""
     parsed = _parse_json_object(content)
     query = parsed.get("query")
-    return query.strip() if isinstance(query, str) and query.strip() else claim_text
+    query = query.strip() if isinstance(query, str) and query.strip() else ""
+    if not query or _PLACEHOLDER_BRACKET_RE.search(query):
+        return claim_text
+    return query
 
 
 def _is_alternate_search_query(claim_text: str, query: str) -> bool:

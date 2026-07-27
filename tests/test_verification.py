@@ -533,6 +533,24 @@ async def test_suggest_search_query_falls_back_to_claim_text_on_empty_query():
     assert result == "Some claim text."
 
 
+async def test_suggest_search_query_falls_back_to_claim_text_on_placeholder_bracket():
+    """Live KB data: when a claim never names the specific company/deal/date
+    and 'don't repeat prior queries' leaves the model nothing left to vary,
+    it can fabricate a fill-in-the-blank query like "...the deal in [specific
+    event or time period]" instead of admitting there's no more detail
+    available. A query containing a literal bracket would search for that
+    bracket text, not real content, so it must be rejected the same as an
+    empty or unparseable suggestion."""
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {
+                "content": '{"query": "Goldman Sachs risk assessment and advocacy for the deal in [specific event or time period]"}',
+            }}]}
+
+    result = await v._suggest_search_query(FakeLLM(), "Goldman Sachs pushed for the deal.", ["a prior query"])
+    assert result == "Goldman Sachs pushed for the deal."
+
+
 def test_only_meaningfully_different_generated_query_is_alternate():
     claim = "The Nasdaq peaked in March 2000."
 
