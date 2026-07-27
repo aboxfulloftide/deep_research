@@ -126,6 +126,88 @@ def test_budget_final_status_unverified_by_default():
     assert budget.final_status() == "unverified"
 
 
+# -- _own_evidence_corroboration: pure function, no I/O ----------------------
+# Live KB data: a claim ("The Wall Street Crash occurred on October 29th,
+# 1929") already backed by history.com, ebsco.com, and explaininghistory.org
+# via extraction/merge history sat "unverified" forever, since verify_claim
+# only ever counted NEW, separately-discovered claim rows as corroboration --
+# never the claim's own pre-existing, already-independent evidence.
+
+def test_own_evidence_corroboration_counts_distinct_reputable_domains():
+    sources = [
+        {"canonical_uri": "https://history.com/a", "trust_tier_code": None},
+        {"canonical_uri": "https://ebsco.com/b", "trust_tier_code": None},
+    ]
+    count, weight = v._own_evidence_corroboration(sources)
+    assert count == 2
+    assert weight == 1.0  # two unknown-tier (0.5) sources
+
+
+def test_own_evidence_corroboration_deduplicates_same_domain():
+    # Two different articles from the same outlet are not two independent
+    # sources -- history.com twice must count as one.
+    sources = [
+        {"canonical_uri": "https://history.com/article-a", "trust_tier_code": None},
+        {"canonical_uri": "https://history.com/article-b", "trust_tier_code": None},
+    ]
+    count, weight = v._own_evidence_corroboration(sources)
+    assert count == 1
+    assert weight == 0.5
+
+
+def test_own_evidence_corroboration_excludes_social_media():
+    sources = [
+        {"canonical_uri": "https://www.reddit.com/r/history/comments/x", "trust_tier_code": None},
+        {"canonical_uri": "https://history.com/a", "trust_tier_code": None},
+    ]
+    count, weight = v._own_evidence_corroboration(sources)
+    assert count == 1
+    assert weight == 0.5
+
+
+def test_own_evidence_corroboration_uses_trust_tier_weights():
+    sources = [
+        {"canonical_uri": "https://irs.gov/a", "trust_tier_code": "official"},
+    ]
+    count, weight = v._own_evidence_corroboration(sources)
+    assert count == 1
+    assert weight == 1.0
+
+
+def test_own_evidence_corroboration_empty_for_no_sources():
+    assert v._own_evidence_corroboration([]) == (0, 0.0)
+
+
+async def test_verify_claim_seeds_supports_from_own_evidence(kb_db, monkeypatch):
+    """The exact live bug: a claim already backed by two independent
+    reputable domains must resolve to "supported" without needing to find
+    any new corroborating claim via search."""
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim(
+        "fact", "The Wall Street Crash occurred on October 29th, 1929.",
+    )
+
+    async def fake_own_evidence(claim_id):
+        return [
+            {"canonical_uri": "https://history.com/articles/1929-stock-market-crash", "trust_tier_code": None},
+            {"canonical_uri": "https://ebsco.com/research-starters/history/stock-market-crash-1929", "trust_tier_code": None},
+        ]
+
+    monkeypatch.setattr(kb_db, "get_claim_own_evidence_sources", fake_own_evidence)
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("should not need external search when own evidence already corroborates")
+
+    monkeypatch.setattr(v, "web_search", fail_if_called)
+
+    result = await v.verify_claim(
+        kb_db, load_config(), claim["id"], extraction_model="stub-model",
+    )
+    assert result.status == "supported"
+    assert result.web_searches_used == 0
+
+
 # -- eligibility / check_status: settled vs. inconclusive claims -------------
 # A settled verdict (supported/contradicted/mixed) is never auto-rechecked.
 # An "unverified" (inconclusive) first pass is a different case -- it gets a

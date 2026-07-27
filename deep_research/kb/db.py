@@ -1770,6 +1770,25 @@ class KBDatabase:
             )
         return {r["source_id"] for r in rows}
 
+    async def get_claim_own_evidence_sources(self, claim_id: str) -> list[dict]:
+        """Distinct sources currently backing this claim's own evidence --
+        accumulated via extraction and any subsequent claim merges -- with
+        trust tier. Used by verify_claim to recognize a claim's existing
+        multi-source corroboration instead of only ever searching for new,
+        separate claim rows to agree with it (merging near-duplicate claims
+        from independent sources into one canonical claim otherwise erases
+        the very comparison targets verification depends on)."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT s.id, s.canonical_uri, tt.code AS trust_tier_code "
+                "FROM claim_evidence ce "
+                "JOIN sources s ON s.id = ce.source_id "
+                "LEFT JOIN trust_tiers tt ON tt.id = s.trust_tier_id "
+                "WHERE ce.claim_id = $1",
+                claim_id,
+            )
+        return [dict(r) for r in rows]
+
     async def update_claim_verification(
         self, claim_id: str, status: str, verification_notes: dict | None = None,
     ) -> dict:

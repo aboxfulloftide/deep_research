@@ -29,6 +29,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from deep_research.config import Config, LLMConfig
 from deep_research.kb.artifacts import build_artifact_for_version
@@ -503,6 +504,39 @@ class _RunSearchBudget:
             return True
 
 
+TRUST_TIER_WEIGHTS = {"official": 1.0, "reputable_reporting": 0.75, "secondary_analysis": 0.5, "user_generated": 0.25}
+
+
+def _own_evidence_corroboration(evidence_sources: list[dict]) -> tuple[int, float]:
+    """A claim's own pre-existing evidence -- accumulated via extraction and
+    any subsequent merges -- expressed as (count, weight) in the same terms
+    _examine_candidates already uses for supports found via fresh search.
+
+    Deduplicated by domain (two articles from the same outlet are not two
+    independent sources) and excluding unvetted social media. Exists because
+    verify_claim's supports/support_weight otherwise only ever grow by
+    finding new, separate claim rows to agree with this one -- but claim
+    merging (see kb.resolution) actively removes those separate rows by
+    consolidating duplicate claims from independent sources into one
+    canonical claim. A claim already backed by several genuinely independent,
+    reputable outlets (discovered live: history.com, ebsco.com, and
+    explaininghistory.org all corroborating the same 1929 Wall Street Crash
+    date) was sitting "unverified" forever as a result, needing to
+    essentially rediscover a fact its own evidence already established."""
+    best_tier_by_domain: dict[str, str | None] = {}
+    for source in evidence_sources:
+        uri = source.get("canonical_uri") or ""
+        if not uri or is_social_media_domain(uri):
+            continue
+        domain = urlparse(uri).hostname or uri
+        tier = source.get("trust_tier_code")
+        existing = best_tier_by_domain.get(domain)
+        if domain not in best_tier_by_domain or TRUST_TIER_WEIGHTS.get(tier, 0.5) > TRUST_TIER_WEIGHTS.get(existing, 0.5):
+            best_tier_by_domain[domain] = tier
+    weight = sum(TRUST_TIER_WEIGHTS.get(tier, 0.5) for tier in best_tier_by_domain.values())
+    return len(best_tier_by_domain), weight
+
+
 class _Budget:
     """Tracks the per-claim verification budget and the stop conditions.
 
@@ -617,9 +651,7 @@ async def _examine_candidates(
             # Default unknown sources to 0.5, preserving the prior
             # two-independent-source behavior. Explicitly classified tiers
             # use their trust ranking, so one official source (1.0) suffices.
-            tier_weights = {"official": 1.0, "reputable_reporting": 0.75,
-                            "secondary_analysis": 0.5, "user_generated": 0.25}
-            source_weight = max((tier_weights.get(s.get("trust_tier_code"), 0.5) for s in other_sources), default=0.5)
+            source_weight = max((TRUST_TIER_WEIGHTS.get(s.get("trust_tier_code"), 0.5) for s in other_sources), default=0.5)
             budget.support_weight += source_weight
             if supporting_ids is not None:
                 supporting_ids.append(other_claim["id"])
@@ -681,6 +713,13 @@ async def verify_claim(
     budget = _Budget(config.kb.verification_max_sources_examined, config.kb.verification_max_web_searches)
     own_source_ids = await kb_db.get_claim_source_ids(claim_id)
     examined_source_ids = set(own_source_ids)
+    # A claim's own evidence, if it already spans multiple independent
+    # reputable sources (accumulated via extraction and merges), is real
+    # corroboration in its own right -- see _own_evidence_corroboration.
+    # Without this, verify_claim only ever grows supports by finding new,
+    # separate claim rows, which claim merging steadily removes.
+    own_evidence_sources = await kb_db.get_claim_own_evidence_sources(claim_id)
+    budget.supports, budget.support_weight = _own_evidence_corroboration(own_evidence_sources)
     contradiction_ids: list[str] = []
     supporting_ids: list[str] = []
     timings: dict[str, float] = {}
