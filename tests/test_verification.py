@@ -640,6 +640,82 @@ def test_only_meaningfully_different_generated_query_is_alternate():
     assert v._is_alternate_search_query(claim, "  the NASDAQ peaked in March 2000. ") is False
 
 
+# -- _is_duplicate_query: live regression, the model repeating itself -------
+# Observed live: SEARCH_QUERY_SUGGESTION_PROMPT explicitly tells the model
+# not to repeat a prior query, but a smaller local model sometimes does
+# anyway -- one claim's retry history showed the same exact query verbatim
+# 5 times, each repeat wasting a real search-budget slot on results already
+# seen instead of exploring a genuinely new angle.
+
+def test_is_duplicate_query_matches_case_and_whitespace_insensitively():
+    tried = ["Energy industry growth projections compared to technology and healthcare sectors by 2030"]
+    assert v._is_duplicate_query(
+        "  ENERGY industry growth projections compared to technology and healthcare sectors by 2030  ", tried,
+    ) is True
+
+
+def test_is_duplicate_query_false_for_a_genuinely_new_query():
+    tried = ["Energy industry growth projections compared to technology and healthcare sectors by 2030"]
+    assert v._is_duplicate_query("Global energy demand forecast 2030 IEA report", tried) is False
+
+
+def test_is_duplicate_query_false_for_empty_history():
+    assert v._is_duplicate_query("Any query at all", []) is False
+
+
+async def test_verify_claim_skips_web_search_for_a_repeated_query(kb_db, monkeypatch):
+    """Integration-level version of the same live bug: verify_claim's
+    external-search loop must not actually call web_search() again once the
+    suggested query duplicates one already tried, even though nothing
+    prevents the model itself from suggesting one."""
+    from dataclasses import dataclass
+
+    from deep_research.config import load_config
+    from deep_research.models import SearchResult
+
+    claim, _ = await kb_db.get_or_create_claim(
+        "fact", "A distinctive test claim about zorbnaxian trade tariffs in 1994.",
+    )
+    config = load_config()
+    config.kb.verification_max_web_searches = 4
+
+    search_calls = []
+
+    async def fake_web_search(query, cfg, **kwargs):
+        search_calls.append(query)
+        # Non-empty (verify_claim's loop breaks outright on an empty
+        # result), but resolved as a failed ingest below so nothing further
+        # is actually fetched over the network.
+        return [SearchResult(title="Irrelevant", url="https://example.test/irrelevant", snippet="")]
+
+    async def fake_suggest_query(llm, claim_text, tried_queries, context=None):
+        # Simulate the model ignoring "don't repeat" and echoing the first
+        # query (the raw claim text) back verbatim every time.
+        return claim_text
+
+    @dataclass
+    class _FailedIngest:
+        status: str = "failed"
+        source_id: str | None = None
+
+    async def fake_ingest_web_page(*args, **kwargs):
+        return _FailedIngest()
+
+    monkeypatch.setattr(v, "web_search", fake_web_search)
+    monkeypatch.setattr(v, "_suggest_search_query", fake_suggest_query)
+    monkeypatch.setattr(v, "ingest_web_page", fake_ingest_web_page)
+
+    result = await v.verify_claim(
+        kb_db, config, claim["id"], extraction_model="stub-model",
+    )
+
+    # Exactly one real search (the first, raw-claim-text attempt) -- every
+    # later loop iteration recognized the suggestion as a repeat and skipped
+    # the wasted call, even though the budget allowed up to 4 attempts.
+    assert search_calls == [claim["canonical_text"]]
+    assert result.web_searches_used == 4
+
+
 async def test_suggest_search_query_includes_context_in_the_prompt():
     seen = {}
 

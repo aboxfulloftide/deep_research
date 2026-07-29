@@ -386,14 +386,28 @@ async def _suggest_search_query(
     return query
 
 
+def _normalize_search_query(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
 def _is_alternate_search_query(claim_text: str, query: str) -> bool:
     """True only when query generation produced meaningfully different text.
 
     Whitespace and case alone do not turn the literal claim into an alternate
     query; this guards the parse-failure fallback in _suggest_search_query.
     """
-    normalize = lambda value: " ".join(value.casefold().split())
-    return normalize(query) != normalize(claim_text)
+    return _normalize_search_query(query) != _normalize_search_query(claim_text)
+
+
+def _is_duplicate_query(query: str, tried_queries: list[str]) -> bool:
+    """True if `query` normalizes to match something already in
+    tried_queries -- the model was explicitly told not to repeat a prior
+    query (see SEARCH_QUERY_SUGGESTION_PROMPT) but did anyway. Observed
+    live: the same query repeated verbatim up to 5 times across one claim's
+    retry history, each repeat wasting a real search-budget slot on results
+    that were already seen instead of exploring a genuinely new angle."""
+    normalized = _normalize_search_query(query)
+    return any(normalized == _normalize_search_query(prior) for prior in tried_queries)
 
 
 async def _rank_candidates_by_similarity(
@@ -787,6 +801,17 @@ async def verify_claim(
                 )
             else:
                 query = claim["canonical_text"]
+
+            if _is_duplicate_query(query, tried_queries):
+                # Searching it again would just return the same (likely
+                # cached) results instead of exploring a genuinely new
+                # angle, so this skips the wasted network/cache round-trip.
+                # Still counts against the search budget (already
+                # incremented above), so a model that keeps repeating
+                # itself can't spin this loop forever -- it just exhausts
+                # the budget faster instead of wasting it on duplicates.
+                continue
+
             tried_queries.append(query)
             try:
                 with _timed(timings, "web_search"):
