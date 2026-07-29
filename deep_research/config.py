@@ -20,6 +20,19 @@ class LLMConfig(BaseModel):
     ollama_api_key: str = "ollama"
     llama_cpp_base_url: str = "http://localhost:8080/v1"
     llama_cpp_api_key: str = "not-needed"
+    # The real number of concurrent generation slots the active backend can
+    # actually serve (llama.cpp's own --parallel N) -- LLMClient uses this to
+    # bound concurrent requests to one endpoint globally, across every caller
+    # (Extra Research, the interactive agent, KB extraction/verification/
+    # resolution) at once. Without this, independently-sized layers of
+    # concurrency at higher levels (e.g. verifying N claims at once, each of
+    # which may itself resolve M new claims concurrently) multiply against
+    # each other well past the server's real capacity, and requests queue
+    # behind each other rather than actually running in parallel -- measured
+    # live: per-claim verification times went from tens of seconds to 15-44
+    # minutes once a second, independently-sized concurrency layer was added
+    # without this shared ceiling.
+    max_concurrent_requests: int = 3
 
 
 class SearXNGConfig(BaseModel):
@@ -197,6 +210,7 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_LLM_OLLAMA_API_KEY": ("llm", "ollama_api_key"),
         "DEEP_RESEARCH_LLM_LLAMA_CPP_BASE_URL": ("llm", "llama_cpp_base_url"),
         "DEEP_RESEARCH_LLM_LLAMA_CPP_API_KEY": ("llm", "llama_cpp_api_key"),
+        "DEEP_RESEARCH_LLM_MAX_CONCURRENT_REQUESTS": ("llm", "max_concurrent_requests"),
         "DEEP_RESEARCH_SEARXNG_URL": ("searxng", "url"),
         "DEEP_RESEARCH_SEARXNG_MIN_INTERVAL_SECONDS": ("searxng", "min_interval_seconds"),
         "DEEP_RESEARCH_BRAVE_API_KEY": ("brave", "api_key"),
