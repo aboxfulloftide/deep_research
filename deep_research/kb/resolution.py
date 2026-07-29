@@ -17,6 +17,7 @@ Two separate concerns, deliberately kept apart:
   ambiguity, parse failure, or request error.
 """
 
+import asyncio
 import hashlib
 import json
 import re
@@ -67,6 +68,12 @@ Return ONLY a JSON object: {"relationship": "same"|"different", "confidence": 0.
 # entity-duplicate and claim-duplicate vetting below.
 ENTITY_LLM_CONFIDENCE_THRESHOLD = 0.75
 CLAIM_LLM_CONFIDENCE_THRESHOLD = 0.75
+# A single content-rich source (a video transcript, a "top 10 companies"
+# listicle) can promote 30-100+ new claims in one batch -- measured live as
+# the dominant cost of verify_claim's web-fallback path when resolved fully
+# sequentially. Bounded rather than unbounded so a huge batch doesn't fire
+# dozens of LLM calls simultaneously against the one shared local model.
+CLAIM_RESOLUTION_CONCURRENCY = 4
 
 # High-precision rule for a common extraction artifact: one source preserves
 # the attribution ("Adam Smith wrote that X") while another stores the quoted
@@ -418,74 +425,101 @@ async def generate_claim_resolution_candidates(
     a confident "same" merges directly instead of queuing, a confident
     "different" is dropped as a similarity false positive, and anything
     ambiguous (or a failed LLM call) falls through to the existing
-    resolution_candidates queue for a human to decide."""
+    resolution_candidates queue for a human to decide.
+
+    Processes up to CLAIM_RESOLUTION_CONCURRENCY claims at once (bounded by
+    a semaphore) rather than one at a time -- a single content-rich source
+    (a video transcript, a "top 10 companies" listicle) can promote 30-100+
+    new claims in one batch, and resolving them fully sequentially was
+    measured live as the dominant cost of verify_claim's web-fallback path
+    (up to ~590s of "resolve_promote" time for one claim's verification, just
+    from ingesting a source that happened to yield 125 new claims). Two
+    claims in the same batch independently discovering they're duplicates of
+    each other and both calling merge_claims() is safe: each of
+    merge_claims's writes is an idempotent UPDATE ... WHERE claim_id = X, so
+    a second, redundant merge call for an already-merged pair just updates
+    zero rows -- the only side effect is a harmless duplicate decision-log
+    entry, not incorrect data."""
     if not new_claim_ids:
         return 0
 
     threshold = config.kb.claim_duplicate_threshold
+    semaphore = asyncio.Semaphore(CLAIM_RESOLUTION_CONCURRENCY)
+
+    async def process_one(claim_id: str) -> int:
+        async with semaphore:
+            return await _generate_resolution_candidates_for_claim(kb_db, config, claim_id, llm, threshold)
+
+    counts = await asyncio.gather(*(process_one(claim_id) for claim_id in new_claim_ids))
+    return sum(counts)
+
+
+async def _generate_resolution_candidates_for_claim(
+    kb_db: KBDatabase, config: Config, claim_id: str, llm: LLMClient | None, threshold: float,
+) -> int:
+    claim = await kb_db.get_claim(claim_id)
+    if claim is None or claim.get("embedding") is None or claim.get("merged_into_claim_id"):
+        return 0  # embedding failed best-effort at creation time; backfill will cover it
+    if is_review_excluded_claim(claim["canonical_text"]):
+        return 0
+
     candidate_count = 0
-    for claim_id in new_claim_ids:
-        claim = await kb_db.get_claim(claim_id)
-        if claim is None or claim.get("embedding") is None or claim.get("merged_into_claim_id"):
-            continue  # embedding failed best-effort at creation time; backfill will cover it
-        if is_review_excluded_claim(claim["canonical_text"]):
+    embedding = claim["embedding"].to_list()
+    claim_numbers = _extract_numbers(claim["canonical_text"])
+    neighbors = await kb_db.find_similar_claims(claim_id, embedding, limit=20)
+    for other in neighbors:
+        if other["similarity"] < threshold:
+            break  # find_similar_claims orders nearest-first (similarity descending)
+        if is_review_excluded_claim(other["canonical_text"]):
             continue
-        embedding = claim["embedding"].to_list()
-        claim_numbers = _extract_numbers(claim["canonical_text"])
-        neighbors = await kb_db.find_similar_claims(claim_id, embedding, limit=20)
-        for other in neighbors:
-            if other["similarity"] < threshold:
-                break  # find_similar_claims orders nearest-first (similarity descending)
-            if is_review_excluded_claim(other["canonical_text"]):
-                continue
-            if claims_differ_only_by_attribution(claim["canonical_text"], other["canonical_text"]):
-                merged = await merge_claims(
-                    kb_db, claim_id, other["id"],
-                    automation={
-                        "confidence": 1.0,
-                        "reasoning": "Claims differ only by a leading attribution.",
-                        "model": None,
-                        "parse_success": True,
-                    },
-                )
-                # Once the claim being processed loses a merge, its cached
-                # neighbor list and identity are stale. The winner will be
-                # considered normally on its own pass or by the backlog sweep.
-                if merged["winner_id"] != claim_id:
-                    break
-                continue
-            other_numbers = _extract_numbers(other["canonical_text"])
-            if claim_numbers and other_numbers and _numbers_conflict(
-                claim["canonical_text"], claim_numbers, other["canonical_text"], other_numbers,
-            ):
-                continue  # numbers disagree and aren't a rounding variant of the same percentage
-
-            if llm is not None:
-                try:
-                    verdict = await _classify_claim_duplicate(llm, claim["canonical_text"], other["canonical_text"])
-                except Exception:
-                    verdict = {"relationship": "different", "confidence": 0.0}
-                relationship = verdict.get("relationship")
-                confidence = verdict.get("confidence") or 0.0
-                if confidence >= CLAIM_LLM_CONFIDENCE_THRESHOLD:
-                    if relationship == "same":
-                        merged = await merge_claims(
-                            kb_db, claim_id, other["id"],
-                            automation={"confidence": confidence, "reasoning": verdict.get("reasoning"),
-                                        "model": getattr(llm, "model", None), "parse_success": True},
-                        )
-                        if merged["winner_id"] != claim_id:
-                            break
-                        continue
-                    if relationship == "different":
-                        continue
-
-            _, created = await kb_db.add_claim_resolution_candidate(
-                claim_id, other["id"], other["similarity"], "embedding_cosine",
-                reason=f"cosine={other['similarity']:.3f}",
+        if claims_differ_only_by_attribution(claim["canonical_text"], other["canonical_text"]):
+            merged = await merge_claims(
+                kb_db, claim_id, other["id"],
+                automation={
+                    "confidence": 1.0,
+                    "reasoning": "Claims differ only by a leading attribution.",
+                    "model": None,
+                    "parse_success": True,
+                },
             )
-            if created:
-                candidate_count += 1
+            # Once the claim being processed loses a merge, its cached
+            # neighbor list and identity are stale. The winner will be
+            # considered normally on its own pass or by the backlog sweep.
+            if merged["winner_id"] != claim_id:
+                break
+            continue
+        other_numbers = _extract_numbers(other["canonical_text"])
+        if claim_numbers and other_numbers and _numbers_conflict(
+            claim["canonical_text"], claim_numbers, other["canonical_text"], other_numbers,
+        ):
+            continue  # numbers disagree and aren't a rounding variant of the same percentage
+
+        if llm is not None:
+            try:
+                verdict = await _classify_claim_duplicate(llm, claim["canonical_text"], other["canonical_text"])
+            except Exception:
+                verdict = {"relationship": "different", "confidence": 0.0}
+            relationship = verdict.get("relationship")
+            confidence = verdict.get("confidence") or 0.0
+            if confidence >= CLAIM_LLM_CONFIDENCE_THRESHOLD:
+                if relationship == "same":
+                    merged = await merge_claims(
+                        kb_db, claim_id, other["id"],
+                        automation={"confidence": confidence, "reasoning": verdict.get("reasoning"),
+                                    "model": getattr(llm, "model", None), "parse_success": True},
+                    )
+                    if merged["winner_id"] != claim_id:
+                        break
+                    continue
+                if relationship == "different":
+                    continue
+
+        _, created = await kb_db.add_claim_resolution_candidate(
+            claim_id, other["id"], other["similarity"], "embedding_cosine",
+            reason=f"cosine={other['similarity']:.3f}",
+        )
+        if created:
+            candidate_count += 1
     return candidate_count
 
 

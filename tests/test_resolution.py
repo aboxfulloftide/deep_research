@@ -1,3 +1,5 @@
+import asyncio
+
 from deep_research.config import Config
 from deep_research.kb import resolution as r
 
@@ -817,3 +819,46 @@ async def test_candidates_not_suppressed_when_only_one_side_has_numbers(kb_db, m
     count = await r.generate_claim_resolution_candidates(kb_db, config, [claim_a["id"], claim_b["id"]])
 
     assert count >= 1
+
+
+# -- generate_claim_resolution_candidates: batch concurrency -----------------
+
+async def test_generate_claim_resolution_candidates_processes_claims_concurrently(kb_db, monkeypatch):
+    """A single content-rich source (a video transcript, a "top 10
+    companies" listicle) can promote 30-100+ new claims in one batch --
+    resolving them fully sequentially was measured live as the dominant
+    cost of verify_claim's web-fallback path (~590s for one claim's
+    verification, purely from a source that happened to yield 125 new
+    claims). Must actually overlap multiple claims' resolution in flight,
+    not just accept a batch and still process it one at a time."""
+    claim_ids = []
+    for i in range(6):
+        claim, _ = await kb_db.get_or_create_claim("fact", f"Unrelated fact number {i} about something distinct.")
+        claim_ids.append(claim["id"])
+
+    fake_vectors_in_order = [[float(i), 0.0, 0.0] + [0.0] * 765 for i in range(6)]
+
+    async def fake_embed_texts(texts, base_url, model, instruction_prefix="clustering: "):
+        return fake_vectors_in_order
+
+    monkeypatch.setattr(r, "embed_texts", fake_embed_texts)
+
+    in_flight = 0
+    max_in_flight = 0
+
+    async def fake_find_similar_claims(claim_id, embedding, limit=20):
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.05)
+        in_flight -= 1
+        return []
+
+    monkeypatch.setattr(kb_db, "find_similar_claims", fake_find_similar_claims)
+
+    config = _fake_config()
+    await r.embed_new_claims(kb_db, config, claim_ids)
+    await r.generate_claim_resolution_candidates(kb_db, config, claim_ids)
+
+    assert max_in_flight > 1
+    assert max_in_flight <= r.CLAIM_RESOLUTION_CONCURRENCY
