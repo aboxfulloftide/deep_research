@@ -2148,9 +2148,24 @@ class KBDatabase:
         standard SQL) never treats NULL as equal to NULL, and every row has at
         least one NULL id-pair (only one of entity/event/claim applies per
         candidate_type). IS NOT DISTINCT FROM is Postgres's NULL-safe equality
-        operator, needed since some of these columns are NULL for any given row."""
+        operator, needed since some of these columns are NULL for any given row.
+
+        The check-then-insert below is only safe against concurrent callers
+        because of the advisory lock: generate_claim_resolution_candidates()
+        processes a batch of new claims concurrently (see resolution.py), so
+        two claims that are each other's neighbor can otherwise both find "no
+        existing row" before either commits its insert, creating a duplicate
+        this application-level dedup was supposed to prevent. The lock is
+        transaction-scoped (pg_advisory_xact_lock), so it's released
+        automatically when this transaction commits or rolls back -- no
+        manual cleanup needed, and it can never be left stuck by a crash."""
+        lock_key = "|".join(str(value) for value in (
+            candidate_type, left_entity_id, right_entity_id,
+            left_event_id, right_event_id, left_claim_id, right_claim_id,
+        ))
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", lock_key)
                 existing = await conn.fetchrow(
                     "SELECT * FROM resolution_candidates WHERE candidate_type = $1 "
                     "AND left_entity_id IS NOT DISTINCT FROM $2 "
