@@ -465,6 +465,54 @@ test had caught, several of them predating this batch entirely:
   of a large backlog and leave the rest checked against internal KB data
   alone, never exercising the search fixes above.
 
+- **`45d5b63`/`f27530b`** — Live-confirmed concurrency-multiplication
+  regression: parallelizing `generate_claim_resolution_candidates()`
+  (`CLAIM_RESOLUTION_CONCURRENCY = 4`, an inner layer inside each claim's
+  verification) multiplied against the verification sweep's own outer
+  concurrency (3) with no shared ceiling, driving up to 12 simultaneous
+  requests against llama.cpp's real `--parallel 3` capacity. Per-claim
+  verification times went from tens of seconds to 15–44 minutes; user
+  directly reported "only 3 claims" processed in an hour. Fixed in two
+  layers: (1) an in-process `asyncio.Semaphore` in `llm.py`, keyed by
+  endpoint `base_url` and sized to `config.llm.max_concurrent_requests`
+  (new field, default 3, matching this deployment's real `--parallel 3`),
+  wrapped only around the actual network call in `chat()`/`chat_stream()` —
+  safe regardless of how many independently-sized concurrency layers exist
+  above it. (2) A second, separate instance of the *same* bug one layer up:
+  an ad-hoc re-verification script running as its own OS process had its own
+  independent in-process semaphore, still competing with the main service
+  for the same real llama.cpp capacity. Fixed with a cross-process limiter —
+  a Postgres advisory lock (`pg_try_advisory_lock`/`pg_advisory_unlock`)
+  keyed by `zlib.crc32(base_url)` (a fixed-algorithm hash; Python's built-in
+  `hash()` is randomized per-process via `PYTHONHASHSEED` and unsafe for this)
+  with one lock-slot per allowed concurrent request, polled with a short
+  sleep when all slots are held. Verified live: 6 concurrent calls from two
+  genuinely separate OS processes ran as clean batches of 3, matching real
+  capacity. Tests: `tests/test_llm.py` (new file) — per-endpoint bound,
+  independent semaphores per endpoint, stable/endpoint-specific lock
+  namespace, and combined cross-process concurrency bound simulated via
+  resetting the in-process semaphore registry between two batches of
+  clients sharing the real dev Postgres DSN.
+- **`db.py` `_add_resolution_candidate` race** — surfaced as an
+  intermittently-failing test (`assert count == 1` occasionally got `2`)
+  once claim resolution was parallelized: the existing application-level
+  check-then-insert dedup (no DB unique constraint, due to NULL-handling
+  complexity across mixed entity/event/claim id columns) was never atomic,
+  and concurrent execution exposed the race. Fixed with
+  `pg_advisory_xact_lock(hashtext(lock_key))` at the top of the transaction,
+  serializing concurrent attempts at the same candidate pair; auto-releases
+  on commit/rollback. Confirmed stable across 5 repeated runs.
+- **Duplicate search queries wasting budget** — live KB data showed one
+  claim's query history repeating the exact same string verbatim 5 times;
+  `SEARCH_QUERY_SUGGESTION_PROMPT` tells the model not to repeat a prior
+  query, but nothing enforced it. Added `_is_duplicate_query()` (casefold +
+  whitespace-collapse comparison against `tried_queries`), skipping the
+  wasted web-search call but still counting against the run's search budget
+  so a model that keeps repeating itself exhausts the budget faster instead
+  of spinning forever. Verified live: re-running the affected (already-
+  poisoned) claim showed `web_searches_used: 2` with zero new entries added
+  to its 14-entry query history.
+
 **Live-tested provider/config corrections along the way, not code bugs**:
 confirmed all three search API keys (Serper/Brave/Tavily) and
 `DEEP_RESEARCH_WIKIPEDIA_CONTACT` are genuinely configured in this
@@ -483,49 +531,95 @@ environment even when the shell itself has the variables set — pass
 curl (a stale process from a failed "address already in use" restart can
 make a health check pass while serving old code/config).
 
-**Priority item found, not fixed — claim extraction loses referential
-context.** Three separate live examples this round (the "AI sabotage"
-mislabeling in the resolution-fix section above, "Goldman Sachs... the deal"
-producing a fabricated search query, and "Lee was found guilty of financial
-misbehavior in 2007" — entity-tagged only as `{"name": "Lee", "type":
-"person"}`, no first name or company, sourced from a YouTube video transcript
-whose actual excerpt reads "*he* was found guilty..." almost certainly
-referring to Lee Kun-hee, Samsung's chairman) show the same root pattern:
-extraction only sees a narrow chunk of a document/transcript at a time, so a
-pronoun or bare surname established earlier in the source never gets
-resolved before a claim is extracted from a later chunk. This is a different
-shape of problem from everything else in this list — not a search, resolution,
-or fetch bug, but an extraction-context/coreference gap — and fixing it
-properly means giving the extraction step more context (a document/video
-summary, or the preceding chunk) before it extracts a claim, which won't
-retroactively repair claims already sitting in the KB with the identity
-already lost. Not started; a good next-session focus.
+**Claim extraction losing referential context — fixed July 29, 2026
+(`PROMPT_VERSION = "v8-preceding-context"`).** Three separate live examples
+surfaced across two sessions (the "AI sabotage" mislabeling in the
+resolution-fix section above, "Goldman Sachs... the deal" producing a
+fabricated search query, and "Lee was found guilty of financial misbehavior
+in 2007" — entity-tagged only as `{"name": "Lee", "type": "person"}`, almost
+certainly Lee Kun-hee, Samsung's chairman) all traced to the same root cause:
+`run_extraction()` sent each chunk to the LLM completely alone, with zero
+visibility into anything established in a previous chunk — no amount of
+prompt wording could fix a reference to something the model was never shown.
+Confirmed live for the Goldman Sachs case by pulling the actual chunk
+sequence: "the deal" only makes sense once you read the *previous* chunk,
+which names Penn Central's $100M commercial-paper offering. Fixed by giving
+every extraction call a ~400-char trailing slice of the immediately
+preceding chunk, labeled as reference-resolution context only ("do NOT
+extract claims from this part"), and extending the prompt's
+resolve-pronouns-and-vague-references rule to cover vague *objects* ("the
+deal", "the risk"), not just pronoun subjects. `chunk_ids`-scoped runs
+(verify_claim's web-fallback extraction on freshly-fetched pages) look up
+the true preceding chunk from the full artifact's chunk list, not just
+whatever precedes it within the requested subset. Tests:
+`test_run_extraction_first_chunk_has_no_preceding_context`,
+`test_run_extraction_uses_true_preceding_chunk_for_scoped_run`.
 
-**Verification backlog sweep — enqueued, then paused, not currently
-running.** A `verification_sweep` job targeting all ~1,100
-`status='unverified'` claims (`only_status="unverified"`, `force=True`,
-`run_max_web_searches=2500`) was run partway (processed a few hundred
-claims, confirmed several of the fixes above working live) before being
-deliberately cancelled mid-run at the user's request, both to apply
-`f279b90`/`0354fce`/`6429979` before spending more of the shared search
-budget on claims that would benefit from them, and then explicitly paused
-("don't start yet") pending further live-claim spot checks. **Whoever picks
-this up next**: the web server process needs restarting with all five
-`DEEP_RESEARCH_*` env vars set explicitly on the launch command (see above)
-to pick up every fix in this section, and `verification_concurrency` should
-be set to `3` via `DEEP_RESEARCH_KB_VERIFICATION_CONCURRENCY=3` to match
-llama.cpp's actual `--parallel 3` (the code default is 2, leaving one
-parallel slot idle the whole sweep). Re-enqueuing is simply another
+This does not retroactively repair claims already sitting in the KB with the
+identity already lost — those were extracted under `v3`/`v7`, before this
+context existed to give the model. Two follow-ups, same night:
+- **42 existing claims deleted** (`delete_claim_cascade`) after retroactively
+  applying the existing, already-tested `has_unresolved_subject()` regex
+  (previously only a gate on newly extracted claims) against every claim
+  already in the KB: 45 matched (pronoun-led subjects like "He left India
+  with...", "They applied for a royal charter..."), 33 `unverified` + 9
+  `deprecated` were deleted, 3 already `status='supported'` were
+  deliberately kept (real verification work behind them, even though the
+  subject is still unresolved — a judgment call, not a rule). This regex
+  only catches pronoun-*subject* patterns; it does not catch vague-*object*
+  cases like "Goldman Sachs... the deal" — no safe, low-false-positive
+  regex was found for that shape, so those remain in the KB until re-extraction
+  replaces them.
+- **Re-extraction backlog identified, not run.** 1,675 current artifacts
+  (1,635 web pages, 39 YouTube videos, 1 pasted conversation) across 1,560
+  sources were extracted under a pre-`v8` prompt version and have more than
+  one chunk (single-chunk artifacts can't have this bug at all, since there's
+  no earlier chunk to lose). Re-extracting all of them would be a large job
+  competing with the verification sweep for the same GPU — deliberately not
+  queued. The full list (source id, artifact id, source type, title, url,
+  prompt_version, chunk_count, claim_count) was written to
+  `/tmp/claude-1000/-home-matheau-code-deep-research/82729eca-1798-4cc3-a7ce-8e66edc686e4/scratchpad/reextraction_backlog.csv`
+  — regenerate with the query in that session's transcript
+  (`extraction_runs` joined to `artifacts`/`sources`, filtered to
+  `prompt_version != 'v8-preceding-context'`, `status IN ('completed',
+  'partial')`, `a.is_current = TRUE`, and chunk count > 1) since that path is
+  under `/tmp` and will not survive indefinitely. Re-extracting is
+  `run_extraction(kb_db, config, artifact_id, force=True)` per artifact;
+  no batch/job-queue entry point for "re-extract this list" exists yet.
+
+**Verification backlog sweep — running, not paused, but structurally
+crash-unsafe.** The `verification_sweep` job/`verification_runs` row pairing
+has no crash recovery: `run_verification_sweep()`'s in-memory task lives only
+inside the web process, so a `systemctl --user restart deep-research.service`
+(needed to deploy new code, including both the concurrency fix and the `v8`
+extraction fix in this same session) silently kills the task while its
+`verification_runs` row stays `status='running'` forever — GPU/llama.cpp go
+idle, `pg_locks`/`pg_stat_activity` show nothing in flight, but nothing
+reports failure. `STALE_RUN_THRESHOLD_HOURS = 9` only self-heals the *next
+time someone tries to start a new run*, which meant a legitimate queued
+attempt (`trigger="cron"` or otherwise) failed with "already in progress"
+instead of silently recovering. Manual recovery, needed twice this session
+after intentional restarts: `KBDatabase.complete_verification_run(run_id,
+error_message=...)` on the orphaned row, then re-enqueue via
 `enqueue_manual_job(db, "verification_sweep", "claim", "unverified_backlog",
-payload={...})` call with the same payload shape — already-resolved claims
-are automatically excluded since they're no longer `status='unverified'`,
-so nothing needs to be tracked manually between runs. Watch for the nightly
+payload={"force": True, "trigger": "manual_unverified_backlog",
+"verification_threshold": 0.0, "only_status": "unverified",
+"run_max_web_searches": 2500})` — already-resolved claims are automatically
+excluded since they're no longer `status='unverified'`. **Known payload
+bug, also found and fixed this session**: an earlier ad-hoc launch script
+used the payload key `"threshold"` instead of `"verification_threshold"` (the
+key `run_verification_sweep`/`jobs.py._run_verification_sweep` actually
+reads) — silently fell back to the config default importance threshold
+(0.8) instead of sweeping the intended full backlog, so every "backlog"
+sweep before this session only ever touched ~700-730 high-importance
+unverified claims instead of the full ~3,890 eligible ones. Not yet fixed
+structurally (e.g. persisting sweep progress into `processing_jobs` itself,
+or resuming an orphaned run on worker startup instead of only on next-run
+attempt) — a good next-session candidate, since this will keep recurring
+every time the service needs restarting mid-sweep. Watch for the nightly
 cron sweep (`trigger="cron"`, fires ~03:00) colliding with a long-running
 manual sweep — only one `verification_sweep`-tracked run can be "in
-progress" at a time (`get_current_verification_run()`), so whichever
-enqueues first blocks the other until it completes or is cancelled via
-`complete_verification_run(run_id, error_message=...)` +
-`request_processing_job_cancel(job_id)`.
+progress" at a time (`get_current_verification_run()`).
 
 ### Existing Foundations Not Yet Integrated Into Routed Collection
 

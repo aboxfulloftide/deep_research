@@ -27,11 +27,22 @@ from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
 
 PROMPT_NAME = "claim_extraction"
-PROMPT_VERSION = "v7-unresolved-pronouns"
+PROMPT_VERSION = "v8-preceding-context"
 EXTRACTION_SCHEMA_VERSION = "v1"
 
+# Trailing slice of the previous chunk given as reference-resolution context
+# only (see PRECEDING_CONTEXT_PREFIX). Chunks are non-overlapping, so a claim
+# like "...it was them who pushed for the deal" can name a specific deal
+# established a chunk earlier ("Goldman Sachs is hired to issue $100 million
+# in commercial paper" for Penn Central) that the current chunk alone never
+# repeats -- observed live in the KB (claim 2cb0131d), where the model had no
+# way to resolve "the deal" from the current chunk text alone. Sized as a
+# fraction of DEFAULT_CHUNK_SIZE_CHARS: enough for the last few sentences
+# without doubling the extraction call's token cost.
+PRECEDING_CONTEXT_CHARS = 400
+
 EXTRACTION_SYSTEM_PROMPT = """/no_think
-You are a claim extraction engine for a knowledge base. You will be given one chunk of text from a source. Extract atomic factual claims made in this chunk.
+You are a claim extraction engine for a knowledge base. You will be given one chunk of text from a source, and may also be given a short block of text from immediately before it. Extract atomic factual claims made in the chunk (never from the preceding-context block itself).
 
 For each claim, output an object with these exact fields:
 - claim_text: a single atomic factual statement, in your own words, not a blob of multiple facts
@@ -50,8 +61,13 @@ Rules:
   pronouns and vague references using the surrounding text: write "The
   Louisiana Purchase cost..." or "The acquisition of United States Shoes
   cost...", never "It cost..." or "The total cost..." with no named subject.
-  If the subject cannot be identified from the chunk, do not extract the
-  claim.
+  This applies to vague objects too, not just subjects -- "pushed for the
+  deal" or "evaluated the risk" must name which deal or risk. A
+  preceding-context block, when given, may be the only place that names it
+  (e.g. an earlier sentence introducing "the Penn Central commercial paper
+  deal" that the chunk itself only calls "the deal") -- use it to fill the
+  reference in. If the subject or object still cannot be identified even
+  with that context, do not extract the claim.
 - Do not extract quiz, test, or exam questions, answer choices, answer keys,
   flash cards, worked exercises, or hypothetical word-problem figures. An
   option marked as the correct answer is still assessment material, not a
@@ -264,7 +280,15 @@ async def run_extraction(
     if artifact is None:
         raise ValueError(f"No such artifact: {artifact_id}")
 
-    chunks = await kb_db.list_chunks(artifact_id)
+    all_chunks = await kb_db.list_chunks(artifact_id)
+    # Built from the full, order-preserved chunk list -- even a chunk_ids-
+    # scoped run (verify_claim's web-fallback) should get the real preceding
+    # text, not just whatever happens to precede it within the subset.
+    preceding_text_by_id = {
+        all_chunks[i]["id"]: all_chunks[i - 1]["chunk_text"][-PRECEDING_CONTEXT_CHARS:]
+        for i in range(1, len(all_chunks))
+    }
+    chunks = all_chunks
     if chunk_ids is not None:
         wanted = set(chunk_ids)
         chunks = [c for c in chunks if c["id"] in wanted]
@@ -305,9 +329,17 @@ async def run_extraction(
                 # Skip the model call as well as its output: these chunks are
                 # structurally answer banks, not merely low-value prose.
                 continue
+            preceding_text = preceding_text_by_id.get(chunk["id"])
+            user_content = f"Chunk text:\n\n{chunk['chunk_text']}"
+            if preceding_text:
+                user_content = (
+                    "Context immediately before this chunk (for resolving pronouns/"
+                    f"references only -- do NOT extract claims from this part):\n\n{preceding_text}"
+                    f"\n\n{user_content}"
+                )
             messages = [
                 {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Chunk text:\n\n{chunk['chunk_text']}"},
+                {"role": "user", "content": user_content},
             ]
             try:
                 resp = await llm.chat(messages)

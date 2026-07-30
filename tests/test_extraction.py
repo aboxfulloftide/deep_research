@@ -137,6 +137,54 @@ async def test_run_extraction_with_chunk_ids_only_processes_those_chunks(kb_db, 
     assert "chunk one" in seen_chunk_texts[0]
 
 
+async def test_run_extraction_first_chunk_has_no_preceding_context(kb_db, monkeypatch):
+    """The first chunk of an artifact has nothing before it, so it must not
+    get a preceding-context block; the second chunk must get the first
+    chunk's text as context -- this is the fix for claims like "...it was
+    them who pushed for the deal" losing the specific deal named a chunk
+    earlier, since chunks are non-overlapping and extraction previously saw
+    only one chunk at a time with no way to resolve such a reference."""
+    artifact, chunks = await _make_artifact_with_chunks(kb_db, ["chunk zero text", "chunk one text"])
+    seen = []
+
+    async def fake_chat(self, messages):
+        seen.append(messages[-1]["content"])
+        return {"choices": [{"message": {"content": "[]"}}]}
+
+    monkeypatch.setattr("deep_research.llm.LLMClient.chat", fake_chat)
+    config = load_config()
+    await run_extraction(kb_db, config, artifact["id"])
+
+    assert "Context immediately before this chunk" not in seen[0]
+    assert "Context immediately before this chunk" in seen[1]
+    assert "chunk zero text" in seen[1]
+
+
+async def test_run_extraction_uses_true_preceding_chunk_for_scoped_run(kb_db, monkeypatch):
+    """A chunk_ids-scoped run (verify_claim's web-fallback) only sends the
+    requested chunk(s) to the LLM for claim extraction, but the preceding-
+    context block must still come from the real previous chunk in the full
+    artifact, not just whatever happens to precede it within the requested
+    subset -- otherwise a scoped run on a later chunk would silently lose
+    reference-resolution context a full-artifact run would have had."""
+    artifact, chunks = await _make_artifact_with_chunks(
+        kb_db, ["chunk zero text", "chunk one text", "chunk two text"],
+    )
+    seen = []
+
+    async def fake_chat(self, messages):
+        seen.append(messages[-1]["content"])
+        return {"choices": [{"message": {"content": "[]"}}]}
+
+    monkeypatch.setattr("deep_research.llm.LLMClient.chat", fake_chat)
+    config = load_config()
+    await run_extraction(kb_db, config, artifact["id"], chunk_ids=[chunks[2]["id"]])
+
+    assert len(seen) == 1
+    assert "chunk one text" in seen[0]
+    assert "chunk two text" in seen[0]
+
+
 async def test_run_extraction_skips_assessment_chunks_without_calling_llm(kb_db, monkeypatch):
     artifact, _ = await _make_artifact_with_chunks(kb_db, [
         """Question
