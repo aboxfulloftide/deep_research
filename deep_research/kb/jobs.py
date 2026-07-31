@@ -503,6 +503,7 @@ class ProcessingJobWorker:
             limit=payload.get("limit"), force=bool(payload.get("force")),
             only_status=payload.get("only_status"),
             run_max_web_searches=payload.get("run_max_web_searches"),
+            max_web_searches=payload.get("max_web_searches"),
         )
         counter_evidence = None
         if payload.get("trigger") == "cron":

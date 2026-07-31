@@ -717,6 +717,7 @@ async def _resolve_new_verification_claims(
 async def verify_claim(
     kb_db: KBDatabase, config: Config, claim_id: str, force: bool = False,
     run_search_budget: _RunSearchBudget | None = None, extraction_model: str | None = None,
+    max_web_searches: int | None = None,
 ) -> VerificationResult:
     claim = await kb_db.get_claim(claim_id)
     if claim is None:
@@ -724,7 +725,10 @@ async def verify_claim(
     if claim["verification_attempted_at"] is not None and not force:
         return VerificationResult(status="skipped", claim_id=claim_id)
 
-    budget = _Budget(config.kb.verification_max_sources_examined, config.kb.verification_max_web_searches)
+    budget = _Budget(
+        config.kb.verification_max_sources_examined,
+        max_web_searches if max_web_searches is not None else config.kb.verification_max_web_searches,
+    )
     own_source_ids = await kb_db.get_claim_source_ids(claim_id)
     examined_source_ids = set(own_source_ids)
     # A claim's own evidence, if it already spans multiple independent
@@ -1015,7 +1019,7 @@ def claim_check_status(claim: dict, threshold: float) -> str:
 async def verify_claims_concurrently(
     kb_db: KBDatabase, config: Config, claims: list[dict], *, force: bool = False,
     concurrency: int | None = None, on_start=None, on_result=None,
-    run_search_budget: _RunSearchBudget | None = None,
+    run_search_budget: _RunSearchBudget | None = None, max_web_searches: int | None = None,
 ) -> list[tuple[dict, str, "VerificationResult | Exception"]]:
     """Verifies many claims at once, up to `concurrency` in flight
     simultaneously (default: config.kb.verification_concurrency, which should
@@ -1056,7 +1060,7 @@ async def verify_claims_concurrently(
             try:
                 result = await verify_claim(
                     kb_db, config, claim["id"], force=force, run_search_budget=run_search_budget,
-                    extraction_model=shared_model,
+                    extraction_model=shared_model, max_web_searches=max_web_searches,
                 )
                 status = result.status
             except Exception as exc:
@@ -1074,6 +1078,7 @@ async def run_verification_sweep(
     kb_db: KBDatabase, config: Config, *, trigger: str, threshold: float | None = None,
     limit: int | None = None, force: bool = False, on_result=None, concurrency: int | None = None,
     only_status: str | None = None, run_max_web_searches: int | None = None,
+    max_web_searches: int | None = None,
 ) -> dict:
     """KB-wide verification sweep: every claim at/above the importance
     threshold gets checked against independent sources, same eligibility
@@ -1095,6 +1100,17 @@ async def run_verification_sweep(
     nightly sweep, not a one-off backlog of hundreds/thousands of claims,
     where the default would exhaust itself in the first few dozen claims and
     leave the rest checked against internal KB data alone.
+
+    max_web_searches overrides config.kb.verification_max_web_searches (the
+    per-claim search cap, distinct from run_max_web_searches above) for this
+    run only. Confirmed live against a real backlog sweep: with the default
+    of 2, 96% of claims that ended up "unverified" had found exactly one
+    supporting source and then hit the per-claim cap before a second search
+    could find a corroborating one -- should_stop() requires supports >= 2
+    or support_weight >= 1.0, and a single non-"official"-tier source alone
+    is never enough (TRUST_TIER_WEIGHTS tops out at 0.75 below "official").
+    The run-level budget was barely touched (676/2500) the whole time, so
+    raising the per-claim cap costs comparatively little of it.
 
     Refuses to start a second sweep while one is already in progress --
     verify_claim makes real LLM calls against a single shared GPU, so
@@ -1155,6 +1171,7 @@ async def run_verification_sweep(
         await verify_claims_concurrently(
             kb_db, config, eligible, force=force, concurrency=concurrency,
             on_start=handle_start, on_result=handle_result, run_search_budget=run_search_budget,
+            max_web_searches=max_web_searches,
         )
         await kb_db.complete_verification_run(run["id"])
     except Exception as exc:

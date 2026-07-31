@@ -208,6 +208,97 @@ async def test_verify_claim_seeds_supports_from_own_evidence(kb_db, monkeypatch)
     assert result.web_searches_used == 0
 
 
+async def test_verify_claim_max_web_searches_overrides_config(kb_db, monkeypatch):
+    """Per-claim search cap override, distinct from run_max_web_searches (the
+    shared run-level budget). Confirmed live against a real backlog sweep:
+    with the config default of 2, 96% of claims that ended up "unverified"
+    had found exactly one supporting source and then hit this per-claim cap
+    before a second search could find a corroborating one -- should_stop()
+    needs supports >= 2 or support_weight >= 1.0, and a single source below
+    "official" trust tier is never enough on its own."""
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "Some claim needing a real search.")
+
+    captured = {}
+    real_budget = v._Budget
+
+    class CapturingBudget(real_budget):
+        def __init__(self, max_sources, max_searches):
+            captured["max_searches"] = max_searches
+            super().__init__(max_sources, max_searches)
+
+    monkeypatch.setattr(v, "_Budget", CapturingBudget)
+
+    async def fake_own_evidence(claim_id):
+        return []
+
+    monkeypatch.setattr(kb_db, "get_claim_own_evidence_sources", fake_own_evidence)
+
+    async def fake_web_search(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(v, "web_search", fake_web_search)
+
+    await v.verify_claim(
+        kb_db, load_config(), claim["id"], extraction_model="stub-model", max_web_searches=7,
+    )
+    assert captured["max_searches"] == 7
+
+
+async def test_verify_claim_defaults_max_web_searches_to_config(kb_db, monkeypatch):
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "Another claim needing a real search.")
+
+    captured = {}
+    real_budget = v._Budget
+
+    class CapturingBudget(real_budget):
+        def __init__(self, max_sources, max_searches):
+            captured["max_searches"] = max_searches
+            super().__init__(max_sources, max_searches)
+
+    monkeypatch.setattr(v, "_Budget", CapturingBudget)
+
+    async def fake_own_evidence(claim_id):
+        return []
+
+    monkeypatch.setattr(kb_db, "get_claim_own_evidence_sources", fake_own_evidence)
+
+    async def fake_web_search(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(v, "web_search", fake_web_search)
+
+    config = load_config()
+    await v.verify_claim(kb_db, config, claim["id"], extraction_model="stub-model")
+    assert captured["max_searches"] == config.kb.verification_max_web_searches
+
+
+async def test_run_verification_sweep_threads_max_web_searches_to_verify_claim(kb_db, monkeypatch):
+    """The per-run override must actually reach verify_claim, not just be
+    accepted and dropped -- run_verification_sweep -> verify_claims_concurrently
+    -> verify_claim is the real call chain a `verification_sweep` job payload
+    goes through (see jobs.py's max_web_searches passthrough)."""
+    from deep_research.config import load_config
+
+    captured = {}
+
+    async def fake_verify_claim(kb_db, config, claim_id, **kwargs):
+        captured["max_web_searches"] = kwargs.get("max_web_searches")
+        return v.VerificationResult(status="unverified", claim_id=claim_id)
+
+    monkeypatch.setattr(v, "verify_claim", fake_verify_claim)
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "A claim eligible for the sweep.", importance_score=0.9)
+
+    await v.run_verification_sweep(
+        kb_db, load_config(), trigger="manual", force=True, only_status="unverified", max_web_searches=9,
+    )
+    assert captured["max_web_searches"] == 9
+
+
 # -- eligibility / check_status: settled vs. inconclusive claims -------------
 # A settled verdict (supported/contradicted/mixed) is never auto-rechecked.
 # An "unverified" (inconclusive) first pass is a different case -- it gets a
