@@ -1194,6 +1194,45 @@ async def test_batch_verification_detects_the_model_once(monkeypatch):
 # while an orphaned manual-trigger run (from a killed dev server) was still
 # marked "running" in the database.
 
+async def test_run_verification_sweep_prioritizes_never_attempted_claims_over_retries(kb_db, monkeypatch):
+    """Confirmed live: a service restart recomputes the eligible list from
+    scratch, and force=True (needed to reopen the whole backlog) bypasses
+    the retry cooldown -- so a high-importance claim that already failed to
+    verify (still unverified) floats right back to the top of a fresh run
+    and gets re-attempted again, while a never-tried, lower-importance claim
+    is starved. One night of restarts left 99% of one run re-checking
+    already-tried claims this way. Never-attempted claims must sort first
+    regardless of importance/topics."""
+    from deep_research.config import load_config
+
+    retried_high_importance, _ = await kb_db.get_or_create_claim(
+        "fact", "A high-importance claim already retried several times.", importance_score=0.95,
+    )
+    async with kb_db.pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE claims SET verification_attempted_at = now() - interval '1 hour' WHERE id = $1",
+            retried_high_importance["id"],
+        )
+
+    fresh_low_importance, _ = await kb_db.get_or_create_claim(
+        "fact", "A low-importance claim never attempted before.", importance_score=0.1,
+    )
+
+    seen_order = []
+
+    async def fake_verify_claims_concurrently(kb_db, config, claims, **kwargs):
+        seen_order.extend(c["id"] for c in claims)
+        return []
+
+    monkeypatch.setattr(v, "verify_claims_concurrently", fake_verify_claims_concurrently)
+
+    await v.run_verification_sweep(
+        kb_db, load_config(), trigger="manual", force=True, only_status="unverified", threshold=0.0,
+    )
+
+    assert seen_order.index(fresh_low_importance["id"]) < seen_order.index(retried_high_importance["id"])
+
+
 async def test_run_verification_sweep_refuses_concurrent_run(kb_db):
     import pytest
 

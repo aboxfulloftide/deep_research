@@ -1267,11 +1267,27 @@ async def run_verification_sweep(
         )
 
     all_claims = await kb_db.list_claims(limit=10000)
-    # Work on attached, high-importance claims first. If the run is bounded
-    # by time or its shared search quota, the claims users deliberately put
-    # in topics receive the most valuable coverage.
+    # Never-attempted claims always come before already-attempted-but-still-
+    # unverified ones, regardless of topic/importance -- confirmed live: a
+    # service restart recomputes this list from scratch, and force=True
+    # (needed to reopen the whole backlog) deliberately bypasses the retry
+    # cooldown, so without this a claim just re-attempted seconds before a
+    # restart is immediately eligible again and, being high-importance/
+    # topic-attached, floats right back to the top -- four restarts in one
+    # night left 99% of one run's claims re-checking the same already-tried
+    # claims (one with 20 prior search queries across earlier attempts)
+    # while genuinely untried claims lower in the list were never reached.
+    # Within each of those two groups, still work on attached, high-
+    # importance claims first -- if the run is bounded by time or its shared
+    # search quota, the claims users deliberately put in topics receive the
+    # most valuable coverage.
     all_claims.sort(
-        key=lambda claim: (bool(claim.get("topics")), claim.get("importance_score") or 0), reverse=True,
+        key=lambda claim: (
+            claim.get("verification_attempted_at") is None,
+            bool(claim.get("topics")),
+            claim.get("importance_score") or 0,
+        ),
+        reverse=True,
     )
     eff_threshold = threshold if threshold is not None else config.kb.verification_importance_threshold
     eligible = [
