@@ -621,6 +621,63 @@ cron sweep (`trigger="cron"`, fires ~03:00) colliding with a long-running
 manual sweep — only one `verification_sweep`-tracked run can be "in
 progress" at a time (`get_current_verification_run()`).
 
+**Related, more dangerous bug found the next session**: the manual recovery
+above only ever completed the `verification_runs` row, never the underlying
+`processing_jobs` row (which stayed `status='running'` with a `lease_seconds
+= 900` lease that `jobs.py._run_verification_sweep` sets once at the start
+and never renews — any sweep running longer than 15 minutes has an expired
+lease for the rest of its life). On the next restart, the worker's own
+"claim next job" query reclaims any `status='running'` job whose lease has
+expired, and re-ran the stale job from scratch **using its original
+payload** — confirmed live: a job enqueued with the old (pre-fix) payload
+got silently resumed 10 seconds before a properly-re-enqueued replacement
+job could even be created, and since only one `verification_sweep` can hold
+the worker's GPU advisory lock at a time, the correct new job sat queued
+indefinitely behind the stale one. Fixed for tonight by also calling
+`KBDatabase.finish_processing_job(job_id, "cancelled", ...)` on the job
+itself (not just the run row) before every restart, but the structural gap
+is unfixed: **any future restart during a long-running verification_sweep
+job will repeat this** unless the lease gets renewed periodically (e.g. from
+`run_verification_sweep`'s per-claim `on_result` callback) or the worker's
+reclaim query is taught to distinguish "abandoned" from "still legitimately
+running, just past a stale timer." Good next-session fix.
+
+**`max_web_searches` raised to 4, tried live, reverted.** Suspected (from a
+253-claim sample) that the per-claim search cap of 2 was cutting claims off
+one search short of a second corroborating source. Tried at 4 against a
+larger, real 168-claim sample and found to be a net loss on its own:
+throughput roughly halved (7.4 vs 14.7 claims/hr) and the supported rate
+also dropped (29% vs 52%). Root cause: `_suggest_search_query`'s one-at-a-
+time prompt mostly produced near-duplicate rewordings once a claim's easy
+angles were exhausted ("...official statistics" / "...official data" /
+"...verified data" / "...reputable sources"), and exact-string dedup
+(`_is_duplicate_query`) doesn't catch that — so the extra budget bought
+mostly wasted searches, not new evidence. Reverted back to the config
+default of 2.
+
+**`diversify_queries` mode added, not yet run.** The real fix the above
+pointed to: `_suggest_diverse_search_queries` asks for a batch of distinct
+angles in one call, and `_dedupe_queries_by_similarity` filters candidates
+by embedding cosine similarity (not just exact-string match) against both
+tried history and each other, so a raised cap can actually buy new angles
+instead of rewordings. Wired through `verify_claim(diversify_queries=...)` →
+`verify_claims_concurrently` → `run_verification_sweep` → the
+`verification_sweep` job payload, defaulting to `False` everywhere (zero
+effect on the routine nightly sweep or the currently-running backlog sweep).
+**Deliberately not run yet** — planned as a dedicated recheck pass over
+`only_status="unverified"` with `max_web_searches=3` and
+`diversify_queries=True`, to run only after the current plain backlog sweep
+finishes:
+```python
+enqueue_manual_job(kb_db, "verification_sweep", "claim", "unverified_recheck", payload={
+    "force": True, "trigger": "manual_unverified_recheck", "only_status": "unverified",
+    "max_web_searches": 3, "diversify_queries": True, "run_max_web_searches": <budget>,
+})
+```
+Not validated live — measure it the same way the `max_web_searches=4` experiment
+was measured (throughput and supported-rate over a real sample of at least
+~150 claims) before trusting the combination is actually better.
+
 ### Existing Foundations Not Yet Integrated Into Routed Collection
 
 - `deep_research/tools/kb_search.py` provides hybrid full-text and semantic
