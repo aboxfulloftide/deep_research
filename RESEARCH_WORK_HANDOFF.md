@@ -678,6 +678,26 @@ Not validated live — measure it the same way the `max_web_searches=4` experime
 was measured (throughput and supported-rate over a real sample of at least
 ~150 claims) before trusting the combination is actually better.
 
+**Sort order fixed: never-attempted claims now prioritized over retries.**
+The declining supported rate across this session's restarts had a second,
+bigger cause than the search-cap experiment above: `run_verification_sweep`
+recomputes its eligible list from scratch every run, sorted only by
+`(topics, importance)` — with no regard for whether a claim had already been
+attempted. Since `force=True` (needed to reopen the whole backlog) bypasses
+the retry cooldown, a claim just re-attempted seconds before a restart was
+immediately eligible again and, being high-importance/topic-attached,
+floated right back to the top of the next run. Confirmed live: of 94 claims
+processed in one run, 93 (99%) already had 6-20 prior search queries in
+their history (one claim had been attempted enough times across the night's
+restarts to accumulate 20), and only 1 was a genuine first attempt — the
+sweep was stuck re-hammering the same already-failed "hard core" instead of
+reaching fresh claims lower in the list. Fixed by adding
+`claim.get("verification_attempted_at") is None` as the primary sort key,
+ahead of the existing `(topics, importance)` ordering, which is now only a
+tiebreaker within each of those two groups. Lands automatically on the next
+restart/re-enqueue; did not require restarting the currently-running sweep
+to deploy.
+
 ### Existing Foundations Not Yet Integrated Into Routed Collection
 
 - `deep_research/tools/kb_search.py` provides hybrid full-text and semantic
