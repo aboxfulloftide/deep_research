@@ -410,6 +410,103 @@ def _is_duplicate_query(query: str, tried_queries: list[str]) -> bool:
     return any(normalized == _normalize_search_query(prior) for prior in tried_queries)
 
 
+DIVERSE_SEARCH_QUERY_PROMPT = """/no_think
+You are choosing several different web search queries to help verify a factual claim -- each one exploring a genuinely different angle, not minor rewordings of each other.
+
+Vary the strategy across queries: one could focus on a specific number/date/entity named in the claim, another on alternate terminology a source might actually use, another on the broader event or context the claim is part of, another on a person or organization directly involved. Do not produce two queries that just swap in synonyms for each other -- if the claim only supports one genuine angle, return fewer queries rather than padding with near-duplicates.
+
+If additional context is given, at least one query must target that specific angle, not just the literal claim text. If prior queries are listed, none of your queries may be a close rephrasing of any of them -- but never invent a placeholder like "[specific event]" or "[time period]" for a detail the claim doesn't actually give you. If the claim itself never names the specific company/deal/date, you cannot search for one either.
+
+Return ONLY a JSON object: {"queries": ["...", "..."]}
+"""
+
+_NEAR_DUPLICATE_QUERY_SIMILARITY_THRESHOLD = 0.92
+
+
+async def _suggest_diverse_search_queries(
+    llm: LLMClient, claim_text: str, tried_queries: list[str], context: str | None = None,
+    n: int = 3,
+) -> list[str]:
+    """Batch counterpart to _suggest_search_query: asks for up to `n`
+    genuinely distinct query angles in one call instead of one query per
+    call. Exists because the one-at-a-time prompt, once a claim's easy
+    angles are exhausted, tends to produce trivial rewordings of the same
+    search rather than admitting there's nothing more to try -- observed
+    live across a real backlog sweep: claims stuck at "unverified" after
+    using their full per-claim search budget had query histories like
+    "...official statistics" / "...official data" / "...verified data" /
+    "...reputable sources", all effectively the same search. Deliberately
+    conservative on failure (empty list on any parse issue), same as
+    _suggest_search_query's fallback -- the caller falls back to the
+    single-query path when this returns nothing usable."""
+    parts = [f"Claim: {claim_text}"]
+    if context:
+        parts.append(f"Additional context (what to specifically look for): {context}")
+    if tried_queries:
+        tried = "\n".join(f"- {q}" for q in tried_queries)
+        parts.append(f"Queries already tried (do not repeat or closely rephrase these):\n{tried}")
+    parts.append(f"Suggest up to {n} genuinely different queries.")
+    messages = [
+        {"role": "system", "content": DIVERSE_SEARCH_QUERY_PROMPT},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+    resp = await llm.chat(messages)
+    content = resp["choices"][0]["message"]["content"] or ""
+    parsed = _parse_json_object(content)
+    raw_queries = parsed.get("queries")
+    if not isinstance(raw_queries, list):
+        return []
+    queries: list[str] = []
+    for candidate in raw_queries:
+        if len(queries) >= n:
+            break
+        query = candidate.strip() if isinstance(candidate, str) and candidate.strip() else ""
+        if not query or _PLACEHOLDER_BRACKET_RE.search(query):
+            continue
+        queries.append(query)
+    return queries
+
+
+async def _dedupe_queries_by_similarity(
+    candidates: list[str], tried_queries: list[str], base_url: str, model: str,
+    threshold: float = _NEAR_DUPLICATE_QUERY_SIMILARITY_THRESHOLD,
+) -> list[str]:
+    """Filters `candidates` down to ones that are neither an exact duplicate
+    (_is_duplicate_query) nor an embedding-near-duplicate of anything already
+    tried, or of an earlier-accepted candidate in this same batch -- exact-
+    match text comparison alone lets through rewordings like "X official
+    statistics" vs "X official data" that return near-identical search
+    results. Best-effort: an unreachable embedding backend degrades to
+    exact-match dedup only, same fallback used elsewhere in this module
+    (_rank_candidates_by_similarity, _rank_chunks_by_similarity) rather than
+    failing the whole verification attempt over a non-critical signal."""
+    exact_filtered = [c for c in candidates if not _is_duplicate_query(c, tried_queries)]
+    if not exact_filtered:
+        return []
+    if not tried_queries:
+        base_vecs: list[list[float]] = []
+    else:
+        try:
+            base_vecs = await embed_texts(tried_queries, base_url, model)
+        except Exception:
+            return exact_filtered
+    try:
+        candidate_vecs = await embed_texts(exact_filtered, base_url, model)
+    except Exception:
+        return exact_filtered
+
+    accepted: list[str] = []
+    accepted_vecs: list[list[float]] = []
+    for candidate, vec in zip(exact_filtered, candidate_vecs):
+        if any(cosine(vec, other) >= threshold for other in base_vecs):
+            continue
+        if any(cosine(vec, other) >= threshold for other in accepted_vecs):
+            continue
+        accepted.append(candidate)
+        accepted_vecs.append(vec)
+    return accepted
+
+
 async def _rank_candidates_by_similarity(
     config: Config, claim: dict, candidates: list[dict],
 ) -> list[tuple[dict, float]]:
@@ -717,7 +814,7 @@ async def _resolve_new_verification_claims(
 async def verify_claim(
     kb_db: KBDatabase, config: Config, claim_id: str, force: bool = False,
     run_search_budget: _RunSearchBudget | None = None, extraction_model: str | None = None,
-    max_web_searches: int | None = None,
+    max_web_searches: int | None = None, diversify_queries: bool = False,
 ) -> VerificationResult:
     claim = await kb_db.get_claim(claim_id)
     if claim is None:
@@ -779,6 +876,7 @@ async def verify_claim(
         # Phase 2: fall back to the internet only if internal coverage was thin
         # and budget remains.
         snapshot_store = SnapshotStore(config.kb_snapshot_dir)
+        pending_diverse_queries: list[str] = []
         while not budget.should_stop() and budget.searches_remaining():
             if run_search_budget is not None and not await run_search_budget.reserve():
                 break
@@ -792,10 +890,30 @@ async def verify_claim(
                 # point is that the literal claim text alone might not even
                 # mention the angle a human wants checked. Either way, ask
                 # the LLM for a query instead of using the raw claim text.
-                with _timed(timings, "llm_classify"):
-                    query = await _suggest_search_query(
-                        llm, claim["canonical_text"], tried_queries, verification_context,
-                    )
+                if diversify_queries and not pending_diverse_queries:
+                    # Generate a fresh batch of genuinely distinct angles up
+                    # front rather than one query per call -- the one-at-a-
+                    # time prompt, once a claim's easy angles run out, tends
+                    # to produce trivial rewordings instead (see
+                    # DIVERSE_SEARCH_QUERY_PROMPT/_dedupe_queries_by_similarity
+                    # docstrings for the live data that motivated this).
+                    remaining = max(1, budget.max_searches - budget.web_searches_used + 1)
+                    with _timed(timings, "llm_classify"):
+                        candidates = await _suggest_diverse_search_queries(
+                            llm, claim["canonical_text"], tried_queries, verification_context,
+                            n=remaining,
+                        )
+                        pending_diverse_queries = await _dedupe_queries_by_similarity(
+                            candidates, tried_queries,
+                            config.kb.embedding_base_url, config.kb.embedding_model,
+                        )
+                if pending_diverse_queries:
+                    query = pending_diverse_queries.pop(0)
+                else:
+                    with _timed(timings, "llm_classify"):
+                        query = await _suggest_search_query(
+                            llm, claim["canonical_text"], tried_queries, verification_context,
+                        )
                 # Google CSE and Startpage are opt-in for genuinely alternate
                 # LLM-generated queries only. If parsing failed and the helper
                 # fell back to the literal claim, keep the conservative engine
@@ -1020,6 +1138,7 @@ async def verify_claims_concurrently(
     kb_db: KBDatabase, config: Config, claims: list[dict], *, force: bool = False,
     concurrency: int | None = None, on_start=None, on_result=None,
     run_search_budget: _RunSearchBudget | None = None, max_web_searches: int | None = None,
+    diversify_queries: bool = False,
 ) -> list[tuple[dict, str, "VerificationResult | Exception"]]:
     """Verifies many claims at once, up to `concurrency` in flight
     simultaneously (default: config.kb.verification_concurrency, which should
@@ -1061,6 +1180,7 @@ async def verify_claims_concurrently(
                 result = await verify_claim(
                     kb_db, config, claim["id"], force=force, run_search_budget=run_search_budget,
                     extraction_model=shared_model, max_web_searches=max_web_searches,
+                    diversify_queries=diversify_queries,
                 )
                 status = result.status
             except Exception as exc:
@@ -1078,7 +1198,7 @@ async def run_verification_sweep(
     kb_db: KBDatabase, config: Config, *, trigger: str, threshold: float | None = None,
     limit: int | None = None, force: bool = False, on_result=None, concurrency: int | None = None,
     only_status: str | None = None, run_max_web_searches: int | None = None,
-    max_web_searches: int | None = None,
+    max_web_searches: int | None = None, diversify_queries: bool = False,
 ) -> dict:
     """KB-wide verification sweep: every claim at/above the importance
     threshold gets checked against independent sources, same eligibility
@@ -1103,14 +1223,31 @@ async def run_verification_sweep(
 
     max_web_searches overrides config.kb.verification_max_web_searches (the
     per-claim search cap, distinct from run_max_web_searches above) for this
-    run only. Confirmed live against a real backlog sweep: with the default
-    of 2, 96% of claims that ended up "unverified" had found exactly one
-    supporting source and then hit the per-claim cap before a second search
-    could find a corroborating one -- should_stop() requires supports >= 2
-    or support_weight >= 1.0, and a single non-"official"-tier source alone
-    is never enough (TRUST_TIER_WEIGHTS tops out at 0.75 below "official").
-    The run-level budget was barely touched (676/2500) the whole time, so
-    raising the per-claim cap costs comparatively little of it.
+    run only. First suspected as the cause of a high unverified rate: with
+    the default of 2, 96% of claims that ended up "unverified" had found
+    exactly one supporting source and then hit the per-claim cap before a
+    second search could find a corroborating one (should_stop() requires
+    supports >= 2 or support_weight >= 1.0, and a single non-"official"-tier
+    source alone is never enough). Tried live at 4 against a real ~170-claim
+    sample and found to be a net loss on its own -- throughput roughly
+    halved (7.4 vs 14.7 claims/hr) and the supported rate also dropped (29%
+    vs 52%), because the one-at-a-time _suggest_search_query prompt mostly
+    produced near-duplicate rewordings ("...official statistics" / "...
+    official data" / "...verified data") once a claim's easy angles were
+    exhausted, rather than genuinely new search angles -- see
+    diversify_queries below for the actual fix this pointed to. Reverted
+    back to the config default (2) after that result.
+
+    diversify_queries switches from asking for one search query at a time to
+    _suggest_diverse_search_queries's batch prompt plus
+    _dedupe_queries_by_similarity's embedding-based near-duplicate filter, so
+    a raised max_web_searches actually buys distinct angles instead of
+    rewordings of the same failed search. Intended to be combined with
+    max_web_searches=3 as a dedicated recheck pass over the existing
+    unverified backlog (only_status="unverified") run *after* the current
+    plain backlog sweep finishes, not as this sweep's own default -- not
+    validated live yet, so don't assume the combination is actually better
+    until it's been run and measured the same way the above was.
 
     Refuses to start a second sweep while one is already in progress --
     verify_claim makes real LLM calls against a single shared GPU, so
@@ -1171,7 +1308,7 @@ async def run_verification_sweep(
         await verify_claims_concurrently(
             kb_db, config, eligible, force=force, concurrency=concurrency,
             on_start=handle_start, on_result=handle_result, run_search_budget=run_search_budget,
-            max_web_searches=max_web_searches,
+            max_web_searches=max_web_searches, diversify_queries=diversify_queries,
         )
         await kb_db.complete_verification_run(run["id"])
     except Exception as exc:

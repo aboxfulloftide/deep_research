@@ -299,6 +299,28 @@ async def test_run_verification_sweep_threads_max_web_searches_to_verify_claim(k
     assert captured["max_web_searches"] == 9
 
 
+async def test_run_verification_sweep_threads_diversify_queries_to_verify_claim(kb_db, monkeypatch):
+    """Same passthrough requirement as max_web_searches, for the dedicated
+    unverified-recheck pass (max_web_searches=3 + diversify_queries=True) --
+    see jobs.py's diversify_queries passthrough."""
+    from deep_research.config import load_config
+
+    captured = {}
+
+    async def fake_verify_claim(kb_db, config, claim_id, **kwargs):
+        captured["diversify_queries"] = kwargs.get("diversify_queries")
+        return v.VerificationResult(status="unverified", claim_id=claim_id)
+
+    monkeypatch.setattr(v, "verify_claim", fake_verify_claim)
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "Another claim eligible for the sweep.", importance_score=0.9)
+
+    await v.run_verification_sweep(
+        kb_db, load_config(), trigger="manual", force=True, only_status="unverified", diversify_queries=True,
+    )
+    assert captured["diversify_queries"] is True
+
+
 # -- eligibility / check_status: settled vs. inconclusive claims -------------
 # A settled verdict (supported/contradicted/mixed) is never auto-rechecked.
 # An "unverified" (inconclusive) first pass is a different case -- it gets a
@@ -752,6 +774,185 @@ def test_is_duplicate_query_false_for_a_genuinely_new_query():
 
 def test_is_duplicate_query_false_for_empty_history():
     assert v._is_duplicate_query("Any query at all", []) is False
+
+
+# -- _suggest_diverse_search_queries: batch query generation ----------------
+# Built for a dedicated "recheck unverified claims" pass, not yet wired into
+# the routine backlog sweep -- see run_verification_sweep's diversify_queries
+# docstring.
+
+async def test_suggest_diverse_search_queries_returns_llm_suggestions():
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {
+                "content": '{"queries": ["angle one query", "angle two query"]}',
+            }}]}
+
+    result = await v._suggest_diverse_search_queries(FakeLLM(), "Some claim text.", [], n=3)
+    assert result == ["angle one query", "angle two query"]
+
+
+async def test_suggest_diverse_search_queries_caps_to_n():
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": '{"queries": ["a", "b", "c", "d", "e"]}'}}]}
+
+    result = await v._suggest_diverse_search_queries(FakeLLM(), "Some claim text.", [], n=2)
+    assert result == ["a", "b"]
+
+
+async def test_suggest_diverse_search_queries_returns_empty_on_garbage_response():
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": "not json"}}]}
+
+    result = await v._suggest_diverse_search_queries(FakeLLM(), "Some claim text.", [])
+    assert result == []
+
+
+async def test_suggest_diverse_search_queries_filters_placeholder_brackets_and_blanks():
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {"content": json.dumps({
+                "queries": [
+                    "a genuine query",
+                    "",
+                    "the deal in [specific event or time period]",
+                    "   ",
+                    "another genuine query",
+                ],
+            })}}]}
+
+    result = await v._suggest_diverse_search_queries(FakeLLM(), "Some claim text.", [])
+    assert result == ["a genuine query", "another genuine query"]
+
+
+# -- _dedupe_queries_by_similarity: near-duplicate rewording detection ------
+# Observed live: raising the per-claim search cap mostly bought near-duplicate
+# rewordings ("...official statistics" / "...official data" / "...verified
+# data") of the same failed search, not genuinely new angles -- exact-string
+# dedup alone doesn't catch this since the wording differs each time.
+
+async def test_dedupe_queries_by_similarity_drops_near_duplicate_of_tried_query(monkeypatch):
+    vectors = {
+        "tried query": [1.0, 0.0],
+        "near-duplicate rewording": [0.99, 0.1411],  # cosine ~0.99 to "tried query"
+        "genuinely different angle": [0.0, 1.0],
+    }
+
+    async def fake_embed_texts(texts, base_url, model):
+        return [vectors[t] for t in texts]
+
+    monkeypatch.setattr(v, "embed_texts", fake_embed_texts)
+
+    result = await v._dedupe_queries_by_similarity(
+        ["near-duplicate rewording", "genuinely different angle"],
+        ["tried query"], "http://fake", "fake-model",
+    )
+    assert result == ["genuinely different angle"]
+
+
+async def test_dedupe_queries_by_similarity_drops_near_duplicates_within_the_batch(monkeypatch):
+    vectors = {
+        "first phrasing": [1.0, 0.0],
+        "second phrasing of the same thing": [0.99, 0.1411],
+        "actually different angle": [0.0, 1.0],
+    }
+
+    async def fake_embed_texts(texts, base_url, model):
+        return [vectors[t] for t in texts]
+
+    monkeypatch.setattr(v, "embed_texts", fake_embed_texts)
+
+    result = await v._dedupe_queries_by_similarity(
+        ["first phrasing", "second phrasing of the same thing", "actually different angle"],
+        [], "http://fake", "fake-model",
+    )
+    assert result == ["first phrasing", "actually different angle"]
+
+
+async def test_dedupe_queries_by_similarity_drops_exact_duplicates_without_embedding(monkeypatch):
+    async def fail_if_called(texts, base_url, model):
+        raise AssertionError("should not need embeddings once every candidate is an exact duplicate")
+
+    monkeypatch.setattr(v, "embed_texts", fail_if_called)
+
+    result = await v._dedupe_queries_by_similarity(
+        ["Tried Query"], ["tried query"], "http://fake", "fake-model",
+    )
+    assert result == []
+
+
+async def test_dedupe_queries_by_similarity_falls_back_to_exact_match_only_on_embed_failure(monkeypatch):
+    async def failing_embed_texts(texts, base_url, model):
+        raise RuntimeError("embedding backend unreachable")
+
+    monkeypatch.setattr(v, "embed_texts", failing_embed_texts)
+
+    result = await v._dedupe_queries_by_similarity(
+        ["candidate one", "candidate two"], ["tried query"], "http://fake", "fake-model",
+    )
+    assert result == ["candidate one", "candidate two"]
+
+
+async def test_verify_claim_diversify_queries_drains_batch_across_iterations(kb_db, monkeypatch):
+    """diversify_queries=True should call the batch suggester once (not once
+    per search, unlike the default single-query path) and drain its results
+    one at a time across loop iterations, only asking for a fresh batch once
+    that one is exhausted. The very first search always uses the literal
+    claim text regardless of this flag, same as the default path -- the
+    batch suggester only kicks in from the second search onward, once
+    tried_queries is non-empty."""
+    from dataclasses import dataclass
+
+    from deep_research.config import load_config
+    from deep_research.models import SearchResult
+
+    claim, _ = await kb_db.get_or_create_claim(
+        "fact", "A distinctive test claim about zorbnaxian trade tariffs in 1994.",
+    )
+    config = load_config()
+    config.kb.verification_max_web_searches = 3
+
+    search_calls: list[str] = []
+
+    async def fake_web_search(query, cfg, **kwargs):
+        search_calls.append(query)
+        return [SearchResult(title="Irrelevant", url=f"https://example.test/{len(search_calls)}", snippet="")]
+
+    suggest_diverse_calls = 0
+
+    async def fake_suggest_diverse(llm, claim_text, tried_queries, context=None, n=3):
+        nonlocal suggest_diverse_calls
+        suggest_diverse_calls += 1
+        return ["diverse query one", "diverse query two"]
+
+    async def fake_dedupe(candidates, tried_queries, base_url, model, threshold=0.92):
+        return list(candidates)
+
+    async def fail_if_called_single(llm, claim_text, tried_queries, context=None):
+        raise AssertionError("should not fall back to the single-query suggester while the batch has queries left")
+
+    @dataclass
+    class _FailedIngest:
+        status: str = "failed"
+        source_id: str | None = None
+
+    async def fake_ingest_web_page(*args, **kwargs):
+        return _FailedIngest()
+
+    monkeypatch.setattr(v, "web_search", fake_web_search)
+    monkeypatch.setattr(v, "_suggest_diverse_search_queries", fake_suggest_diverse)
+    monkeypatch.setattr(v, "_dedupe_queries_by_similarity", fake_dedupe)
+    monkeypatch.setattr(v, "_suggest_search_query", fail_if_called_single)
+    monkeypatch.setattr(v, "ingest_web_page", fake_ingest_web_page)
+
+    await v.verify_claim(
+        kb_db, config, claim["id"], extraction_model="stub-model", diversify_queries=True,
+    )
+
+    assert suggest_diverse_calls == 1
+    assert search_calls == [claim["canonical_text"], "diverse query one", "diverse query two"]
 
 
 async def test_verify_claim_skips_web_search_for_a_repeated_query(kb_db, monkeypatch):

@@ -504,6 +504,7 @@ class ProcessingJobWorker:
             only_status=payload.get("only_status"),
             run_max_web_searches=payload.get("run_max_web_searches"),
             max_web_searches=payload.get("max_web_searches"),
+            diversify_queries=bool(payload.get("diversify_queries")),
         )
         counter_evidence = None
         if payload.get("trigger") == "cron":
