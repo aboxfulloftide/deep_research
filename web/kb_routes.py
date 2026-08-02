@@ -428,12 +428,24 @@ async def get_claim(claim_id: str):
         if enriched:
             counter_claims.append({**enriched, "candidate_id": c["candidate_id"], "reason": c["reason"], "score": c["score"]})
 
+    # Claims settled via verify_claim's web-fallback no longer persist the
+    # proving/disproving claim as a separate row (see
+    # _resolve_new_verification_claims -- a claim can only live on a source
+    # the user added), so supporting_claims/contradicting_claims above come
+    # back empty for anything verified this way. verification_notes.evidence
+    # is the durable trail for that case instead: {url, title, quote,
+    # relationship, snapshot_path} recorded before the auxiliary claim/source
+    # were deleted (or backfilled retroactively for claims settled before
+    # this existed -- see backfill_supported_claim_evidence).
+    web_evidence = (claim.get("verification_notes") or {}).get("evidence") or []
+
     return {
         "claim": _serialize(claim),
         "evidence": _serialize(evidence),
         "supporting_claims": _serialize(supporting_claims),
         "contradicting_claims": _serialize(contradicting_claims),
         "counter_claims": _serialize(counter_claims),
+        "web_evidence": web_evidence,
     }
 
 

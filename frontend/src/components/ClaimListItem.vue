@@ -1,7 +1,7 @@
 <script setup>
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ShieldCheck, ChevronDown, ChevronRight, Star, ThumbsUp, ThumbsDown, Flag } from 'lucide-vue-next'
+import { ShieldCheck, ChevronDown, ChevronRight, Star, ThumbsUp, ThumbsDown, Flag, Globe } from 'lucide-vue-next'
 import { useApi } from '../composables/useApi.js'
 
 const props = defineProps({
@@ -383,10 +383,40 @@ async function runCounterEvidence() {
           </div>
         </template>
 
+        <template v-if="detail.web_evidence?.length">
+          <p class="text-xs font-semibold text-gray-500 dark:text-gray-400 mb-1 flex items-center gap-1">
+            <Globe class="w-3.5 h-3.5" />
+            Web evidence
+          </p>
+          <div class="space-y-2 mb-3">
+            <div
+              v-for="(ev, i) in detail.web_evidence"
+              :key="i"
+              class="text-xs border-l-2 pl-2"
+              :class="ev.relationship === 'contradicts' ? 'border-red-300 dark:border-red-700' : 'border-green-300 dark:border-green-700'"
+            >
+              <a :href="ev.url" target="_blank" rel="noopener noreferrer" class="text-blue-600 dark:text-blue-400 hover:underline font-medium">
+                {{ ev.title || ev.url }}
+              </a>
+              <p v-if="ev.quote" class="text-gray-500 dark:text-gray-400 italic">"{{ ev.quote }}"</p>
+              <span
+                class="inline-block mt-0.5 px-1 py-0.5 rounded uppercase text-[10px] font-medium"
+                :class="ev.relationship === 'contradicts'
+                  ? 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300'
+                  : 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300'"
+              >
+                {{ ev.relationship }}
+              </span>
+              <span v-if="ev.snapshot_path" class="text-gray-400 dark:text-gray-500 ml-1">(archived copy saved)</span>
+            </div>
+          </div>
+        </template>
+
         <p
           v-if="['supported', 'contradicted', 'mixed'].includes(localClaim.status)
             && !detail.supporting_claims?.length
-            && !detail.contradicting_claims?.length"
+            && !detail.contradicting_claims?.length
+            && !detail.web_evidence?.length"
           class="text-xs text-gray-400 dark:text-gray-500 mb-3 italic"
         >
           Verified before this detail was tracked -- re-verify (force) to see the specific sources.
