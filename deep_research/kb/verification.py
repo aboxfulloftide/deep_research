@@ -796,39 +796,29 @@ async def _examine_candidates(
                 contradiction_ids.append(other_claim["id"])
 
 
-async def _resolve_new_verification_claims(
-    kb_db: KBDatabase, new_claim_ids: list[str], kept_ids: set[str], topics: list[dict], source_id: str,
-) -> None:
-    """Extracting a scraped page's top chunks can promote several new
-    claims, but only the one an LLM comparison pass actually classified as
-    supports/contradicts (kept_ids) is worth keeping -- the rest are
-    tangential facts from the same page that were never established as
-    relevant to anything, and get deleted outright. The keeper (and the
-    source it came from -- attach_source_to_topic sweeps in every claim
-    that source still has evidence for, which by this point is just the
-    keeper) gets attached to whatever topic(s) the claim being verified
-    already belongs to, so both are visible in context on the Sources page
-    too, not just floating unexplained. The keeper claim is also excluded
-    from auto-verification by default so it doesn't itself spawn another
-    generation of checks.
+async def _resolve_new_verification_claims(kb_db: KBDatabase, new_claim_ids: list[str]) -> None:
+    """Extracting a scraped page's top chunks to compare against the claim
+    being verified can promote several new claims -- none of them are worth
+    keeping as persistent KB claims, regardless of whether an LLM comparison
+    pass classified one as supports/contradicts, because their source was
+    never something a user added. The verdict itself (supports/contradicts,
+    recorded on the claim actually being verified) is what survives; a
+    second, independent claim tied to a page nobody chose to add should not.
+    The caller strips these ids from supporting_ids/contradiction_ids right
+    after this call, and the now-evidence-less source gets cleaned up
+    separately (see delete_source_cascade in verify_claim's finally block).
 
     Without this, verifying claim A pulls in claims B and C from other pages
-    just to compare against A; if B and C then also meet the importance
-    threshold, the next sweep verifies *them* too, pulling in D, E, F, G...
-    -- unbounded compounding growth with no way to ever finish, discovered
-    from a real KB where a single night's cron run left 1500+ such claims,
-    almost none of them ever established as relevant to anything, all
-    floating with no topic and all eligible to keep the chain going."""
+    just to compare against A; if the comparison kept one of them as a
+    "prover," it used to persist as its own claim excluded from
+    auto-verification -- confirmed live: 1,088 claims (26% of the KB)
+    existed only on auto-fetched verification-evidence sources, 66 of them
+    already marked "supported" despite the user never having added that
+    page. Earlier still, before that exclusion existed at all, a single
+    night's cron run left 1500+ such claims eligible for their own
+    auto-verification, pulling in D, E, F, G... with no way to ever finish."""
     for new_claim_id in new_claim_ids:
-        if new_claim_id not in kept_ids:
-            await kb_db.delete_claim_cascade(new_claim_id)
-
-    kept_this_source = [c for c in new_claim_ids if c in kept_ids]
-    if kept_this_source:
-        for new_claim_id in kept_this_source:
-            await kb_db.set_claim_verification_override(new_claim_id, "exclude")
-        for topic in topics:
-            await kb_db.attach_source_to_topic(topic["id"], source_id, link_reason="verification_evidence")
+        await kb_db.delete_claim_cascade(new_claim_id)
 
 
 async def verify_claim(
@@ -866,11 +856,6 @@ async def verify_claim(
     # to settle this claim once.
     tried_queries: list[str] = list((claim.get("verification_notes") or {}).get("web_search_queries") or [])
     verification_context = claim.get("verification_context")
-    # So any claim discovered as supporting/contradicting evidence during the
-    # web-fallback below can be attached to the same topic(s) as the claim
-    # being verified, instead of floating with no visible context for why it
-    # exists (see _quarantine_new_verification_claims).
-    own_topics = await kb_db.get_topics_for_claim(claim_id)
 
     extraction_base_url = config.kb.verification_llm_base_url or config.kb.extraction_llm_base_url
     if extraction_model is None:
@@ -1015,18 +1000,25 @@ async def verify_claim(
                         )
                     with _timed(timings, "embedding_rank"):
                         new_ranked = await _rank_candidates_by_similarity(config, claim, new_source_claims)
-                    supports_before, contradicts_before = len(supporting_ids), len(contradiction_ids)
                     with _timed(timings, "llm_classify"):
                         await _examine_candidates(
                             kb_db, config, llm, claim, new_ranked, budget, examined_source_ids, contradiction_ids,
                             supporting_ids, phase="external",
                         )
                     if promotion.new_claim_ids:
-                        kept_ids = set(supporting_ids[supports_before:]) | set(contradiction_ids[contradicts_before:])
                         with _timed(timings, "resolve_promote"):
-                            await _resolve_new_verification_claims(
-                                kb_db, promotion.new_claim_ids, kept_ids, own_topics, ingest_result.source_id,
-                            )
+                            await _resolve_new_verification_claims(kb_db, promotion.new_claim_ids)
+                        # These ids no longer exist -- record_claim_supports
+                        # below would otherwise try to insert a claim_supports
+                        # row referencing a deleted claim and fail its FK
+                        # constraint. The supports/contradicts verdict itself
+                        # (budget.supports/contradicts, incremented inside
+                        # _examine_candidates) already happened independently
+                        # of these lists, so the verification outcome is
+                        # unaffected by no longer tracking these specific ids.
+                        new_claim_id_set = set(promotion.new_claim_ids)
+                        supporting_ids[:] = [i for i in supporting_ids if i not in new_claim_id_set]
+                        contradiction_ids[:] = [i for i in contradiction_ids if i not in new_claim_id_set]
                 except Exception:
                     # One bad web-fallback source (unparseable page, extraction
                     # LLM hiccup) shouldn't abort the whole verification and

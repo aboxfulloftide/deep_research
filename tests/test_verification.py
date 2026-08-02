@@ -1340,16 +1340,21 @@ async def test_run_verification_sweep_defaults_run_max_web_searches_to_config(kb
     assert captured["limit"] == config.kb.verification_run_max_web_searches
 
 
-# -- keep-or-delete claims discovered during web-fallback verification ------
-# The bug this guards against: extracting a scraped page's top chunks can
-# promote several new claims, but only the one an LLM comparison pass
-# actually classifies as supports/contradicts is worth keeping. Without
-# discarding the rest, verifying claim A pulls in claims B/C/D from other
-# pages, and if any of them also meet the importance threshold, the next
-# sweep verifies *them* too -- unbounded compounding growth with no way to
-# ever finish. Found in practice: a real KB had 1500+ such claims after one
-# night, almost none of them ever established as relevant to anything, all
-# floating with no topic and all eligible to keep the chain going.
+# -- claims discovered during web-fallback verification never persist ------
+# A claim can only live on a source the user directly added. Extracting a
+# scraped page's top chunks to compare against the claim being verified can
+# promote several new claims, but none of them are worth keeping as
+# persistent KB claims -- regardless of whether an LLM comparison pass
+# classified one as supports/contradicts -- because their source was never
+# something a user added. Confirmed live: 1,088 claims (26% of the KB)
+# existed only on auto-fetched verification-evidence sources, 66 of them
+# already marked "supported" from an earlier version of this code that kept
+# the "proving" claim around. Before that exclusion existed at all, a real
+# KB had 1500+ such claims after one night, almost none of them ever
+# established as relevant to anything, all eligible to keep the chain going
+# (verifying claim A pulls in claim B just to compare against it; if B also
+# meets the importance threshold, the next sweep verifies B too, pulling in
+# C, D, E... with no way to ever finish).
 
 async def _make_source_with_evidenced_claim(kb_db, claim_id, canonical_uri):
     source, _ = await kb_db.get_or_create_source(
@@ -1369,40 +1374,116 @@ async def _make_source_with_evidenced_claim(kb_db, claim_id, canonical_uri):
     return source
 
 
-async def test_resolve_new_verification_claims_keeps_and_tags_the_proving_claim(kb_db):
-    topic = await kb_db.create_topic("Data Centers")
-    kept, _ = await kb_db.get_or_create_claim("fact", "Groundwater supply could soon come under pressure.")
-    discarded, _ = await kb_db.get_or_create_claim("fact", "Tangential fact from the same scraped page.")
-    source = await _make_source_with_evidenced_claim(kb_db, kept["id"], "http://kept-claim-source.example")
+async def test_resolve_new_verification_claims_deletes_even_the_proving_claim(kb_db):
+    """The "proving" claim (the one an LLM comparison classified as
+    supports/contradicts) must be deleted just like any tangential one --
+    keeping it around, even tagged/excluded, is exactly what left 1,088
+    claims on sources nobody added."""
+    proving, _ = await kb_db.get_or_create_claim("fact", "Groundwater supply could soon come under pressure.")
+    tangential, _ = await kb_db.get_or_create_claim("fact", "Tangential fact from the same scraped page.")
+    await _make_source_with_evidenced_claim(kb_db, proving["id"], "http://kept-claim-source.example")
 
-    await v._resolve_new_verification_claims(
-        kb_db, [kept["id"], discarded["id"]], kept_ids={kept["id"]}, topics=[topic], source_id=source["id"],
+    await v._resolve_new_verification_claims(kb_db, [proving["id"], tangential["id"]])
+
+    assert await kb_db.get_claim(proving["id"]) is None
+    assert await kb_db.get_claim(tangential["id"]) is None
+
+
+async def test_verify_claim_strips_deleted_ids_before_recording_supports(kb_db, monkeypatch):
+    """The "proving" claim gets deleted by _resolve_new_verification_claims
+    before verify_claim reaches record_claim_supports -- if that call still
+    tried to persist a claim_supports row referencing the now-deleted id, it
+    would violate the table's foreign key and crash the whole verification
+    instead of just not tracking a reference to something that no longer
+    exists."""
+    from dataclasses import dataclass
+
+    from deep_research.config import load_config
+    from deep_research.models import SearchResult
+
+    claim, _ = await kb_db.get_or_create_claim(
+        "fact", "A distinctive test claim about zorbnaxian trade tariffs in 1994.",
     )
+    config = load_config()
+    proving_claim, _ = await kb_db.get_or_create_claim("fact", "The proving claim from the fetched page.")
 
-    kept_after = await kb_db.get_claim(kept["id"])
-    assert kept_after["verification_override"] == "exclude"
-    assert v.claim_check_status(kept_after, threshold=0.8) == "manual_exclude"
-    linked_topics = await kb_db.get_topics_for_claim(kept["id"])
-    assert [t["id"] for t in linked_topics] == [topic["id"]]
+    async def fake_web_search(query, cfg, **kwargs):
+        return [SearchResult(title="A page", url="https://example.test/a", snippet="")]
 
-    # the source itself is tied to the topic too, not just the claim -- so
-    # it shows up in context on the Sources page instead of floating
-    # unexplained.
-    source_topics = await kb_db.list_topic_sources(topic["id"])
-    assert [s["id"] for s in source_topics] == [source["id"]]
+    @dataclass
+    class _OkIngest:
+        status: str = "ok"
+        source_id: str = "fake-source-id"
+        version_id: str = "fake-version-id"
 
+    async def fake_ingest_web_page(*args, **kwargs):
+        return _OkIngest()
 
-async def test_resolve_new_verification_claims_deletes_the_non_proving_claims(kb_db):
-    kept, _ = await kb_db.get_or_create_claim("fact", "The proving claim.")
-    discarded, _ = await kb_db.get_or_create_claim("fact", "A tangential fact never established as relevant.")
-    source = await _make_source_with_evidenced_claim(kb_db, kept["id"], "http://another-kept-claim-source.example")
+    class _FakeChunkResult:
+        chunk_count = 1
 
-    await v._resolve_new_verification_claims(
-        kb_db, [kept["id"], discarded["id"]], kept_ids={kept["id"]}, topics=[], source_id=source["id"],
-    )
+    async def fake_build_artifact_for_version(*args, **kwargs):
+        return _FakeChunkResult()
 
-    assert await kb_db.get_claim(kept["id"]) is not None
-    assert await kb_db.get_claim(discarded["id"]) is None
+    class _FakeExtractionResult:
+        observation_count = 1
+        extraction_run_id = "fake-run-id"
+        status = "extracted"
+
+    async def fake_run_extraction(*args, **kwargs):
+        return _FakeExtractionResult()
+
+    class _FakePromotion:
+        new_claim_ids = [proving_claim["id"]]
+
+    async def fake_resolve_and_promote(*args, **kwargs):
+        return _FakePromotion()
+
+    async def fake_get_source(source_id):
+        return {"id": source_id, "canonical_uri": "https://example.test/a"}
+
+    async def fake_get_source_version(version_id):
+        return {"id": version_id}
+
+    async def fake_get_current_artifacts_for_version(version_id):
+        return [{"id": "fake-artifact-id"}]
+
+    async def fake_list_chunks(artifact_id):
+        return [{"id": "fake-chunk-id", "embedding": None}]
+
+    async def fake_rank_chunks_by_similarity(config, claim, chunks):
+        return [(chunk, 1.0) for chunk in chunks]
+
+    async def fake_examine_candidates(
+        kb_db, config, llm, claim, ranked_candidates, budget, examined_source_ids,
+        contradiction_ids, supporting_ids=None, phase="internal",
+    ):
+        # Simulates the real function classifying the promoted "proving"
+        # claim as supporting evidence -- the exact scenario that used to
+        # crash record_claim_supports once that claim gets deleted below.
+        if phase == "external":
+            budget.supports += 1
+            budget.support_weight += 1.0
+            if supporting_ids is not None:
+                supporting_ids.append(proving_claim["id"])
+
+    monkeypatch.setattr(v, "web_search", fake_web_search)
+    monkeypatch.setattr(v, "ingest_web_page", fake_ingest_web_page)
+    monkeypatch.setattr(v, "build_artifact_for_version", fake_build_artifact_for_version)
+    monkeypatch.setattr(v, "run_extraction", fake_run_extraction)
+    monkeypatch.setattr(v, "resolve_and_promote", fake_resolve_and_promote)
+    monkeypatch.setattr(v, "_examine_candidates", fake_examine_candidates)
+    monkeypatch.setattr(v, "_rank_chunks_by_similarity", fake_rank_chunks_by_similarity)
+    monkeypatch.setattr(kb_db, "get_source", fake_get_source)
+    monkeypatch.setattr(kb_db, "get_source_version", fake_get_source_version)
+    monkeypatch.setattr(kb_db, "get_current_artifacts_for_version", fake_get_current_artifacts_for_version)
+    monkeypatch.setattr(kb_db, "list_chunks", fake_list_chunks)
+
+    result = await v.verify_claim(kb_db, config, claim["id"], extraction_model="stub-model")
+
+    assert result.status == "supported"
+    assert proving_claim["id"] not in result.supporting_claim_ids
+    assert await kb_db.get_claim(proving_claim["id"]) is None
 
 
 # -- deleting sources that contributed nothing -------------------------------

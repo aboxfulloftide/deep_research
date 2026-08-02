@@ -27,7 +27,7 @@ from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
 
 PROMPT_NAME = "claim_extraction"
-PROMPT_VERSION = "v9-named-event-context"
+PROMPT_VERSION = "v10-propagate-event-name"
 EXTRACTION_SCHEMA_VERSION = "v1"
 
 # Trailing slice of the previous chunk given as reference-resolution context
@@ -78,6 +78,17 @@ Rules:
   instead. If the chunk names the event anywhere (including the preceding-
   context block), use it; if it genuinely never names one, a precise date
   alone is still acceptable.
+  This applies even when the event's name only appears in a DIFFERENT
+  sentence that you are extracting as its own separate claim. If you extract
+  a claim like "The crisis in 1837 became known as the Panic of 1837," every
+  other claim you extract about that same year/period must also say "the
+  Panic of 1837," not just the one claim that happens to introduce the name.
+  Wrong: extracting "Businesses closed in 1837" and "The crisis in 1837
+  became known as the Panic of 1837" as two separate claims, neither one
+  naming the Panic of 1837 in the other. Right: "Businesses closed during
+  the Panic of 1837" and "The crisis in 1837 became known as the Panic of
+  1837" -- the name propagates to every claim about that period, not just
+  the sentence that first states it.
 - Do not extract quiz, test, or exam questions, answer choices, answer keys,
   flash cards, worked exercises, or hypothetical word-problem figures. An
   option marked as the correct answer is still assessment material, not a
