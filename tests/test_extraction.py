@@ -2,6 +2,7 @@ from deep_research.config import load_config
 from deep_research.kb.extraction import (
     is_assessment_content,
     has_unresolved_subject,
+    propagate_named_events,
     repair_lifespan_date_misattribution,
     run_extraction,
 )
@@ -91,6 +92,87 @@ def test_leading_personal_pronouns_are_unresolved_subjects():
     assert has_unresolved_subject(
         "Jack Welch retired with a $417 million severance package."
     ) is False
+
+
+# -- propagate_named_events: mechanical fix for a prompt that didn't stick --
+# Live-confirmed twice: told to name a chunk's specific event instead of a
+# bare year, the model reliably extracts the naming sentence itself
+# ("This crisis became known as the Panic of 1837") as its own claim, but
+# does not reliably fold that name into sibling claims about the same year
+# ("Businesses closed in 1837"), even after two rounds of strengthening the
+# prompt's wording. This repairs it deterministically after the fact.
+
+def test_propagate_named_events_appends_name_to_sibling_claims():
+    claims = [
+        {"claim_text": "Businesses closed in 1837."},
+        {"claim_text": "Workers lost jobs in 1837."},
+        {"claim_text": "This crisis became known as the Panic of 1837."},
+    ]
+
+    result = propagate_named_events(claims)
+
+    assert result[0]["claim_text"] == "Businesses closed in 1837 (the Panic of 1837)."
+    assert result[1]["claim_text"] == "Workers lost jobs in 1837 (the Panic of 1837)."
+    assert result[2]["claim_text"] == "This crisis became known as the Panic of 1837."
+
+
+def test_propagate_named_events_preserves_names_without_the_article():
+    claims = [
+        {"claim_text": "Stock prices fell sharply on October 19, 1987."},
+        {"claim_text": "The 1987 crash became known as Black Monday."},
+    ]
+
+    result = propagate_named_events(claims)
+
+    assert "(Black Monday)" in result[0]["claim_text"]
+    assert "(the Black Monday)" not in result[0]["claim_text"]
+
+
+def test_propagate_named_events_does_not_duplicate_an_already_present_name():
+    claims = [
+        {"claim_text": "Businesses closed during the Panic of 1837."},
+        {"claim_text": "This crisis became known as the Panic of 1837."},
+    ]
+
+    result = propagate_named_events(claims)
+
+    assert result[0]["claim_text"] == "Businesses closed during the Panic of 1837."
+
+
+def test_propagate_named_events_only_applies_to_the_matching_year():
+    claims = [
+        {"claim_text": "Businesses closed in 1837."},
+        {"claim_text": "A different recession happened in 1929."},
+        {"claim_text": "This crisis became known as the Panic of 1837."},
+    ]
+
+    result = propagate_named_events(claims)
+
+    assert "(the Panic of 1837)" in result[0]["claim_text"]
+    assert result[1]["claim_text"] == "A different recession happened in 1929."
+
+
+def test_propagate_named_events_is_a_noop_without_any_naming_claim():
+    claims = [
+        {"claim_text": "Businesses closed in 1837."},
+        {"claim_text": "Workers lost jobs in 1837."},
+    ]
+
+    result = propagate_named_events(claims)
+
+    assert result[0]["claim_text"] == "Businesses closed in 1837."
+    assert result[1]["claim_text"] == "Workers lost jobs in 1837."
+
+
+def test_propagate_named_events_leaves_claims_without_a_year_alone():
+    claims = [
+        {"claim_text": "Businesses closed nationwide."},
+        {"claim_text": "This crisis became known as the Panic of 1837."},
+    ]
+
+    result = propagate_named_events(claims)
+
+    assert result[0]["claim_text"] == "Businesses closed nationwide."
 
 
 async def _make_artifact_with_chunks(kb_db, chunk_texts):

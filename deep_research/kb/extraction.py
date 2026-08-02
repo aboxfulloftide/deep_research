@@ -27,7 +27,7 @@ from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
 
 PROMPT_NAME = "claim_extraction"
-PROMPT_VERSION = "v10-propagate-event-name"
+PROMPT_VERSION = "v11-mechanical-event-propagation"
 EXTRACTION_SCHEMA_VERSION = "v1"
 
 # Trailing slice of the previous chunk given as reference-resolution context
@@ -130,6 +130,65 @@ _UNRESOLVED_SUBJECT_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+_NAMED_AS_RE = re.compile(
+    r"\b(?:became|is|was|came to be)\s+(?:known|referred to)\s+as\s+"
+    r"((?:the\s+)?[A-Z][A-Za-z0-9''’\-\s]{2,60}?)(?=\s*[.,;]|$)",
+)
+_YEAR_TOKEN_RE = re.compile(r"\b(1[5-9]\d{2}|20[0-4]\d)\b")
+
+
+def propagate_named_events(claims: list[dict]) -> list[dict]:
+    """Mechanically fixes a specific, observed extraction failure: told to
+    name a chunk's specific event instead of a bare year (see
+    EXTRACTION_SYSTEM_PROMPT's named-event rule), the model reliably
+    extracts the naming sentence itself as its own claim ("This crisis
+    became known as the Panic of 1837") but does not reliably propagate
+    that name into sibling claims about the same year ("Businesses closed
+    in 1837") -- confirmed live, twice, even after strengthening the
+    prompt's wording both times to explicitly ask for this. This is a
+    deterministic repair instead of a third prompt attempt: find every
+    "X became known as Y" claim in this chunk's batch, extract the year Y
+    is tied to, and append "(Y)" to every OTHER claim in the same batch
+    that mentions that year but doesn't already mention Y.
+
+    Deliberately scoped to one chunk's batch of claims (not the whole
+    extraction run) -- the motivating example had both the naming claim and
+    the claims needing its name in the same chunk. Preserves whatever
+    article the model actually wrote ("the Panic of 1837" vs "Black
+    Monday") instead of guessing whether to prepend "the"."""
+    year_to_name: dict[str, str] = {}
+    for claim in claims:
+        text = str(claim.get("claim_text") or "")
+        match = _NAMED_AS_RE.search(text)
+        if not match:
+            continue
+        year_match = _YEAR_TOKEN_RE.search(text)
+        if not year_match:
+            continue
+        name = match.group(1).strip().rstrip(".,;")
+        year_to_name.setdefault(year_match.group(0), name)
+
+    if not year_to_name:
+        return claims
+
+    for claim in claims:
+        text = str(claim.get("claim_text") or "")
+        if _NAMED_AS_RE.search(text):
+            continue  # the naming claim itself -- leave it alone
+        year_match = _YEAR_TOKEN_RE.search(text)
+        if not year_match:
+            continue
+        name = year_to_name.get(year_match.group(0))
+        if not name or name.casefold() in text.casefold():
+            continue
+        stripped = text.rstrip()
+        if stripped and stripped[-1] in ".!?":
+            stripped = stripped[:-1]
+        claim["claim_text"] = f"{stripped} ({name})."
+
+    return claims
 
 
 def is_assessment_content(text: str) -> bool:
@@ -370,10 +429,14 @@ async def run_extraction(
                 failed_chunk_count += 1
                 continue
 
-            for claim in _parse_json_array(content):
-                if not isinstance(claim, dict) or not claim.get("claim_text"):
-                    continue
-                claim = repair_lifespan_date_misattribution(claim)
+            parsed_claims = [
+                repair_lifespan_date_misattribution(claim)
+                for claim in _parse_json_array(content)
+                if isinstance(claim, dict) and claim.get("claim_text")
+            ]
+            parsed_claims = propagate_named_events(parsed_claims)
+
+            for claim in parsed_claims:
                 if has_unresolved_subject(claim["claim_text"]):
                     continue
                 quote = claim.get("supporting_quote", "")
