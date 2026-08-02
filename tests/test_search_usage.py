@@ -8,6 +8,8 @@ from deep_research.tools.search_usage import (
     log_search_call,
     provider_monthly_quota_exhausted,
     providers_allowed_by_circuit_breaker,
+    serper_behind_pace,
+    serper_pace_status,
     serper_quota_remaining,
     usage_db_path,
 )
@@ -123,6 +125,80 @@ async def test_serper_quota_remaining_never_goes_negative(tmp_path):
     assert await serper_quota_remaining(config) == 0
 
 
+# -- serper_pace_status/serper_behind_pace: use-it-or-lose-it credits -------
+# Serper's balance expires on a fixed date and is forfeited unused (unlike
+# the monthly-resetting providers), so usage should be pushed higher as that
+# date approaches rather than conserved.
+
+async def test_serper_pace_status_returns_none_without_expiry_configured(tmp_path):
+    config = _config(tmp_path)
+    config.serper.quota_remaining_snapshot = 100
+    config.serper.quota_remaining_snapshot_at = datetime.now(timezone.utc).isoformat()
+
+    assert await serper_pace_status(config) is None
+
+
+async def test_serper_pace_status_behind_pace_when_no_calls_made_halfway_to_expiry(tmp_path):
+    config = _config(tmp_path)
+    now = datetime.now(timezone.utc)
+    config.serper.quota_remaining_snapshot = 100
+    config.serper.quota_remaining_snapshot_at = (now - timedelta(days=50)).isoformat()
+    config.serper.quota_expires_at = (now + timedelta(days=50)).isoformat()
+
+    status = await serper_pace_status(config)
+
+    assert status["remaining"] == 100
+    assert status["expected_remaining"] == 50
+    assert status["behind_pace"] is True
+    assert status["days_left"] in (49, 50)
+
+
+async def test_serper_pace_status_on_pace_when_spend_matches_schedule(tmp_path):
+    config = _config(tmp_path)
+    now = datetime.now(timezone.utc)
+    config.serper.quota_remaining_snapshot = 100
+    config.serper.quota_remaining_snapshot_at = (now - timedelta(days=50)).isoformat()
+    config.serper.quota_expires_at = (now + timedelta(days=50)).isoformat()
+    for _ in range(50):
+        await log_search_call(config, "serper", "api", "ok")
+
+    status = await serper_pace_status(config)
+
+    assert status["remaining"] == 50
+    assert status["behind_pace"] is False
+
+
+async def test_serper_behind_pace_false_without_configuration(tmp_path):
+    config = _config(tmp_path)
+    assert await serper_behind_pace(config) is False
+
+
+async def test_serper_behind_pace_true_when_underspending(tmp_path):
+    config = _config(tmp_path)
+    now = datetime.now(timezone.utc)
+    config.serper.quota_remaining_snapshot = 100
+    config.serper.quota_remaining_snapshot_at = (now - timedelta(days=50)).isoformat()
+    config.serper.quota_expires_at = (now + timedelta(days=50)).isoformat()
+
+    assert await serper_behind_pace(config) is True
+
+
+async def test_usage_summary_includes_serper_pacing_fields(tmp_path):
+    config = _config(tmp_path)
+    now = datetime.now(timezone.utc)
+    config.serper.quota_remaining_snapshot = 100
+    config.serper.quota_remaining_snapshot_at = (now - timedelta(days=50)).isoformat()
+    config.serper.quota_expires_at = (now + timedelta(days=50)).isoformat()
+
+    summary = await get_usage_summary(config)
+    serper = summary["providers"]["serper"]
+
+    assert serper["quota_hard_limit"] is True
+    assert serper["behind_pace"] is True
+    assert serper["expected_remaining"] == 50
+    assert serper["days_left"] in (49, 50)
+
+
 async def test_usage_summary_includes_serper_quota_remaining(tmp_path):
     config = _config(tmp_path)
     config.serper.quota_remaining_snapshot = 100
@@ -160,14 +236,33 @@ async def test_usage_summary_tracks_brave_primary_and_fallback_quotas_independen
     must be tracked against its own quota, not share one."""
     config = _config(tmp_path)
     config.brave.monthly_quota = 2000
-    config.brave.fallback_monthly_quota = 3000
+    config.brave.fallback_monthly_quota = 2500
     await log_search_call(config, "brave", "api", "ok")
     for _ in range(5):
         await log_search_call(config, "brave_fallback", "api", "ok")
 
     summary = await get_usage_summary(config)
     assert summary["providers"]["brave"]["quota_remaining"] == 1999
-    assert summary["providers"]["brave_fallback"]["quota_remaining"] == 2995
+    assert summary["providers"]["brave_fallback"]["quota_remaining"] == 2495
+
+
+async def test_usage_summary_marks_brave_fallback_as_soft_limit_and_others_hard(tmp_path):
+    """Brave's paid backup key keeps working past its budgeted monthly
+    figure (it just costs more), while Brave primary/Tavily/Serper actually
+    stop returning results once exhausted -- the distinction should be
+    visible, not just a uniform "N remaining" for all four."""
+    config = _config(tmp_path)
+    config.brave.monthly_quota = 2000
+    config.brave.fallback_monthly_quota = 2500
+    config.tavily.monthly_quota = 1000
+    await log_search_call(config, "brave", "api", "ok")
+    await log_search_call(config, "brave_fallback", "api", "ok")
+    await log_search_call(config, "tavily", "api", "ok")
+
+    summary = await get_usage_summary(config)
+    assert summary["providers"]["brave"]["quota_hard_limit"] is True
+    assert summary["providers"]["tavily"]["quota_hard_limit"] is True
+    assert summary["providers"]["brave_fallback"]["quota_hard_limit"] is False
 
 
 async def test_log_search_call_persists_run_plan_facet_attempt_and_capability(tmp_path):

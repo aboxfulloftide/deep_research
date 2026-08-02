@@ -71,6 +71,18 @@ function providerAccountUrl(key) {
   return PROVIDER_ACCOUNT_URLS[key]
 }
 
+// Brave's paid backup key keeps working past its budgeted monthly figure
+// (it just costs more); Brave primary/Tavily/Serper actually stop returning
+// results once exhausted. quota_hard_limit (set server-side) distinguishes
+// the two so this doesn't read as the same kind of number for both.
+function quotaLabel(p) {
+  return p?.quota_hard_limit === false ? 'before overage charges' : 'searches remaining'
+}
+
+function quotaWarning(p) {
+  return p?.quota_hard_limit !== false && typeof p?.quota_remaining === 'number' && p.quota_remaining <= 0
+}
+
 function statusBadge(p) {
   if (!p || !p.last_status) return { label: 'no data', class: 'bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400' }
   if (p.last_status === 'ok') return { label: 'responding', class: 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300' }
@@ -154,8 +166,16 @@ const statusColors = {
             {{ statusBadge(providers[key]).label }}
           </span>
           <div class="text-sm text-gray-700 dark:text-gray-300 space-y-1">
-            <p v-if="providers[key]?.quota_remaining != null" class="font-medium text-gray-900 dark:text-white">
-              {{ providers[key].quota_remaining.toLocaleString() }} searches remaining
+            <p
+              v-if="providers[key]?.quota_remaining != null"
+              class="font-medium"
+              :class="quotaWarning(providers[key]) ? 'text-red-600 dark:text-red-400' : 'text-gray-900 dark:text-white'"
+            >
+              {{ providers[key].quota_remaining.toLocaleString() }} {{ quotaLabel(providers[key]) }}
+            </p>
+            <p v-if="providers[key]?.days_left != null" class="text-xs" :class="providers[key]?.behind_pace ? 'text-amber-600 dark:text-amber-400' : 'text-gray-500 dark:text-gray-400'">
+              expires in {{ providers[key].days_left }} day{{ providers[key].days_left === 1 ? '' : 's' }} (use-it-or-lose-it)
+              <span v-if="providers[key]?.behind_pace">&mdash; behind pace, expect ~{{ providers[key].expected_remaining?.toLocaleString() }} left by now</span>
             </p>
             <p>{{ providers[key]?.calls_today ?? 0 }} call(s) today &middot; {{ providers[key]?.calls_month ?? 0 }} this month</p>
             <p class="text-xs text-gray-500 dark:text-gray-400">

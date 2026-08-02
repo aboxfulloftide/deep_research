@@ -63,6 +63,13 @@ PROVIDERS = ("duckduckgo", "brave", "tavily", "serper")
 # history, but do not expose them as current providers or recent calls.
 RETIRED_PROVIDERS = ("wikipedia", "wikidata")
 
+# Hitting the limit stops these providers from returning results at all
+# (Serper needs a manual balance reload; Brave primary/Tavily just resume on
+# the next calendar month). brave_fallback is deliberately excluded -- Brave's
+# paid backup key keeps working past its budgeted monthly figure, it just
+# costs more, so quota_remaining there is a spend target, not a failure point.
+_HARD_LIMIT_PROVIDERS = {"tavily", "brave", "serper"}
+
 
 def usage_db_path(config: Config) -> Path:
     return config.db_path.parent / "search_usage.db"
@@ -190,6 +197,62 @@ async def serper_quota_remaining(config: Config) -> int | None:
         )
     used_since_snapshot = rows[0][0]
     return max(0, config.serper.quota_remaining_snapshot - used_since_snapshot)
+
+
+def _parse_iso_utc(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+async def serper_pace_status(config: Config) -> dict | None:
+    """Pacing info for Serper's expiring, use-it-or-lose-it credit balance.
+
+    Unlike the monthly-resetting providers, unused Serper credits are
+    forfeited entirely once quota_expires_at passes -- there is no upside to
+    conserving them past that date, only downside to leaving some unspent.
+    This projects a straight-line depletion schedule from the snapshot
+    (quota_remaining_snapshot at quota_remaining_snapshot_at) down to 0 at
+    quota_expires_at, and compares it to the real current balance:
+    `behind_pace` is True when the actual remaining balance is *higher* than
+    that schedule predicts -- i.e., credits are being under-used relative to
+    the time left, and usage should be pushed higher so the full balance
+    actually gets spent instead of quietly expiring unused. Returns None if
+    no snapshot or expiry has been configured.
+    """
+    remaining = await serper_quota_remaining(config)
+    if remaining is None or not config.serper.quota_expires_at:
+        return None
+    snapshot_at = _parse_iso_utc(config.serper.quota_remaining_snapshot_at)
+    expires_at = _parse_iso_utc(config.serper.quota_expires_at)
+    now = datetime.now(timezone.utc)
+    days_left = max(0, (expires_at - now).days)
+
+    total_window = (expires_at - snapshot_at).total_seconds()
+    if total_window <= 0:
+        # The configured window is already degenerate (expiry at/before the
+        # snapshot) -- any remaining balance is already behind schedule.
+        expected_remaining = 0
+    else:
+        elapsed = max(0.0, (now - snapshot_at).total_seconds())
+        fraction_time_left = max(0.0, 1 - elapsed / total_window)
+        expected_remaining = round(config.serper.quota_remaining_snapshot * fraction_time_left)
+
+    return {
+        "remaining": remaining,
+        "expected_remaining": expected_remaining,
+        "days_left": days_left,
+        "behind_pace": remaining > expected_remaining,
+    }
+
+
+async def serper_behind_pace(config: Config) -> bool:
+    """True if Serper's expiring balance is being under-used relative to a
+    straight-line depletion schedule to its expiry date. Used by
+    web_search() to escalate to Serper even when earlier providers already
+    found enough results, so the balance actually gets spent down instead of
+    quietly expiring unused as the deadline approaches."""
+    status = await serper_pace_status(config)
+    return bool(status and status["behind_pace"])
 
 
 class _Timer:
@@ -324,6 +387,7 @@ async def get_usage_summary(
             }.get(provider)
             if monthly_quota:
                 providers[provider]["quota_remaining"] = max(0, monthly_quota - summary["calls_month"])
+                providers[provider]["quota_hard_limit"] = provider in _HARD_LIMIT_PROVIDERS
 
         recent = await db.execute_fetchall(
             "SELECT provider, mode, status, result_count, error_message, elapsed_ms, query, created_at "
@@ -335,6 +399,12 @@ async def get_usage_summary(
 
     if "serper" in providers:
         providers["serper"]["quota_remaining"] = await serper_quota_remaining(config)
+        providers["serper"]["quota_hard_limit"] = True
+        pace = await serper_pace_status(config)
+        if pace:
+            providers["serper"]["days_left"] = pace["days_left"]
+            providers["serper"]["expected_remaining"] = pace["expected_remaining"]
+            providers["serper"]["behind_pace"] = pace["behind_pace"]
 
     return {
         "providers": providers,

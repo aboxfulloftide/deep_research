@@ -602,6 +602,44 @@ async def test_serper_and_brave_skipped_when_searxng_already_sufficient(monkeypa
     assert calls == {"serper": 0, "brave": 0, "tavily": 0}
 
 
+async def test_serper_called_despite_sufficient_results_when_behind_pace(monkeypatch):
+    """Serper's credits expire on a fixed date and are forfeited unused
+    (unlike Brave/Tavily's monthly-resetting quotas), so serper_behind_pace()
+    must be able to force a call even when SearXNG already found enough --
+    spending the balance down before it expires beats leaving it unspent."""
+    calls = {"serper": 0}
+
+    async def fake_serper(*args, **kwargs):
+        calls["serper"] += 1
+        return [_result("Extra corroborating result", "spend the balance")]
+
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def noop(*args, **kwargs):
+        pass
+
+    async def fake_behind_pace(config):
+        return True
+
+    monkeypatch.setattr(
+        search_module.httpx, "AsyncClient",
+        lambda *args, **kwargs: _fake_client(_searxng_response(3)),
+    )
+    monkeypatch.setattr(search_module, "_throttle_searxng", noop)
+    monkeypatch.setattr(search_module, "_log_searxng_engines", noop)
+    monkeypatch.setattr(search_module, "log_search_call", noop)
+    monkeypatch.setattr(search_module, "_wikipedia_api_search", no_results)
+    monkeypatch.setattr(search_module, "_wikidata_api_search", no_results)
+    monkeypatch.setattr(search_module, "_serper_api_search", fake_serper)
+    monkeypatch.setattr(search_module, "serper_behind_pace", fake_behind_pace)
+
+    config = Config(serper=SerperConfig(api_key="serper-key"))
+    await web_search("PostgreSQL index documentation", config)
+
+    assert calls["serper"] == 1
+
+
 async def test_serper_called_when_searxng_alone_is_thin(monkeypatch):
     calls = {"serper": 0}
 

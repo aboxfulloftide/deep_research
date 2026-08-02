@@ -18,6 +18,7 @@ from deep_research.tools.search_usage import (
     log_search_call,
     provider_monthly_quota_exhausted,
     providers_allowed_by_circuit_breaker,
+    serper_behind_pace,
     timer,
 )
 
@@ -743,9 +744,17 @@ async def web_search(
         # "fewer, better provider calls" instead of calling every configured
         # provider on every search regardless of whether SearXNG/Wikipedia/
         # Wikidata already answered the question.
-        if (
-            config.serper.api_key
-            and sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
+        #
+        # Serper is the one exception: its credits expire on a fixed date and
+        # are forfeited unused rather than rolling over (unlike Brave/Tavily's
+        # monthly-resetting quotas), so serper_behind_pace() can force a call
+        # here even when earlier results already look sufficient -- spending
+        # the balance down before it expires is strictly better than leaving
+        # it unspent. A no-op (never True) until config.serper.quota_expires_at
+        # is actually configured.
+        if config.serper.api_key and (
+            sum(_is_relevant(result, terms) for result in results) < MIN_SUFFICIENT_RELEVANT_RESULTS
+            or await serper_behind_pace(config)
         ):
             t = timer()
             try:

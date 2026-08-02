@@ -96,6 +96,11 @@ class SerperConfig(BaseModel):
     # logged since. Empty/0 means no snapshot has been recorded yet.
     quota_remaining_snapshot: int = 0
     quota_remaining_snapshot_at: str = ""
+    # These credits expire on a fixed date (use-it-or-lose-it, unlike the
+    # monthly-resetting providers) -- empty means unknown/not configured, in
+    # which case search_usage.serper_pace_status returns None and the
+    # waterfall never escalates Serper usage based on pacing.
+    quota_expires_at: str = ""
 
 
 class WikipediaConfig(BaseModel):
@@ -241,6 +246,7 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_SERPER_API_KEY": ("serper", "api_key"),
         "DEEP_RESEARCH_SERPER_QUOTA_REMAINING_SNAPSHOT": ("serper", "quota_remaining_snapshot"),
         "DEEP_RESEARCH_SERPER_QUOTA_REMAINING_SNAPSHOT_AT": ("serper", "quota_remaining_snapshot_at"),
+        "DEEP_RESEARCH_SERPER_QUOTA_EXPIRES_AT": ("serper", "quota_expires_at"),
         "DEEP_RESEARCH_WIKIPEDIA_CONTACT": ("wikipedia", "contact"),
         "DEEP_RESEARCH_SCRAPING_TIMEOUT": ("scraping", "timeout"),
         "DEEP_RESEARCH_SCRAPING_MAX_CONTENT_LENGTH": ("scraping", "max_content_length"),
