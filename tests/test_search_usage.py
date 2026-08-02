@@ -154,6 +154,22 @@ async def test_usage_summary_omits_tavily_quota_remaining_when_not_configured(tm
     assert "quota_remaining" not in summary["providers"]["tavily"]
 
 
+async def test_usage_summary_tracks_brave_primary_and_fallback_quotas_independently(tmp_path):
+    """Primary and fallback are two separate Brave subscriptions with their
+    own monthly allowances (see search.py's _brave_search_layered) -- each
+    must be tracked against its own quota, not share one."""
+    config = _config(tmp_path)
+    config.brave.monthly_quota = 2000
+    config.brave.fallback_monthly_quota = 3000
+    await log_search_call(config, "brave", "api", "ok")
+    for _ in range(5):
+        await log_search_call(config, "brave_fallback", "api", "ok")
+
+    summary = await get_usage_summary(config)
+    assert summary["providers"]["brave"]["quota_remaining"] == 1999
+    assert summary["providers"]["brave_fallback"]["quota_remaining"] == 2995
+
+
 async def test_log_search_call_persists_run_plan_facet_attempt_and_capability(tmp_path):
     config = _config(tmp_path)
     await log_search_call(
