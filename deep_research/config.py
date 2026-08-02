@@ -59,8 +59,8 @@ class BraveConfig(BaseModel):
     # quota_remaining display (same derive-from-calls_month approach as
     # Tavily's monthly_quota -- 0 means unknown/not configured).
     monthly_quota: int = 0
-    # Paid backup key (separate Brave subscription: up to 50 req/s, budgeted
-    # ~3000 searches/month). Only spent once the primary key actually fails
+    # Paid backup key (separate Brave subscription: up to 50 req/s, 2,500
+    # searches/month). Only spent once the primary key actually fails
     # (monthly quota exhausted, persistent 429, subscription error) -- never
     # while the free key is still answering, and never on a merely-empty
     # result. See search.py's _brave_search_layered.
