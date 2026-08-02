@@ -310,6 +310,16 @@ async def get_usage_summary(
                 "last_error": last["error_message"] if last else None,
                 "last_result_count": last["result_count"] if last else None,
             }
+            if provider == "tavily" and config.tavily.monthly_quota:
+                # Unlike Serper's running paid balance (never resets, no API
+                # to query it -- see serper_quota_remaining below), Tavily's
+                # free tier is a real calendar-month quota that resets on the
+                # same boundary already computed above for calls_month, so it
+                # can be derived directly from logged calls with no manual
+                # snapshot needed.
+                providers[provider]["quota_remaining"] = max(
+                    0, config.tavily.monthly_quota - summary["calls_month"],
+                )
 
         recent = await db.execute_fetchall(
             "SELECT provider, mode, status, result_count, error_message, elapsed_ms, query, created_at "

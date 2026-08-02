@@ -70,6 +70,11 @@ class TavilyConfig(BaseModel):
     # this is only invoked when the primary SearXNG + Brave + Serper layer is
     # still thin, not on every query.
     api_key: str = ""
+    # Free tier is 1,000 searches/calendar-month (unlike Serper's running
+    # paid balance, this actually resets) -- 0 means unknown/not configured,
+    # in which case search_usage.get_usage_summary omits quota_remaining for
+    # this provider rather than showing a misleading number.
+    monthly_quota: int = 0
 
 
 class SerperConfig(BaseModel):
@@ -225,6 +230,7 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_BRAVE_API_KEY": ("brave", "api_key"),
         "DEEP_RESEARCH_BRAVE_FALLBACK_API_KEY": ("brave", "fallback_api_key"),
         "DEEP_RESEARCH_TAVILY_API_KEY": ("tavily", "api_key"),
+        "DEEP_RESEARCH_TAVILY_MONTHLY_QUOTA": ("tavily", "monthly_quota"),
         "DEEP_RESEARCH_SERPER_API_KEY": ("serper", "api_key"),
         "DEEP_RESEARCH_SERPER_QUOTA_REMAINING_SNAPSHOT": ("serper", "quota_remaining_snapshot"),
         "DEEP_RESEARCH_SERPER_QUOTA_REMAINING_SNAPSHOT_AT": ("serper", "quota_remaining_snapshot_at"),

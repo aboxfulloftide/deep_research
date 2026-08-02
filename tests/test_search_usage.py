@@ -133,6 +133,27 @@ async def test_usage_summary_includes_serper_quota_remaining(tmp_path):
     assert summary["providers"]["serper"]["quota_remaining"] == 99
 
 
+async def test_usage_summary_includes_tavily_quota_remaining_when_configured(tmp_path):
+    """Unlike Serper's running paid balance, Tavily's free tier (1,000/month)
+    actually resets on the calendar-month boundary already used for
+    calls_month -- no manual snapshot needed, just a configured limit."""
+    config = _config(tmp_path)
+    config.tavily.monthly_quota = 1000
+    await log_search_call(config, "tavily", "api", "ok")
+    await log_search_call(config, "tavily", "api", "empty")
+
+    summary = await get_usage_summary(config)
+    assert summary["providers"]["tavily"]["quota_remaining"] == 998
+
+
+async def test_usage_summary_omits_tavily_quota_remaining_when_not_configured(tmp_path):
+    config = _config(tmp_path)
+    await log_search_call(config, "tavily", "api", "ok")
+
+    summary = await get_usage_summary(config)
+    assert "quota_remaining" not in summary["providers"]["tavily"]
+
+
 async def test_log_search_call_persists_run_plan_facet_attempt_and_capability(tmp_path):
     config = _config(tmp_path)
     await log_search_call(
