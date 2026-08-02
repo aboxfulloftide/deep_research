@@ -2,6 +2,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from deep_research.config import Config
 from deep_research.kb import verification as v
 from deep_research.kb.claim_filters import is_review_excluded_claim
@@ -746,6 +748,41 @@ async def test_suggest_search_query_falls_back_to_claim_text_on_placeholder_brac
     assert result == "Goldman Sachs pushed for the deal."
 
 
+async def test_suggest_search_query_falls_back_to_claim_text_on_vague_placeholder_phrase():
+    """Live KB data, one step further: told not to invent a bracketed
+    placeholder like "[time period]", the model can just as readily write
+    the identical fabrication in plain English instead -- "What was the
+    average wage for workers during this time period?" for a claim that
+    never mentions any time period at all. Same non-content, no brackets, so
+    it must be rejected the same way."""
+    class FakeLLM:
+        async def chat(self, messages):
+            return {"choices": [{"message": {
+                "content": '{"query": "What was the average wage for workers during this time period?"}',
+            }}]}
+
+    result = await v._suggest_search_query(FakeLLM(), "Workers were paid pretty well.", ["a prior query"])
+    assert result == "Workers were paid pretty well."
+
+
+@pytest.mark.parametrize("phrase", [
+    "average wage during this time period",
+    "average wage during that time period",
+    "prices in this era",
+    "prices during that era",
+    "wages at this point in time",
+    "wages during this time",
+    "wages at that time",
+])
+def test_is_fabricated_placeholder_query_catches_vague_phrases_without_brackets(phrase):
+    assert v._is_fabricated_placeholder_query(phrase) is True
+
+
+def test_is_fabricated_placeholder_query_false_for_genuine_queries():
+    assert v._is_fabricated_placeholder_query("Japan asset bubble household savings 1980s") is False
+    assert v._is_fabricated_placeholder_query("average wage in Japan in the 1980s") is False
+
+
 def test_only_meaningfully_different_generated_query_is_alternate():
     claim = "The Nasdaq peaked in March 2000."
 
@@ -819,11 +856,12 @@ async def test_suggest_diverse_search_queries_filters_placeholder_brackets_and_b
                     "",
                     "the deal in [specific event or time period]",
                     "   ",
+                    "wages during this time period",
                     "another genuine query",
                 ],
             })}}]}
 
-    result = await v._suggest_diverse_search_queries(FakeLLM(), "Some claim text.", [])
+    result = await v._suggest_diverse_search_queries(FakeLLM(), "Some claim text.", [], n=10)
     assert result == ["a genuine query", "another genuine query"]
 
 

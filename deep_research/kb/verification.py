@@ -331,15 +331,33 @@ to look for -- make sure the query actually targets that, not just the
 literal claim text. If prior queries are listed, suggest something
 meaningfully different from all of them, not a minor rephrasing of one --
 but never invent a placeholder like "[specific event]" or "[time period]"
-for a detail the claim doesn't actually give you. If the claim itself never
-names the specific company/deal/date, you cannot search for one either --
-use only the words and entities the claim text actually contains, even if
-that means a query similar to one already tried.
+for a detail the claim doesn't actually give you. This applies whether or
+not you write it in brackets -- "during this time period" or "at this
+point in time" is exactly the same fabrication with the brackets removed,
+not a real detail. If the claim itself never names the specific company/
+deal/date/period, you cannot search for one either -- use only the words
+and entities the claim text actually contains, even if that means a query
+similar to one already tried.
 
 Return ONLY a JSON object: {"query": "..."}
 """
 
 _PLACEHOLDER_BRACKET_RE = re.compile(r"\[[^\[\]]{0,80}\]")
+# Observed live: told not to invent a bracketed placeholder like
+# "[time period]" for a detail the claim never gives, the model instead
+# wrote the identical fabrication as plain English -- "What was the average
+# wage for workers during this time period?" for a claim that never
+# mentions any time period at all. Same non-content, just without brackets,
+# so the bracket-only check above missed it.
+_VAGUE_PLACEHOLDER_PHRASE_RE = re.compile(
+    r"\b(?:this|that)\s+(?:specific\s+)?(?:time\s*period|era|point\s+in\s+time)\b"
+    r"|\b(?:during|at)\s+(?:this|that)\s+time\b",
+    re.IGNORECASE,
+)
+
+
+def _is_fabricated_placeholder_query(query: str) -> bool:
+    return bool(_PLACEHOLDER_BRACKET_RE.search(query) or _VAGUE_PLACEHOLDER_PHRASE_RE.search(query))
 
 
 async def _suggest_search_query(
@@ -357,14 +375,16 @@ async def _suggest_search_query(
     + context "compare against datacenter usage" -- a plain search of the
     claim text would never surface a datacenter-specific comparison). Falls
     back to the raw claim text (the original, always-safe default) on any
-    parse failure, an empty suggestion, or a suggestion containing a literal
-    "[placeholder]" bracket -- observed live: when a claim never names the
-    specific company/deal/date to begin with (an extraction gap, not
-    something this step can fix) and "don't repeat prior queries" leaves the
-    model with nothing left to vary, it can fabricate a fill-in-the-blank
+    parse failure, an empty suggestion, or a fabricated placeholder (see
+    _is_fabricated_placeholder_query) -- observed live: when a claim never
+    names the specific company/deal/date to begin with (an extraction gap,
+    not something this step can fix) and "don't repeat prior queries" leaves
+    the model with nothing left to vary, it can fabricate a fill-in-the-blank
     query like "...for the deal in [specific event or time period]" instead
-    of admitting there's no more specific detail available -- a query like
-    that would search for the literal bracket text, not real content."""
+    of admitting there's no more specific detail available -- and, told not
+    to use brackets for that, will just as readily write the identical
+    fabrication in plain English ("...during this time period?") instead.
+    Either way it's a query for non-content, not real detail."""
     parts = [f"Claim: {claim_text}"]
     if context:
         parts.append(f"Additional context (what to specifically look for): {context}")
@@ -381,7 +401,7 @@ async def _suggest_search_query(
     parsed = _parse_json_object(content)
     query = parsed.get("query")
     query = query.strip() if isinstance(query, str) and query.strip() else ""
-    if not query or _PLACEHOLDER_BRACKET_RE.search(query):
+    if not query or _is_fabricated_placeholder_query(query):
         return claim_text
     return query
 
@@ -415,7 +435,7 @@ You are choosing several different web search queries to help verify a factual c
 
 Vary the strategy across queries: one could focus on a specific number/date/entity named in the claim, another on alternate terminology a source might actually use, another on the broader event or context the claim is part of, another on a person or organization directly involved. Do not produce two queries that just swap in synonyms for each other -- if the claim only supports one genuine angle, return fewer queries rather than padding with near-duplicates.
 
-If additional context is given, at least one query must target that specific angle, not just the literal claim text. If prior queries are listed, none of your queries may be a close rephrasing of any of them -- but never invent a placeholder like "[specific event]" or "[time period]" for a detail the claim doesn't actually give you. If the claim itself never names the specific company/deal/date, you cannot search for one either.
+If additional context is given, at least one query must target that specific angle, not just the literal claim text. If prior queries are listed, none of your queries may be a close rephrasing of any of them -- but never invent a placeholder like "[specific event]" or "[time period]" for a detail the claim doesn't actually give you. This applies whether or not you write it in brackets -- "during this time period" or "at this point in time" is exactly the same fabrication with the brackets removed, not a real detail. If the claim itself never names the specific company/deal/date/period, you cannot search for one either.
 
 Return ONLY a JSON object: {"queries": ["...", "..."]}
 """
@@ -461,7 +481,7 @@ async def _suggest_diverse_search_queries(
         if len(queries) >= n:
             break
         query = candidate.strip() if isinstance(candidate, str) and candidate.strip() else ""
-        if not query or _PLACEHOLDER_BRACKET_RE.search(query):
+        if not query or _is_fabricated_placeholder_query(query):
             continue
         queries.append(query)
     return queries
