@@ -77,6 +77,15 @@ class SerperConfig(BaseModel):
     # allowance is large enough for routine use; Tavily remains the fallback
     # when the combined primary results are still thin.
     api_key: str = ""
+    # Serper's paid credit balance is a running total that never resets
+    # monthly (unlike the free-tier providers' rate-limit-based quota
+    # tracking in search_usage.py) and isn't exposed via their search API --
+    # there's no endpoint to query it. quota_remaining_snapshot/_at record a
+    # manually-checked balance (from serper.dev/dashboard) at a point in
+    # time; search_usage.serper_quota_remaining() decays it by every call
+    # logged since. Empty/0 means no snapshot has been recorded yet.
+    quota_remaining_snapshot: int = 0
+    quota_remaining_snapshot_at: str = ""
 
 
 class WikipediaConfig(BaseModel):
@@ -217,6 +226,8 @@ def _apply_env_overrides(config: Config) -> Config:
         "DEEP_RESEARCH_BRAVE_FALLBACK_API_KEY": ("brave", "fallback_api_key"),
         "DEEP_RESEARCH_TAVILY_API_KEY": ("tavily", "api_key"),
         "DEEP_RESEARCH_SERPER_API_KEY": ("serper", "api_key"),
+        "DEEP_RESEARCH_SERPER_QUOTA_REMAINING_SNAPSHOT": ("serper", "quota_remaining_snapshot"),
+        "DEEP_RESEARCH_SERPER_QUOTA_REMAINING_SNAPSHOT_AT": ("serper", "quota_remaining_snapshot_at"),
         "DEEP_RESEARCH_WIKIPEDIA_CONTACT": ("wikipedia", "contact"),
         "DEEP_RESEARCH_SCRAPING_TIMEOUT": ("scraping", "timeout"),
         "DEEP_RESEARCH_SCRAPING_MAX_CONTENT_LENGTH": ("scraping", "max_content_length"),

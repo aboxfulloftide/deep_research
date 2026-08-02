@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -8,6 +8,7 @@ from deep_research.tools.search_usage import (
     log_search_call,
     provider_monthly_quota_exhausted,
     providers_allowed_by_circuit_breaker,
+    serper_quota_remaining,
     usage_db_path,
 )
 
@@ -76,6 +77,60 @@ async def test_monthly_quota_circuit_requires_the_typed_category_not_just_429_te
         error_message="429 Too Many Requests",
     )
     assert await provider_monthly_quota_exhausted(config, "brave") is False
+
+
+# -- serper_quota_remaining: manual balance snapshot, decayed by real calls -
+# Serper's paid credit balance never resets monthly and isn't exposed via
+# their search API, so it can't be queried live -- only estimated from a
+# manually-checked snapshot (serper.dev/dashboard) minus every call logged
+# since.
+
+async def test_serper_quota_remaining_returns_none_without_a_snapshot(tmp_path):
+    config = _config(tmp_path)
+    assert await serper_quota_remaining(config) is None
+
+
+async def test_serper_quota_remaining_decays_by_calls_since_snapshot(tmp_path):
+    config = _config(tmp_path)
+    config.serper.quota_remaining_snapshot = 100
+    config.serper.quota_remaining_snapshot_at = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+
+    await log_search_call(config, "serper", "api", "ok")
+    await log_search_call(config, "serper", "api", "error", error_message="boom")
+
+    assert await serper_quota_remaining(config) == 98
+
+
+async def test_serper_quota_remaining_ignores_calls_before_the_snapshot(tmp_path):
+    config = _config(tmp_path)
+    # A call logged before the snapshot was taken must not count against it --
+    # the snapshot already reflects the balance as of that point in time.
+    await log_search_call(config, "serper", "api", "ok")
+    config.serper.quota_remaining_snapshot = 50
+    config.serper.quota_remaining_snapshot_at = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+
+    assert await serper_quota_remaining(config) == 50
+
+
+async def test_serper_quota_remaining_never_goes_negative(tmp_path):
+    config = _config(tmp_path)
+    config.serper.quota_remaining_snapshot = 1
+    config.serper.quota_remaining_snapshot_at = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+
+    for _ in range(3):
+        await log_search_call(config, "serper", "api", "ok")
+
+    assert await serper_quota_remaining(config) == 0
+
+
+async def test_usage_summary_includes_serper_quota_remaining(tmp_path):
+    config = _config(tmp_path)
+    config.serper.quota_remaining_snapshot = 100
+    config.serper.quota_remaining_snapshot_at = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+    await log_search_call(config, "serper", "api", "ok")
+
+    summary = await get_usage_summary(config)
+    assert summary["providers"]["serper"]["quota_remaining"] == 99
 
 
 async def test_log_search_call_persists_run_plan_facet_attempt_and_capability(tmp_path):

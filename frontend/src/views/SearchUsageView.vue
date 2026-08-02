@@ -154,6 +154,9 @@ const statusColors = {
             {{ statusBadge(providers[key]).label }}
           </span>
           <div class="text-sm text-gray-700 dark:text-gray-300 space-y-1">
+            <p v-if="providers[key]?.quota_remaining != null" class="font-medium text-gray-900 dark:text-white">
+              {{ providers[key].quota_remaining.toLocaleString() }} searches remaining
+            </p>
             <p>{{ providers[key]?.calls_today ?? 0 }} call(s) today &middot; {{ providers[key]?.calls_month ?? 0 }} this month</p>
             <p class="text-xs text-gray-500 dark:text-gray-400">
               <span :class="statusColors.ok">ok={{ providers[key]?.ok_count ?? 0 }}</span>

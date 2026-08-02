@@ -168,6 +168,30 @@ async def provider_monthly_quota_exhausted(config: Config, provider: str) -> boo
     return bool(rows)
 
 
+async def serper_quota_remaining(config: Config) -> int | None:
+    """Estimates Serper's remaining paid-credit balance from a manually
+    recorded snapshot (config.serper.quota_remaining_snapshot/_at) minus
+    every call logged against 'serper' since that snapshot was taken.
+
+    Serper's balance is a running total that never resets monthly (unlike
+    provider_monthly_quota_exhausted's calendar-month rate-limit tracking
+    above) and isn't exposed via their search API, so there's no way to
+    query it live -- this only stays accurate between snapshots because
+    log_search_call records every real call made to their API, successful
+    or not (an error response still consumed a real HTTP request against
+    their endpoint). Returns None if no snapshot has ever been recorded.
+    """
+    if not config.serper.quota_remaining_snapshot or not config.serper.quota_remaining_snapshot_at:
+        return None
+    async with _connect(config) as db:
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM search_calls WHERE provider = 'serper' AND created_at >= ?",
+            (config.serper.quota_remaining_snapshot_at,),
+        )
+    used_since_snapshot = rows[0][0]
+    return max(0, config.serper.quota_remaining_snapshot - used_since_snapshot)
+
+
 class _Timer:
     def __init__(self):
         self.start = time.monotonic()
@@ -294,6 +318,9 @@ async def get_usage_summary(
             (*RETIRED_PROVIDERS, recent_limit),
         )
         recent_calls = [dict(r) for r in recent]
+
+    if "serper" in providers:
+        providers["serper"]["quota_remaining"] = await serper_quota_remaining(config)
 
     return {
         "providers": providers,
