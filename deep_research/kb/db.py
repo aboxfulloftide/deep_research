@@ -1865,6 +1865,18 @@ class KBDatabase:
             row = await conn.fetchval("SELECT 1 FROM claim_evidence WHERE source_id = $1 LIMIT 1", source_id)
         return row is not None
 
+    async def get_snapshot_paths_for_source(self, source_id: str) -> list[str]:
+        """For cleaning up on-disk snapshot files before/alongside
+        delete_source_cascade -- that call only removes DB rows, so without
+        this the raw fetched page (HTML/text) sits on disk forever with no
+        row pointing to it, for every fetched-but-never-used verification
+        page (the large majority)."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT snapshot_path FROM source_versions WHERE source_id = $1", source_id,
+            )
+        return [r["snapshot_path"] for r in rows]
+
     async def delete_source_cascade(self, source_id: str) -> None:
         """Hard-deletes a source and everything under it (versions,
         artifacts, chunks, extraction runs/observations, fetch attempts,

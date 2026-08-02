@@ -29,6 +29,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 from deep_research.config import Config, LLMConfig
@@ -855,6 +856,14 @@ async def verify_claim(
     # of wasting its first search slot repeating a query that already failed
     # to settle this claim once.
     tried_queries: list[str] = list((claim.get("verification_notes") or {}).get("web_search_queries") or [])
+    # A durable trail of what actually proved this claim, surviving even
+    # though the auxiliary claim/source a piece of evidence came from does
+    # not (see _resolve_new_verification_claims) -- without this, a settled
+    # "supported"/"contradicted" verdict left no way to see what the
+    # evidence actually said or where it came from, only a bare count.
+    # Seeded from prior attempts the same way tried_queries is, so a retry
+    # accumulates rather than losing earlier findings.
+    evidence_log: list[dict] = list((claim.get("verification_notes") or {}).get("evidence") or [])
     verification_context = claim.get("verification_context")
 
     extraction_base_url = config.kb.verification_llm_base_url or config.kb.extraction_llm_base_url
@@ -1000,12 +1009,44 @@ async def verify_claim(
                         )
                     with _timed(timings, "embedding_rank"):
                         new_ranked = await _rank_candidates_by_similarity(config, claim, new_source_claims)
+                    supports_before, contradicts_before = len(supporting_ids), len(contradiction_ids)
                     with _timed(timings, "llm_classify"):
                         await _examine_candidates(
                             kb_db, config, llm, claim, new_ranked, budget, examined_source_ids, contradiction_ids,
                             supporting_ids, phase="external",
                         )
                     if promotion.new_claim_ids:
+                        new_claim_id_set = set(promotion.new_claim_ids)
+                        # Whichever of this page's freshly-promoted claims
+                        # actually settled the verdict (as opposed to a
+                        # candidate that came from get_claims_independent_of
+                        # instead) -- these are about to be deleted, so this
+                        # is the last chance to archive what they said and
+                        # where they came from.
+                        kept_this_page = [
+                            (i, "supports") for i in supporting_ids[supports_before:] if i in new_claim_id_set
+                        ] + [
+                            (i, "contradicts") for i in contradiction_ids[contradicts_before:] if i in new_claim_id_set
+                        ]
+                        with _timed(timings, "db_other"):
+                            for kept_claim_id, relationship in kept_this_page:
+                                kept_claim = await kb_db.get_claim(kept_claim_id)
+                                if kept_claim is None:
+                                    continue
+                                try:
+                                    archived_path = snapshot_store.archive_verification_evidence(
+                                        version["snapshot_path"], claim_id,
+                                        Path(version["snapshot_path"]).suffix or ".dat",
+                                    )
+                                except OSError:
+                                    archived_path = None
+                                evidence_log.append({
+                                    "url": source["canonical_uri"],
+                                    "title": source.get("title"),
+                                    "quote": kept_claim["canonical_text"],
+                                    "relationship": relationship,
+                                    "snapshot_path": str(archived_path) if archived_path else None,
+                                })
                         with _timed(timings, "resolve_promote"):
                             await _resolve_new_verification_claims(kb_db, promotion.new_claim_ids)
                         # These ids no longer exist -- record_claim_supports
@@ -1016,7 +1057,6 @@ async def verify_claim(
                         # _examine_candidates) already happened independently
                         # of these lists, so the verification outcome is
                         # unaffected by no longer tracking these specific ids.
-                        new_claim_id_set = set(promotion.new_claim_ids)
                         supporting_ids[:] = [i for i in supporting_ids if i not in new_claim_id_set]
                         contradiction_ids[:] = [i for i in contradiction_ids if i not in new_claim_id_set]
                 except Exception:
@@ -1036,7 +1076,17 @@ async def verify_claim(
                     # through), since all of them can leave zero evidence.
                     with _timed(timings, "db_other"):
                         if not await kb_db.source_has_claim_evidence(ingest_result.source_id):
+                            # Any evidence worth keeping was already archived
+                            # (compressed, copied elsewhere) above, so the
+                            # transient raw snapshot(s) for this source are
+                            # safe to delete regardless -- without this, the
+                            # much larger set of fetched-but-never-used pages
+                            # would leave their raw HTML on disk forever with
+                            # no DB row ever pointing back to it.
+                            snapshot_paths = await kb_db.get_snapshot_paths_for_source(ingest_result.source_id)
                             await kb_db.delete_source_cascade(ingest_result.source_id)
+                            for snapshot_path in snapshot_paths:
+                                snapshot_store.delete(snapshot_path)
     finally:
         await llm.close()
 
@@ -1052,6 +1102,7 @@ async def verify_claim(
         "contradicting_claim_ids": contradiction_ids,
         "timings": timings,
         "web_search_queries": tried_queries,
+        "evidence": evidence_log,
     }
     await kb_db.record_claim_supports(claim_id, supporting_ids)
     await kb_db.update_claim_verification(claim_id, status, notes)

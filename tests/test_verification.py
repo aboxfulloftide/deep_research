@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1389,23 +1390,17 @@ async def test_resolve_new_verification_claims_deletes_even_the_proving_claim(kb
     assert await kb_db.get_claim(tangential["id"]) is None
 
 
-async def test_verify_claim_strips_deleted_ids_before_recording_supports(kb_db, monkeypatch):
-    """The "proving" claim gets deleted by _resolve_new_verification_claims
-    before verify_claim reaches record_claim_supports -- if that call still
-    tried to persist a claim_supports row referencing the now-deleted id, it
-    would violate the table's foreign key and crash the whole verification
-    instead of just not tracking a reference to something that no longer
-    exists."""
+async def _make_verify_claim_web_fallback_mocks(kb_db, monkeypatch, tmp_path, proving_claim, relationship="supports"):
+    """Shared scaffold for the web-fallback tests below: simulates one
+    fetched page whose extraction promotes exactly one claim (proving_claim),
+    which an LLM comparison then classifies as supports/contradicts. Returns
+    the real on-disk snapshot path so callers can assert on archiving."""
     from dataclasses import dataclass
 
-    from deep_research.config import load_config
     from deep_research.models import SearchResult
 
-    claim, _ = await kb_db.get_or_create_claim(
-        "fact", "A distinctive test claim about zorbnaxian trade tariffs in 1994.",
-    )
-    config = load_config()
-    proving_claim, _ = await kb_db.get_or_create_claim("fact", "The proving claim from the fetched page.")
+    snapshot_path = tmp_path / "fetched-page.html"
+    snapshot_path.write_bytes(b"<html>the fetched page content</html>")
 
     async def fake_web_search(query, cfg, **kwargs):
         return [SearchResult(title="A page", url="https://example.test/a", snippet="")]
@@ -1440,16 +1435,19 @@ async def test_verify_claim_strips_deleted_ids_before_recording_supports(kb_db, 
         return _FakePromotion()
 
     async def fake_get_source(source_id):
-        return {"id": source_id, "canonical_uri": "https://example.test/a"}
+        return {"id": source_id, "canonical_uri": "https://example.test/a", "title": "A page"}
 
     async def fake_get_source_version(version_id):
-        return {"id": version_id}
+        return {"id": version_id, "snapshot_path": str(snapshot_path), "mime_type": "text/html"}
 
     async def fake_get_current_artifacts_for_version(version_id):
         return [{"id": "fake-artifact-id"}]
 
     async def fake_list_chunks(artifact_id):
         return [{"id": "fake-chunk-id", "embedding": None}]
+
+    async def fake_get_snapshot_paths_for_source(source_id):
+        return [str(snapshot_path)]
 
     async def fake_rank_chunks_by_similarity(config, claim, chunks):
         return [(chunk, 1.0) for chunk in chunks]
@@ -1459,13 +1457,17 @@ async def test_verify_claim_strips_deleted_ids_before_recording_supports(kb_db, 
         contradiction_ids, supporting_ids=None, phase="internal",
     ):
         # Simulates the real function classifying the promoted "proving"
-        # claim as supporting evidence -- the exact scenario that used to
-        # crash record_claim_supports once that claim gets deleted below.
-        if phase == "external":
+        # claim as supporting/contradicting evidence.
+        if phase != "external":
+            return
+        if relationship == "supports":
             budget.supports += 1
             budget.support_weight += 1.0
             if supporting_ids is not None:
                 supporting_ids.append(proving_claim["id"])
+        else:
+            budget.contradicts += 1
+            contradiction_ids.append(proving_claim["id"])
 
     monkeypatch.setattr(v, "web_search", fake_web_search)
     monkeypatch.setattr(v, "ingest_web_page", fake_ingest_web_page)
@@ -1478,12 +1480,93 @@ async def test_verify_claim_strips_deleted_ids_before_recording_supports(kb_db, 
     monkeypatch.setattr(kb_db, "get_source_version", fake_get_source_version)
     monkeypatch.setattr(kb_db, "get_current_artifacts_for_version", fake_get_current_artifacts_for_version)
     monkeypatch.setattr(kb_db, "list_chunks", fake_list_chunks)
+    monkeypatch.setattr(kb_db, "get_snapshot_paths_for_source", fake_get_snapshot_paths_for_source)
+    return snapshot_path
+
+
+async def test_verify_claim_strips_deleted_ids_before_recording_supports(kb_db, monkeypatch, tmp_path):
+    """The "proving" claim gets deleted by _resolve_new_verification_claims
+    before verify_claim reaches record_claim_supports -- if that call still
+    tried to persist a claim_supports row referencing the now-deleted id, it
+    would violate the table's foreign key and crash the whole verification
+    instead of just not tracking a reference to something that no longer
+    exists."""
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim(
+        "fact", "A distinctive test claim about zorbnaxian trade tariffs in 1994.",
+    )
+    proving_claim, _ = await kb_db.get_or_create_claim("fact", "The proving claim from the fetched page.")
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    await _make_verify_claim_web_fallback_mocks(kb_db, monkeypatch, tmp_path, proving_claim)
 
     result = await v.verify_claim(kb_db, config, claim["id"], extraction_model="stub-model")
 
     assert result.status == "supported"
     assert proving_claim["id"] not in result.supporting_claim_ids
     assert await kb_db.get_claim(proving_claim["id"]) is None
+
+
+async def test_verify_claim_archives_evidence_before_deleting_the_proving_claim(kb_db, monkeypatch, tmp_path):
+    """The proving claim's text, source URL/title, and a compressed copy of
+    the actual fetched page must survive in verification_notes even after
+    the claim/source themselves are deleted -- otherwise a settled verdict
+    leaves no way to see what evidence actually proved it or where it came
+    from, just a bare count."""
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim(
+        "fact", "A distinctive test claim about zorbnaxian trade tariffs in 1994.",
+    )
+    proving_claim, _ = await kb_db.get_or_create_claim("fact", "The proving claim from the fetched page.")
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    snapshot_path = await _make_verify_claim_web_fallback_mocks(kb_db, monkeypatch, tmp_path, proving_claim)
+    original_content = snapshot_path.read_bytes()
+
+    await v.verify_claim(kb_db, config, claim["id"], extraction_model="stub-model")
+
+    updated = await kb_db.get_claim(claim["id"])
+    evidence = updated["verification_notes"]["evidence"]
+    assert len(evidence) == 1
+    entry = evidence[0]
+    assert entry["url"] == "https://example.test/a"
+    assert entry["title"] == "A page"
+    assert entry["quote"] == "The proving claim from the fetched page."
+    assert entry["relationship"] == "supports"
+
+    import gzip
+    archived_content = gzip.decompress(Path(entry["snapshot_path"]).read_bytes())
+    assert archived_content == original_content
+    # The original transient snapshot is cleaned up once the source itself
+    # is (delete_source_cascade only removes DB rows, not files on disk).
+    assert not snapshot_path.exists()
+
+
+async def test_verify_claim_archives_evidence_for_contradicting_claims_too(kb_db, monkeypatch, tmp_path):
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim(
+        "fact", "A distinctive test claim about zorbnaxian trade tariffs in 1994.",
+    )
+    disproving_claim, _ = await kb_db.get_or_create_claim("fact", "The disproving claim from the fetched page.")
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    await _make_verify_claim_web_fallback_mocks(
+        kb_db, monkeypatch, tmp_path, disproving_claim, relationship="contradicts",
+    )
+
+    await v.verify_claim(kb_db, config, claim["id"], extraction_model="stub-model")
+
+    updated = await kb_db.get_claim(claim["id"])
+    evidence = updated["verification_notes"]["evidence"]
+    assert len(evidence) == 1
+    assert evidence[0]["relationship"] == "contradicts"
+    assert evidence[0]["quote"] == "The disproving claim from the fetched page."
 
 
 # -- deleting sources that contributed nothing -------------------------------
@@ -1518,6 +1601,30 @@ async def test_delete_source_cascade_removes_source_and_its_artifacts(kb_db):
 
     assert await kb_db.get_source(source["id"]) is None
     assert await kb_db.list_chunks(artifact["id"]) == []
+
+
+async def test_get_snapshot_paths_for_source_returns_all_versions(kb_db):
+    """Called before delete_source_cascade so the caller can clean up the
+    on-disk snapshot file(s) too -- that call only removes DB rows, so
+    without this the raw fetched page sits on disk forever with nothing
+    pointing back to it."""
+    source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="http://multi-version.example", canonical_key="multi-version",
+    )
+    await kb_db.add_source_version(
+        source["id"], content_hash="h1", snapshot_path="/tmp/v1.html", http_status=200, mime_type="text/html",
+    )
+    await kb_db.add_source_version(
+        source["id"], content_hash="h2", snapshot_path="/tmp/v2.html", http_status=200, mime_type="text/html",
+    )
+
+    paths = await kb_db.get_snapshot_paths_for_source(source["id"])
+
+    assert set(paths) == {"/tmp/v1.html", "/tmp/v2.html"}
+
+
+async def test_get_snapshot_paths_for_source_empty_for_unknown_source(kb_db):
+    assert await kb_db.get_snapshot_paths_for_source("nonexistent-source-id") == []
 
 
 # -- claims.verification_context: expands what verify_claim looks for --------
