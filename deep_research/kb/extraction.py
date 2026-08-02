@@ -27,7 +27,7 @@ from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
 
 PROMPT_NAME = "claim_extraction"
-PROMPT_VERSION = "v8-preceding-context"
+PROMPT_VERSION = "v9-named-event-context"
 EXTRACTION_SCHEMA_VERSION = "v1"
 
 # Trailing slice of the previous chunk given as reference-resolution context
@@ -68,6 +68,16 @@ Rules:
   deal" that the chunk itself only calls "the deal") -- use it to fill the
   reference in. If the subject or object still cannot be identified even
   with that context, do not extract the claim.
+- A claim describing an effect, consequence, or detail of a specific named
+  event, crisis, policy, or period (e.g. "the Panic of 1837", "the Plaza
+  Accord", "World War II") must name that event, not just carry over a bare
+  year or generic description. "Businesses closed in 1837" is too generic to
+  stand alone -- countless unrelated things happen in any given year --
+  even though 1837 is accurate; write "Businesses closed during the Panic of
+  1837" (or name whichever specific event the chunk is actually describing)
+  instead. If the chunk names the event anywhere (including the preceding-
+  context block), use it; if it genuinely never names one, a precise date
+  alone is still acceptable.
 - Do not extract quiz, test, or exam questions, answer choices, answer keys,
   flash cards, worked exercises, or hypothetical word-problem figures. An
   option marked as the correct answer is still assessment material, not a
