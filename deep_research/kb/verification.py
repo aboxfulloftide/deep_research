@@ -669,6 +669,90 @@ def _own_evidence_corroboration(evidence_sources: list[dict]) -> tuple[int, floa
     return len(best_tier_by_domain), weight
 
 
+async def backfill_supported_claim_evidence(
+    kb_db: KBDatabase, config: Config, *, dry_run: bool = False, on_result=None,
+) -> dict:
+    """Retroactively archives supporting evidence for claims marked
+    "supported" before verify_claim's live evidence-archiving existed (added
+    the same session "claims can only live on a source the user added" did
+    -- see _resolve_new_verification_claims). Gathers each claim's own
+    claim_evidence (extraction-time evidence) plus any claim_supports ->
+    supporting claim's own claim_evidence, archives each underlying
+    source_version's snapshot (deduplicated per snapshot path within one
+    claim, skipped if the file is missing -- e.g. a supporting claim whose
+    source was already cleaned up before this backfill ran), and records
+    {url, title, quote, relationship: "supports", snapshot_path} into
+    verification_notes.evidence -- consolidating pre-existing evidence into
+    the same durable, efficient format new verifications produce.
+
+    Idempotent: a claim that already has a non-empty evidence list (either
+    from a live verify_claim run, or a previous backfill pass) is skipped,
+    so this is safe to re-run over the whole KB as new claims settle.
+    dry_run=True computes and reports via on_result without writing
+    anything, for sanity-checking real counts before committing -- the
+    live specificity sweep earlier this session only validated on 12
+    hand-picked examples before running for real across the whole KB, and
+    that mismatch is exactly what this dry_run guards against here.
+
+    `on_result(claim, status)` is called (synchronously) after each claim,
+    status one of "backfilled"/"already_had_evidence"/"no_evidence_found".
+    """
+    snapshot_store = SnapshotStore(config.kb_snapshot_dir)
+    all_claims = await kb_db.list_claims(limit=10000)
+    supported = [c for c in all_claims if c["status"] == "supported"]
+
+    counts = {"total": len(supported), "already_had_evidence": 0, "backfilled": 0, "no_evidence_found": 0}
+
+    for claim in supported:
+        existing = (claim.get("verification_notes") or {}).get("evidence") or []
+        if existing:
+            counts["already_had_evidence"] += 1
+            if on_result:
+                on_result(claim, "already_had_evidence")
+            continue
+
+        claim_ids_to_check = [claim["id"], *await kb_db.get_claim_support_ids(claim["id"])]
+        entries: list[dict] = []
+        archived_snapshot_paths: set[str] = set()
+        for source_claim_id in claim_ids_to_check:
+            for row in await kb_db.get_claim_evidence_detail(source_claim_id):
+                snapshot_path = row.get("snapshot_path")
+                archived_path = None
+                if snapshot_path and Path(snapshot_path).exists():
+                    if snapshot_path in archived_snapshot_paths:
+                        continue  # already archived once for this claim -- same source_version cited twice
+                    archived_snapshot_paths.add(snapshot_path)
+                    try:
+                        archived_path = snapshot_store.archive_verification_evidence(
+                            snapshot_path, claim["id"], Path(snapshot_path).suffix or ".dat",
+                        )
+                    except OSError:
+                        archived_path = None
+                entries.append({
+                    "url": row["canonical_uri"],
+                    "title": row.get("title"),
+                    "quote": row["excerpt_text"],
+                    "relationship": "supports",
+                    "snapshot_path": str(archived_path) if archived_path else None,
+                })
+
+        if not entries:
+            counts["no_evidence_found"] += 1
+            if on_result:
+                on_result(claim, "no_evidence_found")
+            continue
+
+        if not dry_run:
+            notes = dict(claim.get("verification_notes") or {})
+            notes["evidence"] = entries
+            await kb_db.update_claim_verification(claim["id"], claim["status"], notes)
+        counts["backfilled"] += 1
+        if on_result:
+            on_result(claim, "backfilled")
+
+    return counts
+
+
 class _Budget:
     """Tracks the per-claim verification budget and the stop conditions.
 
@@ -795,6 +879,27 @@ async def _examine_candidates(
             )
             if created:
                 contradiction_ids.append(other_claim["id"])
+
+
+async def _cleanup_evidence_less_source(
+    kb_db: KBDatabase, snapshot_store: SnapshotStore, source_id: str,
+) -> None:
+    """Deletes a source (and its on-disk snapshot files) if nothing ends up
+    citing it as evidence. Used both for a page ingest_web_page could not
+    even fetch (get_or_create_source runs before the fetch attempt, so a
+    bare source row exists with zero versions/artifacts even on total
+    failure -- confirmed live: 11 such empty husks left behind across a
+    5-claim sample, one per failed fetch, since the early
+    `if ingest_result.status == "failed": continue` used to skip straight
+    past the cleanup that normally lives in verify_claim's finally block)
+    and for a page that fetched fine but ended up contributing no surviving
+    claim at all."""
+    if await kb_db.source_has_claim_evidence(source_id):
+        return
+    snapshot_paths = await kb_db.get_snapshot_paths_for_source(source_id)
+    await kb_db.delete_source_cascade(source_id)
+    for snapshot_path in snapshot_paths:
+        snapshot_store.delete(snapshot_path)
 
 
 async def _resolve_new_verification_claims(kb_db: KBDatabase, new_claim_ids: list[str]) -> None:
@@ -970,7 +1075,11 @@ async def verify_claim(
                     ingest_result = await ingest_web_page(
                         result.url, config, kb_db, snapshot_store, source_purpose="verification_evidence",
                     )
-                if ingest_result.status == "failed" or ingest_result.source_id in examined_source_ids:
+                if ingest_result.status == "failed":
+                    with _timed(timings, "db_other"):
+                        await _cleanup_evidence_less_source(kb_db, snapshot_store, ingest_result.source_id)
+                    continue
+                if ingest_result.source_id in examined_source_ids:
                     continue
 
                 try:
@@ -1074,19 +1183,11 @@ async def verify_claim(
                     # runs regardless of which exit path above was taken
                     # (early continue, exception, or falling all the way
                     # through), since all of them can leave zero evidence.
+                    # Any evidence worth keeping was already archived
+                    # (compressed, copied elsewhere) above, so deleting the
+                    # transient source/snapshot here is always safe.
                     with _timed(timings, "db_other"):
-                        if not await kb_db.source_has_claim_evidence(ingest_result.source_id):
-                            # Any evidence worth keeping was already archived
-                            # (compressed, copied elsewhere) above, so the
-                            # transient raw snapshot(s) for this source are
-                            # safe to delete regardless -- without this, the
-                            # much larger set of fetched-but-never-used pages
-                            # would leave their raw HTML on disk forever with
-                            # no DB row ever pointing back to it.
-                            snapshot_paths = await kb_db.get_snapshot_paths_for_source(ingest_result.source_id)
-                            await kb_db.delete_source_cascade(ingest_result.source_id)
-                            for snapshot_path in snapshot_paths:
-                                snapshot_store.delete(snapshot_path)
+                        await _cleanup_evidence_less_source(kb_db, snapshot_store, ingest_result.source_id)
     finally:
         await llm.close()
 

@@ -1484,6 +1484,49 @@ async def _make_verify_claim_web_fallback_mocks(kb_db, monkeypatch, tmp_path, pr
     return snapshot_path
 
 
+async def test_verify_claim_cleans_up_source_left_by_a_failed_fetch(kb_db, monkeypatch, tmp_path):
+    """ingest_web_page creates the source row (get_or_create_source) before
+    it ever attempts the actual fetch, so a total failure (404, blocked,
+    timeout) still leaves a bare source with zero versions/artifacts behind.
+    The old code's early `if ingest_result.status == "failed": continue`
+    skipped straight past the cleanup that normally lives in verify_claim's
+    finally block, since that continue happened before the try/finally even
+    started -- confirmed live: 11 such empty husks left behind across a
+    real 5-claim sample, one per failed fetch."""
+    from dataclasses import dataclass
+
+    from deep_research.config import load_config
+    from deep_research.models import SearchResult
+
+    claim, _ = await kb_db.get_or_create_claim(
+        "fact", "A distinctive test claim about zorbnaxian trade tariffs in 1994.",
+    )
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    failed_source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="https://example.test/unreachable", canonical_key="unreachable",
+    )
+
+    async def fake_web_search(query, cfg, **kwargs):
+        return [SearchResult(title="An unreachable page", url="https://example.test/unreachable", snippet="")]
+
+    @dataclass
+    class _FailedIngest:
+        status: str = "failed"
+        source_id: str = failed_source["id"]
+
+    async def fake_ingest_web_page(*args, **kwargs):
+        return _FailedIngest()
+
+    monkeypatch.setattr(v, "web_search", fake_web_search)
+    monkeypatch.setattr(v, "ingest_web_page", fake_ingest_web_page)
+
+    await v.verify_claim(kb_db, config, claim["id"], extraction_model="stub-model")
+
+    assert await kb_db.get_source(failed_source["id"]) is None
+
+
 async def test_verify_claim_strips_deleted_ids_before_recording_supports(kb_db, monkeypatch, tmp_path):
     """The "proving" claim gets deleted by _resolve_new_verification_claims
     before verify_claim reaches record_claim_supports -- if that call still
@@ -1567,6 +1610,210 @@ async def test_verify_claim_archives_evidence_for_contradicting_claims_too(kb_db
     assert len(evidence) == 1
     assert evidence[0]["relationship"] == "contradicts"
     assert evidence[0]["quote"] == "The disproving claim from the fetched page."
+
+
+# -- backfill_supported_claim_evidence: pre-existing "supported" claims -----
+# verify_claim's live archiving (above) only covers claims settled from now
+# on. Claims already marked "supported" before it existed have no such
+# trail -- just a bare count -- even though the underlying evidence
+# (claim_evidence rows, or a claim_supports link to another claim's own
+# evidence) is usually still sitting right there in the KB.
+
+async def _add_real_claim_evidence(kb_db, tmp_path, claim_id, canonical_uri, quote, content=b"<html>archived page</html>"):
+    """Creates a real source/version/artifact/chunk/claim_evidence chain
+    with an actual on-disk snapshot file, so backfill_supported_claim_evidence
+    can genuinely read and archive it (not just a mocked path)."""
+    from deep_research.kb.storage import SnapshotStore
+
+    source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri=canonical_uri, canonical_key=canonical_uri,
+    )
+    store = SnapshotStore(tmp_path / "kb-snapshots")
+    snapshot_path = store.write(source["id"], 1, content, ".html")
+    version, _ = await kb_db.add_source_version(
+        source["id"], content_hash="h1", snapshot_path=str(snapshot_path), http_status=200, mime_type="text/html",
+    )
+    artifact, _ = await kb_db.upsert_artifact(
+        artifact_id=f"art-{source['id']}", source_version_id=version["id"], artifact_type="clean_text",
+        storage_path="/tmp/x.txt", content_hash="h1", chunk_params_hash="p1",
+    )
+    chunk = await kb_db.add_chunk(artifact["id"], 0, quote, "chash")
+    await kb_db.add_claim_evidence(
+        claim_id=claim_id, artifact_chunk_id=chunk["id"], source_id=source["id"], source_version_id=version["id"],
+        excerpt_text=quote,
+    )
+    return snapshot_path
+
+
+async def test_backfill_supported_claim_evidence_archives_own_evidence(kb_db, tmp_path):
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "A claim with its own pre-existing evidence.")
+    async with kb_db.pool.acquire() as conn:
+        await conn.execute("UPDATE claims SET status = 'supported' WHERE id = $1", claim["id"])
+    snapshot_path = await _add_real_claim_evidence(
+        kb_db, tmp_path, claim["id"], "https://example.test/own-evidence", "The exact supporting quote.",
+    )
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    result = await v.backfill_supported_claim_evidence(kb_db, config)
+
+    assert result == {"total": 1, "already_had_evidence": 0, "backfilled": 1, "no_evidence_found": 0}
+    updated = await kb_db.get_claim(claim["id"])
+    evidence = updated["verification_notes"]["evidence"]
+    assert len(evidence) == 1
+    assert evidence[0]["url"] == "https://example.test/own-evidence"
+    assert evidence[0]["quote"] == "The exact supporting quote."
+    assert evidence[0]["relationship"] == "supports"
+
+    import gzip
+    archived = gzip.decompress(Path(evidence[0]["snapshot_path"]).read_bytes())
+    assert archived == snapshot_path.read_bytes()
+
+
+async def test_backfill_supported_claim_evidence_includes_claim_supports_evidence(kb_db, tmp_path):
+    """A claim supported via claim_supports (an LLM comparison against a
+    separately-discovered claim, not its own extraction evidence) must pull
+    in that OTHER claim's evidence too, not just its own (empty) evidence."""
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "A claim supported by a separate corroborating claim.")
+    supporting_claim, _ = await kb_db.get_or_create_claim("fact", "The independently-discovered corroborating claim.")
+    async with kb_db.pool.acquire() as conn:
+        await conn.execute("UPDATE claims SET status = 'supported' WHERE id = $1", claim["id"])
+    await kb_db.record_claim_supports(claim["id"], [supporting_claim["id"]])
+    await _add_real_claim_evidence(
+        kb_db, tmp_path, supporting_claim["id"], "https://example.test/corroborating", "The corroborating quote.",
+    )
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    result = await v.backfill_supported_claim_evidence(kb_db, config)
+
+    assert result["backfilled"] == 1
+    updated = await kb_db.get_claim(claim["id"])
+    evidence = updated["verification_notes"]["evidence"]
+    assert len(evidence) == 1
+    assert evidence[0]["url"] == "https://example.test/corroborating"
+    assert evidence[0]["quote"] == "The corroborating quote."
+
+
+async def test_backfill_supported_claim_evidence_skips_claims_that_already_have_evidence(kb_db, tmp_path):
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "Already backfilled or live-verified claim.")
+    await kb_db.update_claim_verification(
+        claim["id"], "supported", {"evidence": [{"url": "https://already.example", "quote": "q", "relationship": "supports"}]},
+    )
+    await _add_real_claim_evidence(
+        kb_db, tmp_path, claim["id"], "https://example.test/should-not-be-touched", "Should not appear.",
+    )
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    result = await v.backfill_supported_claim_evidence(kb_db, config)
+
+    assert result == {"total": 1, "already_had_evidence": 1, "backfilled": 0, "no_evidence_found": 0}
+    updated = await kb_db.get_claim(claim["id"])
+    assert updated["verification_notes"]["evidence"] == [
+        {"url": "https://already.example", "quote": "q", "relationship": "supports"},
+    ]
+
+
+async def test_backfill_supported_claim_evidence_only_touches_supported_claims(kb_db, tmp_path):
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "An unverified claim with evidence, not yet settled.")
+    await _add_real_claim_evidence(
+        kb_db, tmp_path, claim["id"], "https://example.test/unverified-claim-evidence", "Some quote.",
+    )
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    result = await v.backfill_supported_claim_evidence(kb_db, config)
+
+    assert result["total"] == 0
+    updated = await kb_db.get_claim(claim["id"])
+    assert (updated.get("verification_notes") or {}).get("evidence") is None
+
+
+async def test_backfill_supported_claim_evidence_dry_run_does_not_write(kb_db, tmp_path):
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "A claim to preview, not actually backfill.")
+    async with kb_db.pool.acquire() as conn:
+        await conn.execute("UPDATE claims SET status = 'supported' WHERE id = $1", claim["id"])
+    await _add_real_claim_evidence(
+        kb_db, tmp_path, claim["id"], "https://example.test/dry-run", "A quote.",
+    )
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    result = await v.backfill_supported_claim_evidence(kb_db, config, dry_run=True)
+
+    assert result == {"total": 1, "already_had_evidence": 0, "backfilled": 1, "no_evidence_found": 0}
+    updated = await kb_db.get_claim(claim["id"])
+    assert (updated.get("verification_notes") or {}).get("evidence") is None
+
+
+async def test_backfill_supported_claim_evidence_handles_missing_snapshot_gracefully(kb_db, tmp_path):
+    """A supporting claim's source may have already been cleaned up (e.g.
+    by delete_source_cascade) before this backfill runs -- the quote/URL
+    should still be recorded, just without an archived snapshot copy."""
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "A claim whose source snapshot no longer exists on disk.")
+    async with kb_db.pool.acquire() as conn:
+        await conn.execute("UPDATE claims SET status = 'supported' WHERE id = $1", claim["id"])
+    source, _ = await kb_db.get_or_create_source(
+        source_type_code="web", canonical_uri="https://example.test/missing-snapshot", canonical_key="missing",
+    )
+    version, _ = await kb_db.add_source_version(
+        source["id"], content_hash="h1", snapshot_path="/tmp/does-not-exist-anywhere.html",
+        http_status=200, mime_type="text/html",
+    )
+    artifact, _ = await kb_db.upsert_artifact(
+        artifact_id=f"art-{source['id']}", source_version_id=version["id"], artifact_type="clean_text",
+        storage_path="/tmp/x.txt", content_hash="h1", chunk_params_hash="p1",
+    )
+    chunk = await kb_db.add_chunk(artifact["id"], 0, "text", "chash")
+    await kb_db.add_claim_evidence(
+        claim_id=claim["id"], artifact_chunk_id=chunk["id"], source_id=source["id"], source_version_id=version["id"],
+        excerpt_text="A quote from a since-deleted source.",
+    )
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    result = await v.backfill_supported_claim_evidence(kb_db, config)
+
+    assert result["backfilled"] == 1
+    updated = await kb_db.get_claim(claim["id"])
+    evidence = updated["verification_notes"]["evidence"]
+    assert evidence[0]["quote"] == "A quote from a since-deleted source."
+    assert evidence[0]["snapshot_path"] is None
+
+
+async def test_backfill_supported_claim_evidence_reports_no_evidence_found(kb_db, tmp_path):
+    """Mirrors the 38 real KB claims found to have neither their own
+    claim_evidence nor a claim_supports link -- their supporting claim was
+    itself deleted by an earlier cleanup pass, so there is nothing left to
+    recover. Must be reported, not silently skipped or errored on."""
+    from deep_research.config import load_config
+
+    claim, _ = await kb_db.get_or_create_claim("fact", "A supported claim with no recoverable evidence at all.")
+    async with kb_db.pool.acquire() as conn:
+        await conn.execute("UPDATE claims SET status = 'supported' WHERE id = $1", claim["id"])
+    config = load_config()
+    config.kb.snapshot_dir = str(tmp_path / "kb-snapshots")
+
+    reported = []
+    result = await v.backfill_supported_claim_evidence(
+        kb_db, config, on_result=lambda c, status: reported.append(status),
+    )
+
+    assert result == {"total": 1, "already_had_evidence": 0, "backfilled": 0, "no_evidence_found": 1}
+    assert reported == ["no_evidence_found"]
 
 
 # -- deleting sources that contributed nothing -------------------------------

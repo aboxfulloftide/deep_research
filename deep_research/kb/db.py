@@ -1789,6 +1789,25 @@ class KBDatabase:
             )
         return [dict(r) for r in rows]
 
+    async def get_claim_evidence_detail(self, claim_id: str) -> list[dict]:
+        """Full evidence detail (the verbatim quote, source URL/title, and
+        the specific version's snapshot path/mime type) for backfilling a
+        durable evidence trail onto claims whose verdict predates
+        verify_claim's live archiving -- one row per claim_evidence entry,
+        joined out to its source and the exact source_version it was
+        extracted from (not just the source, since a re-fetched source can
+        have several versions with different snapshots)."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT ce.excerpt_text, s.canonical_uri, s.title, sv.snapshot_path, sv.mime_type "
+                "FROM claim_evidence ce "
+                "JOIN sources s ON s.id = ce.source_id "
+                "JOIN source_versions sv ON sv.id = ce.source_version_id "
+                "WHERE ce.claim_id = $1",
+                claim_id,
+            )
+        return [dict(r) for r in rows]
+
     async def update_claim_verification(
         self, claim_id: str, status: str, verification_notes: dict | None = None,
     ) -> dict:
