@@ -22,12 +22,12 @@ from dataclasses import dataclass
 import httpx
 
 from deep_research.config import Config, LLMConfig
-from deep_research.kb.chunking import find_quote
+from deep_research.kb.chunking import find_quote, normalize_ws
 from deep_research.kb.db import KBDatabase
 from deep_research.llm import LLMClient
 
 PROMPT_NAME = "claim_extraction"
-PROMPT_VERSION = "v11-mechanical-event-propagation"
+PROMPT_VERSION = "v12-reject-chunk-boundary-truncation"
 EXTRACTION_SCHEMA_VERSION = "v1"
 
 # Trailing slice of the previous chunk given as reference-resolution context
@@ -218,6 +218,32 @@ def has_unresolved_subject(claim_text: str) -> bool:
     measured.
     """
     return bool(_UNRESOLVED_SUBJECT_RE.search(claim_text or ""))
+
+
+_TERMINAL_PUNCTUATION = ".!?’”\")"
+
+
+def is_truncated_by_chunk_boundary(chunk_text: str, quote_char_end: int | None, tolerance: int = 5) -> bool:
+    """True when a claim's supporting quote runs right up to the end of its
+    chunk with no sentence-ending punctuation right before that point.
+
+    chunk_text() (see kb.chunking) snaps to the nearest whitespace boundary,
+    not a sentence boundary, so a chunk can legitimately end mid-sentence --
+    confirmed live: the model then extracts that dangling final fragment as
+    if it were a complete fact ("In Oak Ridge today, Oklo is building a",
+    "Speculation can magnify the volatility of economic and financial
+    variables, thus harming") instead of recognizing it's cut off. Checked
+    against the quote's own end position, not just whether the chunk itself
+    ends mid-sentence, since a chunk's true final sentence may already have
+    been extracted correctly (with a non-truncated quote) even when a
+    later, incomplete one also got extracted from the same chunk."""
+    if quote_char_end is None:
+        return False
+    normalized_len = len(normalize_ws(chunk_text))
+    if normalized_len - quote_char_end > tolerance:
+        return False
+    tail = normalize_ws(chunk_text)[:quote_char_end].rstrip()
+    return bool(tail) and tail[-1] not in _TERMINAL_PUNCTUATION
 
 
 def repair_lifespan_date_misattribution(claim: dict) -> dict:
@@ -442,6 +468,8 @@ async def run_extraction(
                 quote = claim.get("supporting_quote", "")
                 match = find_quote(quote, chunk["chunk_text"])
                 match_type, q_start, q_end = match or (None, None, None)
+                if is_truncated_by_chunk_boundary(chunk["chunk_text"], q_end):
+                    continue
                 await kb_db.add_observation(
                     extraction_run_id=run["id"], artifact_chunk_id=chunk["id"],
                     raw_text=claim["claim_text"], raw_payload=claim,

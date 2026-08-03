@@ -1,7 +1,9 @@
 from deep_research.config import load_config
+from deep_research.kb.chunking import find_quote
 from deep_research.kb.extraction import (
     is_assessment_content,
     has_unresolved_subject,
+    is_truncated_by_chunk_boundary,
     propagate_named_events,
     repair_lifespan_date_misattribution,
     run_extraction,
@@ -92,6 +94,44 @@ def test_leading_personal_pronouns_are_unresolved_subjects():
     assert has_unresolved_subject(
         "Jack Welch retired with a $417 million severance package."
     ) is False
+
+
+# -- is_truncated_by_chunk_boundary: chunking cuts mid-sentence sometimes --
+# chunk_text() (kb.chunking) snaps to the nearest whitespace boundary, not a
+# sentence boundary, so a chunk can legitimately end mid-sentence. Live-
+# confirmed: the model then extracts that dangling final fragment as a
+# complete claim ("In Oak Ridge today, Oklo is building a").
+
+def test_is_truncated_by_chunk_boundary_true_for_dangling_final_sentence():
+    chunk_text = "Orano and BWXT are building uranium enrichment plants, Oklo is building a"
+    quote = "Oklo is building a"
+    match = find_quote(quote, chunk_text)
+    assert is_truncated_by_chunk_boundary(chunk_text, match[2]) is True
+
+
+def test_is_truncated_by_chunk_boundary_false_for_a_complete_sentence():
+    chunk_text = "Orano and BWXT are building uranium enrichment plants. Oklo is building a new reactor."
+    quote = "Oklo is building a new reactor."
+    match = find_quote(quote, chunk_text)
+    assert is_truncated_by_chunk_boundary(chunk_text, match[2]) is False
+
+
+def test_is_truncated_by_chunk_boundary_false_when_quote_is_not_near_the_end():
+    chunk_text = "Oklo is building a new reactor. Meanwhile, other companies are also expanding rapidly this year."
+    quote = "Oklo is building a new reactor."
+    match = find_quote(quote, chunk_text)
+    assert is_truncated_by_chunk_boundary(chunk_text, match[2]) is False
+
+
+def test_is_truncated_by_chunk_boundary_false_for_none_position():
+    assert is_truncated_by_chunk_boundary("Some chunk text.", None) is False
+
+
+def test_is_truncated_by_chunk_boundary_true_for_trailing_comma_fragment():
+    chunk_text = "Speculation can magnify the volatility of economic and financial variables, thus harming"
+    quote = "Speculation can magnify the volatility of economic and financial variables, thus harming"
+    match = find_quote(quote, chunk_text)
+    assert is_truncated_by_chunk_boundary(chunk_text, match[2]) is True
 
 
 # -- propagate_named_events: mechanical fix for a prompt that didn't stick --
